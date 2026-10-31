@@ -8,6 +8,7 @@ version = "0.1.0"
 [dependencies]
 python = "3.14.*"
 structlog = ">=26.1.0,<27"
+anthropic = ">=2.3.0,<3"
 
 [pypi-dependencies]
 agentic-systems-practicum = { path = ".", editable = true }

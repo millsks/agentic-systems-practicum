@@ -27,6 +27,6 @@ def get_client(**options: Any) -> Any:
         anthropic = importlib.import_module("anthropic")
     except ImportError as exc:
         raise LiveModelUnavailableError(
-            "The anthropic package is not installed here. Live labs run locally once it is added to the workspace."
+            "The anthropic package is not installed here (it never is in the browser). Run live labs locally with Pixi."
         ) from exc
     return anthropic.Anthropic(**options)

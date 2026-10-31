@@ -346,12 +346,11 @@ assert answer.ok</code></pre>
     <h2>Running against the real API</h2>
     <p>The agent calls only <code>client.messages.create</code>, so switching to Claude changes one line: the client.
       The provided CLI does it for you with <code>agentlab.get_client()</code>, which returns
-      <code>anthropic.Anthropic()</code> when the package is installed.</p>
-    <pre data-label="Terminal"><code class="language-bash">pixi add anthropic                       # the SDK, from conda-forge
-export ANTHROPIC_API_KEY=...             # or sign in with `ant auth login`
+      <code>anthropic.Anthropic()</code>. This repository's Pixi environment already includes the <code>anthropic</code> SDK.</p>
+    <pre data-label="Terminal"><code class="language-bash">export ANTHROPIC_API_KEY=...             # or sign in with `ant auth login`
 cd work/c1_research_agent
 pixi run python -m research "How does a swarm choose a new home?" -v</code></pre>
-    <p>Without the package the CLI exits with code 2 and explains these steps instead of crashing. In your own scripts
+    <p>Where the package is missing (for example, a copy of the agent in another workspace) the CLI exits with code 2 and explains how to add it instead of crashing. In your own scripts
       the equivalent is:</p>
     <pre><code class="language-python">import anthropic
 from research import run
