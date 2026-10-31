@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Loop Cheat Sheet · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="ref-loop">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · Cheat sheet</p>
+    <h1>Agent Loop Cheat Sheet</h1>
+    <p class="lede">The request and response shapes, stop reasons, tool rules, and the loop itself on one page. Every
+      snippet uses <code>agentlab</code>; for the real API, create the client with <code>anthropic.Anthropic()</code>
+      and change nothing else.</p>
+    <div class="lesson-meta"><span>⏱ Keep open while you build</span><span>Taught in <a href="../modules/m02-messages-api.html">M02</a>, <a href="../modules/m03-limits-stop-reasons.html">M03</a>, <a href="../modules/m07-tools-as-contracts.html">M07</a>-<a href="../modules/m11-stop-conditions.html">M11</a></span></div>
+    <ul class="objectives">
+      <li>Write a correct request and read a response</li>
+      <li>Handle every <code>stop_reason</code></li>
+      <li>Pair <code>tool_use</code> and <code>tool_result</code> blocks without a 400</li>
+      <li>Write the loop, with budget guards, from memory</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="request">
+    <h2>Request shape</h2>
+    <pre><code class="language-python">response = client.messages.create(
+    model="claude-opus-5-5",           # al.MODEL; also claude-sonnet-5-5, claude-haiku-5-5 (no date suffix)
+    max_tokens=1024,                   # required; output cap (up to 128K; large values need streaming)
+    system="You are a concise research assistant.",   # optional; instructions, not a message
+    messages=[                         # required; the full history, every request (the API is stateless)
+        {"role": "user", "content": "What's the weather in Paris?"},
+    ],
+    tools=TOOLS,                       # optional; list of tool definitions
+    output_config={"effort": "medium"},   # optional; low | medium (default) | high | xhigh | max
+    stop_sequences=["END"],            # optional
+)</code></pre>
+    <table>
+      <thead><tr><th>Rule</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>First message</td><td>Must be <code>user</code>.</td></tr>
+        <tr><td>Last message</td><td>Must not be <code>assistant</code> (no prefill).</td></tr>
+        <tr><td>Content</td><td>A non-empty string, or a non-empty list of blocks.</td></tr>
+        <tr><td>Rejected</td><td><code>temperature</code>, <code>top_p</code>, <code>top_k</code>; forced <code>tool_choice</code> (<code>any</code>/<code>tool</code>); <code>thinking</code> other than <code>{"type": "adaptive"}</code>; <code>budget_tokens</code>.</td></tr>
+        <tr><td>Structured output</td><td><code>output_config={"format": {"type": "json_schema", "schema": {...}}}</code> (not the deprecated <code>output_format</code>).</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="response">
+    <h2>Response shape</h2>
+    <pre><code class="language-json">{
+  "id": "msg_...",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5-5",
+  "content": [
+    {"type": "text", "text": "Let me check."},
+    {"type": "tool_use", "id": "toolu_...", "name": "get_weather", "input": {"city": "Paris"}}
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 412, "output_tokens": 38}
+}</code></pre>
+    <table>
+      <thead><tr><th>Block</th><th>Who sends it</th><th>Fields</th></tr></thead>
+      <tbody>
+        <tr><td><code>text</code></td><td>model and you</td><td><code>text</code> (non-empty)</td></tr>
+        <tr><td><code>tool_use</code></td><td>model</td><td><code>id</code>, <code>name</code>, <code>input</code> (already-parsed dict)</td></tr>
+        <tr><td><code>tool_result</code></td><td>you, in a <code>user</code> message</td><td><code>tool_use_id</code>, <code>content</code> (string or text blocks), optional <code>is_error</code></td></tr>
+      </tbody>
+    </table>
+    <p>Check <code>stop_reason</code> before reading <code>content</code>. Append <code>response.content</code> (the
+      blocks, not just the text) to keep <code>tool_use</code> blocks in the history.</p>
+  </section>
+
+  <section class="lesson-section" id="stop-reasons">
+    <h2>stop_reason: what to do</h2>
+    <table>
+      <thead><tr><th><code>stop_reason</code></th><th>Means</th><th>Do this</th></tr></thead>
+      <tbody>
+        <tr><td><code>end_turn</code></td><td>The model finished.</td><td>Return the text. The loop ends.</td></tr>
+        <tr><td><code>tool_use</code></td><td>The model wants tool calls.</td><td>Append the assistant turn, run every <code>tool_use</code>, send all results in one user message, loop.</td></tr>
+        <tr><td><code>max_tokens</code></td><td>Output hit <code>max_tokens</code>; content is cut off.</td><td>Raise <code>max_tokens</code>, ask for shorter output, or stop and report. Never treat as complete. A cut-off <code>tool_use</code> must not be run.</td></tr>
+        <tr><td><code>stop_sequence</code></td><td>A stop sequence matched; <code>stop_sequence</code> says which.</td><td>Use the text up to that point.</td></tr>
+        <tr><td><code>pause_turn</code></td><td>A server tool paused a long turn.</td><td>Append the assistant turn and send the request again to continue.</td></tr>
+        <tr><td><code>refusal</code></td><td>The model declined.</td><td>Read <code>stop_details</code> (<code>category</code>, <code>explanation</code>); stop and report. Do not retry the same request.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="tools">
+    <h2>Tool definition</h2>
+    <pre><code class="language-python">TOOLS = [{
+    "name": "get_weather",                       # ^[a-zA-Z0-9_-]{1,64}$, unique
+    "description": "Current weather for one city. Use when the user asks about weather now. "
+                   "Returns 'temp C, conditions'. Read-only.",
+    "strict": True,                              # optional: guarantees schema-valid input
+    "input_schema": {
+        "type": "object",                        # always an object
+        "properties": {
+            "city": {"type": "string", "description": "City name, e.g. 'Paris'."},
+            "unit": {"type": "string", "enum": ["c", "f"], "description": "Temperature unit."},
+        },
+        "required": ["city"],                    # strict needs required ...
+        "additionalProperties": False,           # ... and additionalProperties: false
+    },
+}]</code></pre>
+    <ul>
+      <li>The model sees only <code>name</code>, <code>description</code>, and <code>input_schema</code>; it never runs
+        code. Say when to use the tool and what it returns (<a href="../modules/m07-tools-as-contracts.html">M07</a>,
+        <a href="../modules/m12-tool-design.html">M12</a>).</li>
+      <li><code>tool_choice</code> defaults to <code>auto</code>; <code>{"type": "none"}</code> disables tools. Forcing
+        a call is rejected on Opus 5.5: steer with the prompt.</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="pairing">
+    <h2>tool_use / tool_result pairing rules</h2>
+    <pre><code class="language-python">messages.append({"role": "assistant", "content": response.content})    # 1. the whole assistant turn
+messages.append({"role": "user", "content": [                            # 2. the very next message
+    {"type": "tool_result", "tool_use_id": "toolu_A", "content": "18 C, sunny"},
+    {"type": "tool_result", "tool_use_id": "toolu_B", "content": "No city named 'Pariss'.", "is_error": True},
+]})</code></pre>
+    <ol>
+      <li>Every <code>tool_use</code> gets exactly one <code>tool_result</code> with the same id as
+        <code>tool_use_id</code>.</li>
+      <li>The results go in the <strong>next</strong> message, which is a <code>user</code> message.</li>
+      <li><strong>Parallel calls</strong> (several <code>tool_use</code> blocks in one response): return <strong>all</strong>
+        results in <strong>one</strong> user message, not one message per result.</li>
+      <li><code>tool_result</code> blocks come <strong>first</strong> in that message; any text goes after them.</li>
+      <li>Never answer a <code>tool_use</code> that is not in the previous assistant message.</li>
+      <li>A failed tool still gets a result: <code>"is_error": True</code> and a message that says what went wrong and
+        how to recover (<a href="../modules/m10-errors-as-data.html">M10</a>). Never drop it.</li>
+    </ol>
+  </section>
+
+  <section class="lesson-section" id="loop">
+    <h2>The minimal loop</h2>
+    <pre><code class="language-python">def run_agent(client, task, tools, impls, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response, messages                     # end_turn, max_tokens, refusal, ...: caller decides
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                output = impls[block.name](**block.input)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+            except Exception as exc:                      # unknown tool, bad input, tool failure
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": f"{type(exc).__name__}: {exc}", "is_error": True})
+        messages.append({"role": "user", "content": results})   # all results, one message
+    raise RuntimeError(f"stopped after {max_steps} steps")</code></pre>
+    <p>Run it with a parallel call (two <code>tool_use</code> blocks in one response) and a failing tool. Two script
+      steps, two requests.</p>
+    <div class="runnable" data-title="The loop with parallel calls and an error">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for one city. Read-only.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+WEATHER = {"Paris": "18 C, sunny", "Oslo": "4 C, rain"}
+
+def get_weather(city):
+    if city not in WEATHER:
+        raise KeyError(f"no data for {city!r}; known cities: {', '.join(WEATHER)}")
+    return WEATHER[city]
+
+def run_agent(client, task, tools, impls, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response, messages
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                output = impls[block.name](**block.input)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+            except Exception as exc:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": f"{type(exc).__name__}: {exc}", "is_error": True})
+        messages.append({"role": "user", "content": results})
+    raise RuntimeError(f"stopped after {max_steps} steps")
+
+client = al.MockClient([
+    al.tool_calls([("get_weather", {"city": "Paris"}), ("get_weather", {"city": "Lyon"})]),
+    "Paris is 18 C and sunny. I have no weather data for Lyon.",
+])
+response, messages = run_agent(client, "Weather in Paris and Lyon?", TOOLS, {"get_weather": get_weather})
+print(al.format_transcript(messages))
+print("stop_reason:", response.stop_reason, "| requests:", len(client.requests))
+</textarea>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="bad-requests">
+    <h2>Common BadRequestErrors and fixes</h2>
+    <table>
+      <thead><tr><th>Error message (agentlab wording)</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>tool_use ids were found without tool_result blocks immediately after: toolu_...</code></td><td>A <code>tool_use</code> was not answered in the next message, or one of several parallel calls was skipped, or results were split across messages.</td><td>Answer every id, all in the one user message right after the assistant turn.</td></tr>
+        <tr><td><code>tool_result references unknown tool_use id ...</code></td><td>Wrong or made-up <code>tool_use_id</code>.</td><td>Copy <code>block.id</code> exactly.</td></tr>
+        <tr><td><code>tool_result blocks must answer tool_use blocks in the previous assistant message</code></td><td>The assistant turn was never appended, or only its text was appended.</td><td>Append <code>response.content</code> before the results.</td></tr>
+        <tr><td><code>tool_result blocks must come before any other content</code></td><td>Text placed before the results.</td><td>Put <code>tool_result</code> blocks first.</td></tr>
+        <tr><td><code>the final message must not be an assistant message</code></td><td>Prefill, or a loop that sent the history right after appending the assistant turn.</td><td>End with a user message.</td></tr>
+        <tr><td><code>the first message must use the 'user' role</code></td><td>History starts with <code>assistant</code>.</td><td>Start with <code>user</code>.</td></tr>
+        <tr><td><code>a system message cannot be the first message</code></td><td>The system prompt was put in <code>messages</code>.</td><td>Use the <code>system</code> parameter.</td></tr>
+        <tr><td><code>text content blocks must be non-empty</code></td><td>An empty string as content or in a text block.</td><td>Skip empty text; send a real message.</td></tr>
+        <tr><td><code>temperature: sampling parameters are not supported</code></td><td><code>temperature</code>, <code>top_p</code>, or <code>top_k</code>.</td><td>Remove them; steer with the prompt and <code>effort</code>.</td></tr>
+        <tr><td><code>tool_choice: type "tool" and "any" are not supported</code></td><td>Forced tool choice.</td><td>Use <code>auto</code> and steer with the prompt.</td></tr>
+        <tr><td><code>thinking: only {'type': 'adaptive'} is supported</code></td><td><code>disabled</code> or <code>budget_tokens</code>.</td><td>Omit <code>thinking</code> or use adaptive; control depth with <code>effort</code>.</td></tr>
+        <tr><td><code>tools.0.name: must match ...</code> / <code>tool names must be unique</code></td><td>Spaces, dots, or duplicates in names.</td><td>Use unique <code>snake_case</code> names.</td></tr>
+        <tr><td><code>input_schema: must be a JSON Schema with type 'object'</code></td><td>Missing schema or a non-object top level.</td><td>Wrap parameters in <code>{"type": "object", "properties": {...}}</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>A <code>BadRequestError</code> (400) never succeeds on retry: fix the request. Retry only <code>RateLimitError</code>
+      (429), <code>InternalServerError</code> (5xx), and <code>APIConnectionError</code>, with backoff.</p>
+  </section>
+
+  <section class="lesson-section" id="budgets">
+    <h2>Budget guards</h2>
+    <pre><code class="language-python">PRICE_IN, PRICE_OUT = 4 / 1_000_000, 20 / 1_000_000    # Opus 5.5: $4 / $20 per million tokens
+start, tokens, cost, seen = time.monotonic(), 0, 0.0, set()
+for step in range(MAX_STEPS):                            # 1. step limit
+    response = client.messages.create(...)
+    tokens += response.usage.input_tokens + response.usage.output_tokens
+    cost += response.usage.input_tokens * PRICE_IN + response.usage.output_tokens * PRICE_OUT
+    if tokens &gt; MAX_TOKENS: return report("token_budget")      # 2. token budget
+    if cost &gt; MAX_COST: return report("cost_budget")           # 3. cost budget
+    if time.monotonic() - start &gt; MAX_SECONDS: return report("time_limit")   # 4. wall clock
+    for block in tool_uses(response):
+        key = (block.name, json.dumps(block.input, sort_keys=True))
+        if key in seen: return report("repeated_call")         # 5. loop detection
+        seen.add(key)
+    ...
+return report("max_steps")</code></pre>
+    <ul>
+      <li>Always stop with a structured result: answer (if any), steps, tokens, cost, and the reason stopped
+        (<a href="../modules/m11-stop-conditions.html">M11</a>).</li>
+      <li>Input tokens grow every step, because the whole history is re-sent. Check budgets after every response.</li>
+      <li>Prices per million tokens (input/output): Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

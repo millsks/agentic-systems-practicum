@@ -1,0 +1,73 @@
+# pixi-policy.toml, written by `pixi policy init` from what this workspace uses today.
+# Tighten it from here; `pixi policy explain <RULE>` says what each rule checks.
+
+[sources]
+allowed-channels = ["conda-forge"]
+allow-git = false
+allow-url = false
+allow-path = true  # in use today
+
+[bans]
+deny = []  # e.g. { name = "pycrypto", reason = "unmaintained", use-instead = "pycryptodome" }
+
+[licenses]
+# Every license the conda packages declare today. pixi.lock records no PyPI licenses.
+allow = [
+  "0BSD",
+  "AFL-2.1",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSD-3-Clause-Attribution",
+  "BSD-3-Clause-Clear",
+  "FTL",
+  "GPL-2.0-only",
+  "GPL-2.0-only WITH GCC-exception-2.0",
+  "GPL-2.0-or-later",
+  "GPL-3.0-only",
+  "GPL-3.0-only WITH GCC-exception-3.1",
+  "HPND",
+  "HPND-sell-variant",
+  "IJG",
+  "ISC",
+  "LGPL-2.0-or-later",
+  "LGPL-2.1-only",
+  "LGPL-2.1-or-later",
+  "LGPL-3.0-only",
+  "LicenseRef-IntelSimplifiedSoftwareOct2022",
+  "LicenseRef-MicrosoftVisualCpp2015-2022Runtime",
+  "LicenseRef-MicrosoftWindowsSDK10",
+  "LicenseRef-Public-Domain",
+  "LicenseRef-Qhull",
+  "LicenseRef-Ubuntu-Font-Licence-Version-1.0",
+  "LicenseRef-libglvnd",
+  "MIT",
+  "MIT-open-group",
+  "MPL-1.1",
+  "MPL-2.0",
+  "OFL-1.1",
+  "OLDAP-2.8",
+  "PSF-2.0",
+  "PostgreSQL",
+  "Python-2.0",
+  "TCL",
+  "X11",
+  "Zlib",
+  "blessing",
+  "bzip2-1.0.6",
+  "curl",
+  "zlib-acknowledgement",
+]
+unknown = "allow"
+
+[manifest]
+wildcard-spec = false  # 9 dependencies are "*" today; give them ranges, then remove this
+required-platforms = [
+  "osx-arm64",
+  "osx-64",
+  "linux-64",
+  "win-64",
+]
+
+[lock]  # present, complete and in-sync are all on

@@ -1,0 +1,1357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M11 · Stop Conditions &amp; Budgets · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m11">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Module 11</p>
+    <h1>Stop Conditions &amp; Budgets</h1>
+    <p class="lede">An agent loop ends when the model stops asking for tools, and nothing guarantees that it will.
+      This module gives your loop its own reasons to stop: step limits, token and cost budgets, a clock, loop
+      detection, and correct handling of truncated and refused responses. Every run then ends with a report that says
+      what it produced, what it cost, and why it stopped.</p>
+    <div class="lesson-meta"><span>⏱ ~1.5 hours</span><span>Prerequisites: <a href="m09-agent-loop.html">M09 The Agent Loop</a>, <a href="m10-errors-as-data.html">M10 Errors as Data</a></span></div>
+    <ul class="objectives">
+      <li>Explain why a loop that only checks <code>stop_reason</code> can run forever, and why each step costs more than the last</li>
+      <li>Enforce a step limit and a wall-clock deadline, and end a capped run gracefully</li>
+      <li>Track tokens from <code>response.usage</code> and convert them to dollars at published prices</li>
+      <li>Detect repeated identical tool calls and either nudge the model or stop</li>
+      <li>Handle <code>max_tokens</code> (including a dropped tool call) and <code>refusal</code> in the middle of a loop without corrupting the history</li>
+      <li>Return a <code>RunResult</code> dataclass with the answer, why the run stopped, steps, tokens, and cost</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-stop">
+    <h2>Why a loop needs its own brakes</h2>
+    <p>The M09 loop has one exit: <code>stop_reason != "tool_use"</code>. That is the model's decision. Usually it
+      makes it after a few steps. But there are ordinary situations where it keeps going:</p>
+    <ul>
+      <li><strong>The task cannot be done with these tools.</strong> The model keeps searching with new wording,
+        hoping the next query works.</li>
+      <li><strong>A tool keeps failing.</strong> Error results (M10) invite a retry; a broken tool invites many.</li>
+      <li><strong>The model repeats itself.</strong> It calls the same tool with the same input and gets the same
+        result, again.</li>
+      <li><strong>The task is simply large.</strong> A legitimate job that needs 200 steps when you budgeted for 20.</li>
+    </ul>
+    <p>Step through a run with no natural end. The visualizer's loop stops only because a step limit exists.</p>
+    <div class="viz" data-viz="agent-loop" data-config='{"scenario": "runaway"}'></div>
+    <p>Now measure what such a run costs. The API is stateless (M02), so every request re-sends the whole history.
+      Each step adds an assistant turn and a tool result to that history, so <strong>each request has more input
+      tokens than the one before</strong>. The cell runs eight steps of a model that never gives up and prints the
+      usage of each.</p>
+    <div class="runnable" data-title="Eight steps of a runaway loop">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "search", "description": "Search the web. Returns matching page titles.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+
+def stubborn_model(request):
+    return al.tool_call("search", {"q": f"Atlantis census 2031, attempt {request.turn + 1}"},
+                        text="Nothing yet. Let me try another search.")
+
+client = al.MockClient(responder=stubborn_model)
+messages = [{"role": "user", "content": "Find the 2031 census population of Atlantis."}]
+total_in = total_out = 0
+for step in range(1, 9):                       # pretend we forgot to stop: watch 8 steps
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    total_in += response.usage.input_tokens
+    total_out += response.usage.output_tokens
+    print(f"step {step}: input={response.usage.input_tokens:4}  output={response.usage.output_tokens:3}  "
+          f"running total={total_in + total_out:5}")
+    messages.append({"role": "assistant", "content": response.content})
+    call = next(b for b in response.content if b.type == "tool_use")
+    messages.append({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": call.id, "content": "0 results"}]})
+print("stop_reason was still:", response.stop_reason)
+</textarea>
+    </div>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 480 220" role="img" aria-label="Bar chart: input tokens per step grow from 59 at step 1 to 577 at step 8">
+        <line x1="30" y1="180" x2="470" y2="180" stroke="var(--fg-muted)" stroke-width="1"/>
+        <g fill="var(--viz-1)">
+          <rect x="40" y="164.7" width="36" height="15.3"/>
+          <rect x="95" y="145.4" width="36" height="34.6"/>
+          <rect x="150" y="126.2" width="36" height="53.8"/>
+          <rect x="205" y="107.0" width="36" height="73.0"/>
+          <rect x="260" y="87.7" width="36" height="92.3"/>
+          <rect x="315" y="68.5" width="36" height="111.5"/>
+          <rect x="370" y="49.2" width="36" height="130.8"/>
+          <rect x="425" y="30.0" width="36" height="150.0"/>
+        </g>
+        <g fill="var(--fg)" font-size="11" text-anchor="middle">
+          <text x="58" y="160">59</text><text x="113" y="141">133</text><text x="168" y="122">207</text>
+          <text x="223" y="103">281</text><text x="278" y="83">355</text><text x="333" y="64">429</text>
+          <text x="388" y="45">503</text><text x="443" y="26">577</text>
+        </g>
+        <g fill="var(--fg-muted)" font-size="11" text-anchor="middle">
+          <text x="58" y="196">1</text><text x="113" y="196">2</text><text x="168" y="196">3</text><text x="223" y="196">4</text>
+          <text x="278" y="196">5</text><text x="333" y="196">6</text><text x="388" y="196">7</text><text x="443" y="196">8</text>
+          <text x="250" y="214">step</text>
+        </g>
+      </svg>
+      <figcaption>Input tokens per request in the runaway run. Each step re-sends everything before it, so the
+        per-step cost grows linearly and the run's total grows roughly with the square of the step count.</figcaption>
+    </figure>
+    <p>The mock's numbers are small because its messages are short. A real agent's requests carry a system prompt,
+      tool definitions, and tool results that may be thousands of tokens each, so the same shape reaches tens of
+      thousands of tokens per request within a few steps. A <strong>stop condition</strong> is any rule, checked by
+      your code, that ends the run regardless of what the model wants. A <strong>budget</strong> is a stop condition
+      expressed as a quantity you are willing to spend: steps, tokens, dollars, seconds.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> the model decides when it is done; your code decides when
+      it has spent enough. Every production loop needs both, because history grows every step and so does the cost of
+      the next request.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="max-steps">
+    <h2>Step limits and deadlines</h2>
+    <p>The simplest brake is a <strong>step limit</strong>: the maximum number of model requests in one run. One step
+      means one <code>messages.create</code> call, plus running whatever tools it asked for. Your M09 loop already took
+      a <code>max_steps</code> argument; what matters now is what the function <em>returns</em> when it hits the limit.
+      Returning <code>None</code> or an empty string hides the reason. Return the reason explicitly.</p>
+    <div class="runnable" data-title="A step limit that reports why it stopped">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "search", "description": "Search the web. Returns matching page titles.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+
+def stubborn_model(request):
+    return al.tool_call("search", {"q": f"Atlantis census 2031, attempt {request.turn + 1}"})
+
+def run_agent(client, task, tools, registry, max_steps=3):
+    messages = [{"role": "user", "content": task}]
+    steps = 0
+    while steps < max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        steps += 1
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text, "end_turn", steps
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": registry[b.name](**b.input)}
+                   for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return "", "max_steps", steps
+
+client = al.MockClient(responder=stubborn_model)
+answer, why, steps = run_agent(client, "Find the 2031 census population of Atlantis.", TOOLS,
+                               {"search": lambda q: "0 results"}, max_steps=3)
+print(f"stopped because {why!r} after {steps} steps; answer={answer!r}")
+</textarea>
+    </div>
+    <p>How big should the limit be? Large enough that a legitimate run never hits it, small enough that a runaway is
+      cheap. Look at real transcripts of successful runs and set the limit at a few times their typical step count.
+      Hitting the limit should be rare, and when it happens it should be logged and investigated.</p>
+    <h3>Ending gracefully</h3>
+    <p>A hard stop throws away everything the model learned. A <strong>graceful stop</strong> spends one more request
+      to collect a final answer. After the last tool results, add a text block (after the results, in the same user
+      message) telling the model it is out of steps, and send the request with <code>tool_choice={"type": "none"}</code>,
+      which tells the model it may not call tools on this turn. Then it can only answer with text.</p>
+    <div class="runnable" data-title="One last request, with tools switched off">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "search", "description": "Search the web. Returns matching page titles.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+
+client = al.MockClient([
+    al.tool_call("search", {"q": "Atlantis census 2031"}),
+    al.tool_call("search", {"q": "Atlantis population 2031"}),
+    al.tool_call("search", {"q": "Atlantis 2031 census data"}),
+    "I could not find any 2031 census figures for Atlantis. Atlantis is a legendary island, so no census exists.",
+])
+messages = [{"role": "user", "content": "Find the 2031 census population of Atlantis."}]
+max_steps = 3
+for step in range(1, max_steps + 1):
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    results = [{"type": "tool_result", "tool_use_id": b.id, "content": "0 results"}
+               for b in response.content if b.type == "tool_use"]
+    messages.append({"role": "user", "content": results})
+
+# Step limit reached. One last request: no tools allowed, and an instruction after the results.
+messages[-1]["content"].append({"type": "text", "text": "Step limit reached. Answer now with what you found, "
+                                                        "and say what is still unknown."})
+final = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages,
+                               tool_choice={"type": "none"})
+print(final.stop_reason, "->", final.text)
+print("requests:", len(client.requests))
+</textarea>
+    </div>
+    <p>Four scripted steps for four requests: three loop steps and the wrap-up. Keep sending <code>tools</code> on
+      that last request; the history contains <code>tool_use</code> blocks, and <code>tool_choice</code> is what
+      switches calling off. Remember that <code>tool_choice</code> can only be <code>auto</code> or <code>none</code>
+      on Opus 5.5; forcing a call is rejected (M07).</p>
+    <h3>Wall-clock deadlines</h3>
+    <p>Steps do not bound time. One step might take a second; another, with a slow tool and a long answer, a minute. If
+      a user is waiting, or a job must finish inside a scheduler's window, add a <strong>deadline</strong>: compute
+      <code>deadline = time.monotonic() + limit</code> at the start and check it before each request. As in M10, inject
+      the clock so you can test it.</p>
+    <div class="runnable" data-title="A deadline check with an injected clock">
+<textarea>
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+    def __call__(self):
+        return self.now
+
+clock = FakeClock()
+
+def slow_step():
+    clock.now += 7.5                 # pretend each model call plus tools takes 7.5 seconds
+
+def run(time_limit, now=clock):
+    deadline = now() + time_limit
+    steps = 0
+    while True:
+        if now() >= deadline:
+            return "deadline", steps
+        slow_step()
+        steps += 1
+
+print(run(time_limit=30.0))
+</textarea>
+    </div>
+    <p>A deadline checked between steps can overshoot by one step. That is usually fine; the per-tool timeouts from
+      M10 bound how long a single step can take.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> count one step per <code>messages.create</code> call, stop
+      at <code>max_steps</code>, and say so in the return value. For a graceful end, append an instruction after the
+      last results and make one more request with <code>tool_choice={"type": "none"}</code>. Check a
+      <code>time.monotonic()</code> deadline before each request when time matters.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="token-budget">
+    <h2>Token budgets from <code>usage</code></h2>
+    <p>Steps are a proxy. What you actually pay for, and what fills the context window, is tokens. Every response
+      carries <code>response.usage</code> (M02) with <code>input_tokens</code> (everything the request sent) and
+      <code>output_tokens</code> (everything the model generated). Add them up across the run and you have the run's
+      exact token spend.</p>
+    <pre><code class="language-python">input_tokens = output_tokens = 0
+while ...:
+    response = client.messages.create(...)
+    input_tokens += response.usage.input_tokens
+    output_tokens += response.usage.output_tokens
+    if input_tokens + output_tokens &gt; max_total_tokens:
+        ...   # stop with "token_budget"</code></pre>
+    <p>Three details matter:</p>
+    <ul>
+      <li><strong>Check after each response, before running its tools.</strong> The response is already paid for, but
+        nothing that follows is. Tools may be slow or have side effects, and their results only lead to another
+        request you have decided not to make.</li>
+      <li><strong>A budget checked after the fact can overshoot by one request.</strong> If that matters, estimate the
+        next request first: <code>al.estimate_request_tokens(messages, tools=tools)</code> in the mock, or
+        <code>client.messages.count_tokens(...)</code> on the real API (M01).</li>
+      <li><strong>Separate input from output.</strong> They are priced differently, and they tell different stories:
+        input that grows every step means history is piling up; large output means the model is writing a lot.</li>
+    </ul>
+    <p>In this course the mock estimates usage at about four characters per token, so its numbers show the shape, not
+      the exact counts a real tokenizer would give. The mock also always reports zero for the cache fields
+      (<code>cache_creation_input_tokens</code>, <code>cache_read_input_tokens</code>); prompt caching is a later
+      topic, and this module ignores those fields.</p>
+    <aside class="callout note" data-title="Task budgets on the real API">
+      <p>Your budget is enforced from outside: the model does not know it exists, so it cannot plan around it. The real
+        API also offers <strong>task budgets</strong> (in beta), where you tell the model how many tokens it has for the
+        whole task so it can pace its own work, for example by wrapping up when the budget runs low. Treat that as a
+        model-aware complement to the hard limits in this module, not a replacement: the model's pacing makes a good
+        ending more likely, and your loop's checks make a bounded bill certain.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> sum <code>usage.input_tokens</code> and
+      <code>usage.output_tokens</code> over the run. Check the budget right after each response and before running
+      tools. Estimate the next request if overshooting by one step is not acceptable.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="cost-budget">
+    <h2>Cost budgets in dollars</h2>
+    <p>Tokens become money at the model's published price, quoted in US dollars per million tokens, with separate
+      prices for input and output:</p>
+    <table>
+      <thead><tr><th>Model</th><th>Input ($ / M tokens)</th><th>Output ($ / M tokens)</th></tr></thead>
+      <tbody>
+        <tr><td><code>claude-opus-5-5</code></td><td>4.00</td><td>20.00</td></tr>
+        <tr><td><code>claude-sonnet-5-5</code></td><td>2.00</td><td>10.00</td></tr>
+        <tr><td><code>claude-haiku-5-5</code></td><td>0.10</td><td>0.50</td></tr>
+      </tbody>
+    </table>
+    <p>The formula is <code>(input_tokens × input_price + output_tokens × output_price) / 1,000,000</code>. Output is
+      five times the price of input on every model here, but agent runs are usually dominated by input, because every
+      step re-reads the history.</p>
+    <div class="runnable" data-title="From tokens to dollars">
+<textarea>
+PRICES = {                      # USD per million tokens: (input, output)
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+# The eight-step runaway from the first cell: 2,544 input and 160 output tokens.
+for model in PRICES:
+    print(f"{model:18} ${cost_usd(model, 2544, 160):.6f}")
+
+# A realistic agent: 40 steps averaging 30,000 input and 800 output tokens each.
+print(f"40 real steps on Opus: ${cost_usd('claude-opus-5-5', 40 * 30_000, 40 * 800):.2f}")
+</textarea>
+    </div>
+    <p>A cent or two per run looks harmless until you multiply: a runaway that costs five dollars, triggered by a
+      scheduled job every ten minutes, is a large bill by the end of the month. A cost budget per run puts a ceiling
+      on the worst case, and the total cost in your run report lets you add up spend across runs.</p>
+    <aside class="callout warn" data-title="Common mistakes">
+      <ul>
+        <li><strong>Dividing by 1,000 instead of 1,000,000.</strong> Prices are per <em>million</em> tokens.</li>
+        <li><strong>Using one price for both directions.</strong> Output costs five times input here.</li>
+        <li><strong>Pricing only the last request.</strong> Sum usage over every request in the run, including ones
+          whose responses you then discard.</li>
+        <li><strong>Hard-coding prices in the loop.</strong> Keep them in one table keyed by model id, so changing
+          model or price is a one-line edit.</li>
+      </ul>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> cost = (input × input price + output × output price) /
+      1,000,000, with prices per model. Check a dollar budget the same way and in the same place as a token
+      budget.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="repeated-calls">
+    <h2>Detecting repeated tool calls</h2>
+    <p>Budgets stop a runaway eventually. Loop detection stops one of its most common causes early: the model calling
+      the <em>same tool with the same input</em> again. Most tools are deterministic over a short run, so an identical
+      call gets an identical result; repeating it cannot help.</p>
+    <p>To detect "identical", you need a <strong>key</strong> for each call: a value that is equal exactly when two
+      calls are the same. The tool name plus the input serialized with <code>json.dumps(input, sort_keys=True)</code>
+      works well. <code>sort_keys=True</code> matters: <code>{"q": "x", "limit": 5}</code> and
+      <code>{"limit": 5, "q": "x"}</code> are the same call, and sorting makes their JSON identical (including nested
+      dicts). A <code>collections.Counter</code> then counts each key.</p>
+    <div class="runnable" data-title="Predict: which calls count as the same?" data-predict>
+<textarea>
+import json
+from collections import Counter
+
+def call_key(name, tool_input):
+    return name + ":" + json.dumps(tool_input, sort_keys=True)
+
+seen = Counter()
+calls = [
+    ("search", {"q": "atlantis", "limit": 5}),
+    ("search", {"limit": 5, "q": "atlantis"}),     # same call, keys in another order
+    ("search", {"q": "Atlantis", "limit": 5}),     # different: capital A
+    ("search", {"q": "atlantis", "limit": 5}),
+]
+for name, tool_input in calls:
+    key = call_key(name, tool_input)
+    seen[key] += 1
+    print(seen[key], key)
+</textarea>
+    </div>
+    <p>When you detect a repeat, you have two responses, and good loops use both in order:</p>
+    <ol>
+      <li><strong>Nudge.</strong> Do not run the tool. Send an error result that says the call is a repeat and
+        suggests what to do instead. This is M10's "errors as data" applied to behavior: the model usually changes
+        course when told.</li>
+      <li><strong>Stop.</strong> If the same call keeps coming after the nudge, end the run with a clear reason such as
+        <code>"repeated_call"</code>.</li>
+    </ol>
+    <div class="runnable" data-title="Nudge on the first repeat">
+<textarea>
+import json
+from collections import Counter
+import agentlab as al
+
+TOOLS = [{"name": "search", "description": "Search the web. Returns matching page titles.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+
+def call_key(name, tool_input):
+    return name + ":" + json.dumps(tool_input, sort_keys=True)
+
+client = al.MockClient([
+    al.tool_call("search", {"q": "Atlantis census 2031"}),
+    al.tool_call("search", {"q": "Atlantis census 2031"}),
+    lambda request: (
+        "No source has a 2031 census for Atlantis; it is a legendary island."
+        if request.tool_results[0].get("is_error") else al.tool_call("search", {"q": "Atlantis census 2031"})
+    ),
+])
+messages = [{"role": "user", "content": "Find the 2031 census population of Atlantis."}]
+seen = Counter()
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        key = call_key(block.name, block.input)
+        seen[key] += 1
+        if seen[key] > 1:
+            results.append({"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                            "content": f"You already called {block.name} with exactly this input "
+                                       f"({seen[key] - 1} time(s)); the result will not change. "
+                                       "Try a different input or answer with what you have."})
+        else:
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": "0 results"})
+    messages.append({"role": "user", "content": results})
+print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <aside class="callout think"><p>Not every repeat is a loop. Polling a job's status (<code>get_status(job_id)</code>)
+      or reading the time legitimately repeats an identical call, because the answer changes. Exempt such tools, or
+      give them a higher limit. Exact-match detection also misses near-repeats, like the runaway's slightly reworded
+      searches; budgets catch those.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> key each call by name plus
+      <code>json.dumps(input, sort_keys=True)</code>, count with a <code>Counter</code>, nudge with an error result on
+      the first repeat, and stop when repeats exceed your limit.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="max-tokens-refusal">
+    <h2>Truncation and refusal in the middle of a loop</h2>
+    <p>M03 covered every <code>stop_reason</code> for a single call. Inside a loop, two of them need extra care because
+      they can leave you with a response you must not treat like a normal turn.</p>
+    <h3><code>max_tokens</code>: the response was cut off</h3>
+    <p>If the model hits your <code>max_tokens</code> limit while writing, generation stops wherever it was. If it was
+      in the middle of a tool call, that call is incomplete: its input is not usable JSON for your function. The mock
+      models this by <strong>dropping a tool_use block that does not fit</strong>. You keep any text that came before
+      it, the <code>stop_reason</code> is <code>"max_tokens"</code>, and there is nothing to run.</p>
+    <div class="runnable" data-title="The same step with a small and a large max_tokens">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "save_report", "description": "Save a report to disk.",
+          "input_schema": {"type": "object", "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+                           "required": ["title", "body"]}}]
+step = al.tool_call("save_report", {"title": "Q3", "body": "Revenue grew 12% on strong demand in every region."},
+                    text="I'll save the report now.")
+client = al.MockClient([step, step])
+messages = [{"role": "user", "content": "Write and save the Q3 report."}]
+
+small = client.messages.create(model=al.MODEL, max_tokens=12, tools=TOOLS, messages=messages)
+print("max_tokens=12  ->", small.stop_reason, [b.type for b in small.content], repr(small.text))
+
+big = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+print("max_tokens=1024 ->", big.stop_reason, [b.type for b in big.content])
+</textarea>
+    </div>
+    <p>A loop that checks only for <code>"end_turn"</code> treats that truncated response as a tool step, finds no
+      <code>tool_use</code> blocks, and appends a user message with an empty list of results. Worse, if nothing at all
+      fit, <code>response.content</code> is empty, and appending it creates an empty assistant turn. Either way the
+      next request is invalid:</p>
+    <div class="runnable" data-title="An empty turn breaks the history">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "save_report", "description": "Save a report to disk.",
+          "input_schema": {"type": "object", "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+                           "required": ["title", "body"]}}]
+client = al.MockClient([al.tool_call("save_report", {"title": "Q3", "body": "Revenue grew 12% this quarter."})])
+messages = [{"role": "user", "content": "Write and save the Q3 report."}]
+
+response = client.messages.create(model=al.MODEL, max_tokens=5, tools=TOOLS, messages=messages)
+print(response.stop_reason, response.content)
+messages.append({"role": "assistant", "content": response.content})     # the naive loop does this
+try:
+    messages.append({"role": "user", "content": "continue"})
+    client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+except al.BadRequestError as exc:
+    print("BadRequestError:", exc.message)
+</textarea>
+    </div>
+    <p>There are two sound responses to <code>max_tokens</code> in a loop:</p>
+    <ul>
+      <li><strong>Stop and report it</strong> with reason <code>"max_tokens"</code> and whatever text arrived as a
+        partial answer. This is the right default: it is simple, and a recurring truncation is a configuration problem
+        you want to see.</li>
+      <li><strong>Retry the same request with a larger <code>max_tokens</code></strong>, without appending the
+        truncated response. Bound this (one retry, up to a ceiling) so it cannot become a loop of its own. Very large
+        values need streaming (M04).</li>
+    </ul>
+    <p>Never run a tool call from a response that stopped for <code>max_tokens</code>, and never append an empty
+      content list.</p>
+    <h3><code>refusal</code>: the model declined</h3>
+    <p>A refusal can arrive at any step, including after several successful tool calls: the task may turn into
+      something the model will not do. The response has <code>stop_reason="refusal"</code>, usually no content, and
+      <code>stop_details</code> with a <code>category</code> and an <code>explanation</code>.</p>
+    <div class="runnable" data-title="A refusal on step two">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "lookup", "description": "Look up a public fact.",
+          "input_schema": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}]
+client = al.MockClient([
+    al.tool_call("lookup", {"topic": "router firmware"}),
+    al.refusal("cyber", "Writing a working exploit for a specific device is not something I can help with."),
+])
+messages = [{"role": "user", "content": "Check my router's firmware and then write an exploit for it."}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    if response.stop_reason == "refusal":
+        details = response.stop_details
+        print("refused mid-loop: category =", details.category)
+        print("explanation:", details.explanation)
+        print("content:", response.content)
+        break
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    messages.append({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": b.id, "content": "Firmware 2.1.4, released 2025."}
+        for b in response.content if b.type == "tool_use"]})
+print("requests:", len(client.requests))
+</textarea>
+    </div>
+    <p>Stop the run with reason <code>"refusal"</code>, record the category and explanation in your logs, and show the
+      user a clear message. Do not retry the same conversation hoping for a different outcome, and do not append the
+      empty turn.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> branch on every <code>stop_reason</code>, not just
+      <code>end_turn</code>. Only <code>tool_use</code> means "run tools and continue". On <code>max_tokens</code> and
+      <code>refusal</code>, stop (or for <code>max_tokens</code>, retry the request with a bigger limit), and never
+      append empty content.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="run-result">
+    <h2>A structured run result</h2>
+    <p>With all these exits, "return the final text" is no longer enough. The caller needs to know <em>whether</em>
+      the text is an answer, and what the run cost. Return a <strong>dataclass</strong> (a class whose fields Python
+      turns into an <code>__init__</code> and a readable <code>repr</code> for you):</p>
+    <pre><code class="language-python">from dataclasses import dataclass, field
+
+@dataclass
+class RunResult:
+    answer: str            # final text; may be partial or empty when the run did not finish
+    stopped_because: str   # "end_turn", "max_steps", "token_budget", "cost_budget",
+                           # "repeated_call", "max_tokens", "refusal", "deadline", ...
+    steps: int             # messages.create calls made
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)   # the transcript, for debugging</code></pre>
+    <p>The field is called <code>stopped_because</code> rather than <code>stop_reason</code> on purpose: the API's
+      <code>stop_reason</code> describes one response, while this describes the whole run, and several of its values
+      (<code>"max_steps"</code>, <code>"cost_budget"</code>) come from your code, not the model. Only
+      <code>stopped_because == "end_turn"</code> means the model finished on its own.</p>
+    <p>The order of checks inside the loop is where the design lives:</p>
+    <pre class="mermaid">flowchart TD
+  S{steps &lt; max_steps?} -->|no| MS[stop: max_steps]
+  S -->|yes| C[messages.create, steps += 1, add usage]
+  C --> R{stop_reason}
+  R -->|end_turn, max_tokens, refusal, other| E[stop with that reason]
+  R -->|tool_use| B{over cost or token budget?}
+  B -->|yes| BB[stop: cost_budget / token_budget]
+  B -->|no| P{identical call over the limit?}
+  P -->|yes| PP[stop: repeated_call]
+  P -->|no| T[run tools, append results] --> S</pre>
+    <div class="runnable" data-title="run_agent with every stop condition">
+<textarea>
+import json
+from collections import Counter
+from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10, max_total_tokens=50_000,
+              max_cost_usd=0.50, max_identical_calls=2):
+    messages = [{"role": "user", "content": task}]
+    seen = Counter()
+    steps = input_tokens = output_tokens = 0
+
+    def finish(why, answer=""):
+        return RunResult(answer, why, steps, input_tokens, output_tokens,
+                         cost_usd(al.MODEL, input_tokens, output_tokens), messages)
+
+    while steps < max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        steps += 1
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        if response.content:
+            messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return finish(response.stop_reason, response.text)    # end_turn, max_tokens, refusal, ...
+        if cost_usd(al.MODEL, input_tokens, output_tokens) > max_cost_usd:
+            return finish("cost_budget", response.text)
+        if input_tokens + output_tokens > max_total_tokens:
+            return finish("token_budget", response.text)
+        calls = [b for b in response.content if b.type == "tool_use"]
+        for block in calls:
+            seen[block.name + ":" + json.dumps(block.input, sort_keys=True)] += 1
+        if max(seen.values()) > max_identical_calls:
+            return finish("repeated_call", response.text)
+        messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))} for b in calls]})
+    return finish("max_steps")
+
+TOOLS = [{"name": "search", "description": "Search the web. Returns matching page titles.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+registry = {"search": lambda q: "0 results"}
+task = "Find the 2031 census population of Atlantis."
+
+runs = {
+    "finishes": al.MockClient([al.tool_call("search", {"q": "Atlantis census"}), "There is no such census."]),
+    "wanders": al.MockClient(responder=lambda r: al.tool_call("search", {"q": f"Atlantis {r.turn}"})),
+    "repeats": al.MockClient(responder=lambda r: al.tool_call("search", {"q": "Atlantis census"})),
+}
+for label, client in runs.items():
+    print(f"{label:9}", run_agent(client, task, TOOLS, registry, max_steps=6))
+print(f"{'budget':9}", run_agent(runs["wanders"], task, TOOLS, registry, max_total_tokens=300))
+</textarea>
+    </div>
+    <p>Four runs, four different reasons, and each report says exactly what happened. This version keeps the tool
+      execution minimal so the stop logic stands out; a real agent would use M10's <code>execute_tool</code> and
+      <code>call_with_retry</code> in those two places. (Retried requests that failed have no usage to add, so retries
+      do not change the token count; they do cost time, which a deadline covers.)</p>
+    <aside class="callout warn" data-title="A stopped run is not resumable as is">
+      <p>When the loop stops on a budget or a repeat, the last assistant turn contains <code>tool_use</code> blocks with
+        no results. That transcript cannot be sent again unchanged. If you want to continue later, first append a user
+        message answering every pending call, for example with error results saying the run was paused.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> return a <code>RunResult</code> with the answer,
+      <code>stopped_because</code>, steps, input and output tokens, and cost. Check stop reasons first, then budgets,
+      then repeats, then run tools. Only <code>"end_turn"</code> is a natural finish.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser against the mock and are graded instantly. Exercises 3 to 5 build up one
+      <code>run_agent</code>; each starter gives you a working base to extend.</p>
+
+    <div class="exercise" data-id="m11-e1" data-title="Price a run">
+      <div class="exercise-prompt">
+        <p>Write <code>cost_usd(model, input_tokens, output_tokens)</code> using the <code>PRICES</code> table in the
+          starter (US dollars per million tokens, input then output). Return the cost as a float. For a model that is
+          not in the table, raise <code>ValueError</code> with a message that names the model.</p>
+      </div>
+<textarea class="starter">
+PRICES = {
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+}
+
+def cost_usd(model, input_tokens, output_tokens):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import math
+
+def test_opus_input_only():
+    assert math.isclose(cost_usd("claude-opus-5-5", 1_000_000, 0), 4.0), "1M Opus input tokens cost $4.00"
+
+def test_output_price():
+    assert math.isclose(cost_usd("claude-opus-5-5", 0, 1_000_000), 20.0), "1M Opus output tokens cost $20.00"
+
+def test_mixed():
+    got = cost_usd("claude-haiku-5-5", 2000, 1000)
+    assert math.isclose(got, 0.0007), f"2000 in + 1000 out on Haiku is $0.0007, got {got}"
+    got = cost_usd("claude-sonnet-5-5", 30_000, 800)
+    assert math.isclose(got, 0.068), f"30,000 in + 800 out on Sonnet is $0.068, got {got}"
+
+def test_unknown_model():
+    try:
+        cost_usd("claude-opus-5-5-20260101", 10, 10)
+    except ValueError as exc:
+        assert "claude-opus-5-5-20260101" in str(exc), "the error message should name the unknown model"
+    else:
+        raise AssertionError("an unknown model should raise ValueError")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Check <code>if model not in PRICES</code> first and raise.
+        Then unpack <code>price_in, price_out = PRICES[model]</code> and divide the weighted sum by
+        <code>1_000_000</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">PRICES = {
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+}
+
+def cost_usd(model, input_tokens, output_tokens):
+    if model not in PRICES:
+        raise ValueError(f"no price for model {model!r}")
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m11-e2" data-title="Spot the repeat">
+      <div class="exercise-prompt">
+        <p>Write a class <code>CallTracker</code> with a method <code>record(name, tool_input)</code> that returns how
+          many times this exact call (same tool name, same input) has now been recorded, including this time. Inputs
+          that differ only in key order, at any nesting level, are the same call. Each tracker counts independently.</p>
+      </div>
+<textarea class="starter">
+import json
+from collections import Counter
+
+class CallTracker:
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+def test_counts():
+    t = CallTracker()
+    assert t.record("search", {"q": "a"}) == 1, "first call should return 1"
+    assert t.record("search", {"q": "a"}) == 2, "the same call again should return 2"
+    assert t.record("search", {"q": "b"}) == 1, "a different input is a different call"
+    assert t.record("lookup", {"q": "a"}) == 1, "a different tool name is a different call"
+
+def test_key_order():
+    t = CallTracker()
+    t.record("search", {"q": "a", "limit": 5, "filters": {"lang": "en", "year": 2031}})
+    n = t.record("search", {"filters": {"year": 2031, "lang": "en"}, "limit": 5, "q": "a"})
+    assert n == 2, "key order (including nested dicts) must not matter"
+
+def test_independent_trackers():
+    a, b = CallTracker(), CallTracker()
+    a.record("search", {"q": "x"})
+    assert b.record("search", {"q": "x"}) == 1, "each tracker needs its own counts (no shared class-level dict)"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Create the <code>Counter</code> in <code>__init__</code>
+        (<code>self.counts = Counter()</code>), not as a class attribute, or every tracker shares it. The key is
+        <code>name + ":" + json.dumps(tool_input, sort_keys=True)</code>; <code>sort_keys</code> sorts nested dicts
+        too.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import json
+from collections import Counter
+
+class CallTracker:
+    def __init__(self):
+        self.counts = Counter()
+
+    def record(self, name, tool_input):
+        key = name + ":" + json.dumps(tool_input, sort_keys=True)
+        self.counts[key] += 1
+        return self.counts[key]</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m11-e3" data-title="Steps, tokens, and a report">
+      <div class="exercise-prompt">
+        <p>The starter's <code>run_agent</code> is the compact M09 loop. Change it to return a <code>RunResult</code>
+          (defined in the starter) instead of text:</p>
+        <ul>
+          <li>Count <code>steps</code> (one per <code>messages.create</code> call) and never make more than
+            <code>max_steps</code> requests.</li>
+          <li>Sum <code>response.usage.input_tokens</code> and <code>output_tokens</code> across all responses, and set
+            <code>cost_usd</code> with the provided <code>cost_usd(al.MODEL, ...)</code>.</li>
+          <li>When the model finishes (<code>stop_reason == "end_turn"</code>): <code>answer</code> is its text,
+            <code>stopped_because</code> is <code>"end_turn"</code>.</li>
+          <li>When the step limit is reached: <code>answer=""</code>, <code>stopped_because="max_steps"</code>.</li>
+          <li>Put the conversation in <code>messages</code>.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    while True:
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+                   for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+</textarea>
+      <script type="text/x-python" class="tests">
+import math
+import agentlab as al
+
+TOOLS = [{"name": "search", "description": "Search.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+REG = {"search": lambda q: "0 results"}
+
+class Spy:
+    def __init__(self, script=None, responder=None):
+        self.inner = al.MockClient(script, responder=responder)
+        self.responses = []
+        self.messages = self
+    def create(self, **kwargs):
+        response = self.inner.messages.create(**kwargs)
+        self.responses.append(response)
+        return response
+
+def test_finishes():
+    spy = Spy([al.tool_call("search", {"q": "x"}), "All done."])
+    r = run_agent(spy, "find x", TOOLS, REG)
+    assert isinstance(r, RunResult), f"run_agent should return a RunResult, got {type(r).__name__}"
+    assert r.answer == "All done." and r.stopped_because == "end_turn", f"expected the final answer and 'end_turn', got {r}"
+    assert r.steps == 2, f"two requests means steps == 2, got {r.steps}"
+    assert r.input_tokens == sum(x.usage.input_tokens for x in spy.responses), "input_tokens must sum every response's usage"
+    assert r.output_tokens == sum(x.usage.output_tokens for x in spy.responses), "output_tokens must sum every response's usage"
+    assert math.isclose(r.cost_usd, cost_usd(al.MODEL, r.input_tokens, r.output_tokens)), "cost_usd must match the token totals"
+    assert len(r.messages) == 4, f"messages should hold user, assistant, user, assistant; got {len(r.messages)}"
+
+def test_step_limit():
+    spy = Spy(responder=lambda req: al.tool_call("search", {"q": f"try {req.turn}"}))
+    r = run_agent(spy, "find x", TOOLS, REG, max_steps=4)
+    assert len(spy.responses) == 4, f"max_steps=4 allows exactly 4 requests, made {len(spy.responses)}"
+    assert r.stopped_because == "max_steps" and r.answer == "", f"expected answer '' and 'max_steps', got {r}"
+    assert r.steps == 4, f"steps should be 4, got {r.steps}"
+    assert r.input_tokens == sum(x.usage.input_tokens for x in spy.responses), "count tokens from every step"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Replace <code>while True</code> with
+        <code>while steps &lt; max_steps</code>, increment <code>steps</code> right after each call, add the usage, and
+        after the loop return the <code>"max_steps"</code> result. A small inner function
+        <code>finish(why, answer)</code> that builds the <code>RunResult</code> avoids repeating six arguments.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    steps = input_tokens = output_tokens = 0
+
+    def finish(why, answer):
+        return RunResult(answer, why, steps, input_tokens, output_tokens,
+                         cost_usd(al.MODEL, input_tokens, output_tokens), messages)
+
+    while steps &lt; max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        steps += 1
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return finish("end_turn", response.text)
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+                   for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return finish("max_steps", "")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m11-e4" data-title="Fix this broken agent: truncation and refusal">
+      <div class="exercise-prompt">
+        <p>This agent works until the model refuses or runs out of tokens mid-run. Two bug reports:</p>
+        <pre><code>Run A: "Check my router, then write an exploit for it."
+  step 1: tool_use check_device {"device": "router"}
+  step 2: stop_reason=refusal, content=[]
+  BadRequestError: messages.3.content: must be a non-empty string or list of blocks
+
+Run B: "Save a long note."  (max_tokens=20)
+  step 1: stop_reason=max_tokens, content=[text "Saving the note now."]   (tool_use dropped)
+  BadRequestError: messages.2.content: must be a non-empty string or list of blocks</code></pre>
+        <p>Fix <code>run_agent</code> so that it handles every <code>stop_reason</code>:</p>
+        <ul>
+          <li><code>"tool_use"</code>: run the tools and continue, as now.</li>
+          <li><code>"refusal"</code>: stop with <code>stopped_because="refusal"</code> and <code>answer=""</code>.</li>
+          <li><code>"max_tokens"</code>: stop with <code>stopped_because="max_tokens"</code> and the partial text as
+            <code>answer</code>.</li>
+          <li><code>"end_turn"</code> (and anything else): stop with that stop reason and the text.</li>
+        </ul>
+        <p>Make no further request after a stop, keep counting steps and tokens, and never append an assistant message
+          with empty content to <code>messages</code>.</p>
+      </div>
+<textarea class="starter">
+from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10, max_tokens=1024):
+    messages = [{"role": "user", "content": task}]
+    steps = input_tokens = output_tokens = 0
+
+    def finish(why, answer):
+        return RunResult(answer, why, steps, input_tokens, output_tokens,
+                         cost_usd(al.MODEL, input_tokens, output_tokens), messages)
+
+    while steps < max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=max_tokens, tools=tools, messages=messages)
+        steps += 1
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "end_turn":
+            return finish("end_turn", response.text)
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+                   for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return finish("max_steps", "")
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+TOOLS = [{"name": "check_device", "description": "Look up a device's firmware.",
+          "input_schema": {"type": "object", "properties": {"device": {"type": "string"}}, "required": ["device"]}},
+         {"name": "save_note", "description": "Save a note.",
+          "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}]
+
+def _registry(log):
+    return {"check_device": lambda device: log.append("check") or "firmware 2.1.4",
+            "save_note": lambda text: log.append("save") or "saved"}
+
+def _no_empty(messages):
+    return all(m["content"] for m in messages)
+
+def test_refusal_mid_run():
+    log = []
+    client = al.MockClient([al.tool_call("check_device", {"device": "router"}),
+                            al.refusal("cyber", "I can't help write an exploit.")])
+    try:
+        r = run_agent(client, "Check my router, then write an exploit for it.", TOOLS, _registry(log))
+    except al.BadRequestError as exc:
+        raise AssertionError(f"still sending a broken request after the refusal: {exc.message}") from None
+    assert r.stopped_because == "refusal", f"stopped_because should be 'refusal', got {r.stopped_because!r}"
+    assert r.answer == "", "a refusal has no answer text"
+    assert r.steps == 2 and len(client.requests) == 2, "stop right after the refusal: two requests in total"
+    assert log == ["check"], "the first tool still runs"
+    assert _no_empty(r.messages), "never append a message with empty content"
+
+def test_max_tokens_drops_tool():
+    log = []
+    client = al.MockClient([al.tool_call("save_note", {"text": "x" * 400}, text="Saving the note now.")])
+    try:
+        r = run_agent(client, "Save a long note.", TOOLS, _registry(log), max_tokens=20)
+    except al.BadRequestError as exc:
+        raise AssertionError(f"still sending a broken request after max_tokens: {exc.message}") from None
+    assert r.stopped_because == "max_tokens", f"stopped_because should be 'max_tokens', got {r.stopped_because!r}"
+    assert r.answer == "Saving the note now.", f"keep the partial text as the answer, got {r.answer!r}"
+    assert log == [], "a truncated response has no complete tool call to run"
+    assert r.steps == 1 and r.input_tokens > 0, "steps and tokens are still counted"
+    assert _no_empty(r.messages), "never append a message with empty content"
+
+def test_normal_run_still_works():
+    log = []
+    client = al.MockClient([al.tool_call("check_device", {"device": "router"}), "Firmware 2.1.4 is current."])
+    r = run_agent(client, "Check my router.", TOOLS, _registry(log))
+    assert r.stopped_because == "end_turn" and r.answer == "Firmware 2.1.4 is current.", f"normal runs end with end_turn, got {r}"
+    assert r.steps == 2, f"two steps expected, got {r.steps}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Append the assistant turn only
+        <code>if response.content:</code>. Then replace the single <code>end_turn</code> check with
+        <code>if response.stop_reason != "tool_use":</code> and return
+        <code>finish(response.stop_reason, response.text)</code>; a refusal's <code>text</code> is already
+        <code>""</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10, max_tokens=1024):
+    messages = [{"role": "user", "content": task}]
+    steps = input_tokens = output_tokens = 0
+
+    def finish(why, answer):
+        return RunResult(answer, why, steps, input_tokens, output_tokens,
+                         cost_usd(al.MODEL, input_tokens, output_tokens), messages)
+
+    while steps &lt; max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=max_tokens, tools=tools, messages=messages)
+        steps += 1
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        if response.content:
+            messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return finish(response.stop_reason, response.text)
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+                   for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return finish("max_steps", "")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m11-e5" data-title="Budgets and loop detection">
+      <div class="exercise-prompt">
+        <p>Add three more stop conditions to the fixed agent. New keyword arguments:
+          <code>max_total_tokens=50_000</code>, <code>max_cost_usd=0.50</code>, <code>max_identical_calls=2</code>.
+          After a <code>tool_use</code> response has been counted and appended, and <strong>before running any
+          tool</strong>, check in this order:</p>
+        <ol>
+          <li>Run cost so far greater than <code>max_cost_usd</code>: stop with <code>"cost_budget"</code>.</li>
+          <li>Input plus output tokens so far greater than <code>max_total_tokens</code>: stop with
+            <code>"token_budget"</code>.</li>
+          <li>Record every tool call in this response (name plus input, key order ignored). If any call has now been
+            requested more than <code>max_identical_calls</code> times: stop with <code>"repeated_call"</code>.</li>
+        </ol>
+        <p>On these stops, <code>answer</code> is the response's text. Everything from exercises 3 and 4 still
+          applies.</p>
+      </div>
+<textarea class="starter">
+import json
+from collections import Counter
+from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10, max_tokens=1024,
+              max_total_tokens=50_000, max_cost_usd=0.50, max_identical_calls=2):
+    messages = [{"role": "user", "content": task}]
+    steps = input_tokens = output_tokens = 0
+
+    def finish(why, answer):
+        return RunResult(answer, why, steps, input_tokens, output_tokens,
+                         cost_usd(al.MODEL, input_tokens, output_tokens), messages)
+
+    while steps < max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=max_tokens, tools=tools, messages=messages)
+        steps += 1
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        if response.content:
+            messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return finish(response.stop_reason, response.text)
+        # budgets and repeat detection go here
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+                   for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return finish("max_steps", "")
+</textarea>
+      <script type="text/x-python" class="tests">
+import math
+import agentlab as al
+
+TOOLS = [{"name": "search", "description": "Search.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+
+class Spy:
+    def __init__(self, script=None, responder=None):
+        self.inner = al.MockClient(script, responder=responder)
+        self.responses = []
+        self.messages = self
+    def create(self, **kwargs):
+        response = self.inner.messages.create(**kwargs)
+        self.responses.append(response)
+        return response
+
+def _counting_registry():
+    runs = []
+    return runs, {"search": lambda q: runs.append(q) or "0 results"}
+
+def _wander(req):
+    return al.tool_call("search", {"q": f"Atlantis {req.turn}"})
+
+def _totals(responses):
+    return sum(r.usage.input_tokens for r in responses), sum(r.usage.output_tokens for r in responses)
+
+def test_token_budget():
+    runs, reg = _counting_registry()
+    spy = Spy(responder=_wander)
+    r = run_agent(spy, "census", TOOLS, reg, max_steps=50, max_total_tokens=300)
+    assert r.stopped_because == "token_budget", f"expected 'token_budget', got {r.stopped_because!r}"
+    i, o = _totals(spy.responses)
+    i_prev, o_prev = _totals(spy.responses[:-1])
+    assert i + o > 300 and i_prev + o_prev <= 300, "stop on the first response that takes the total over the budget"
+    assert (r.input_tokens, r.output_tokens) == (i, o), "the report must include the tokens of the final response"
+    assert len(runs) == r.steps - 1, "do not run the tools of the response that broke the budget"
+
+def test_cost_budget():
+    runs, reg = _counting_registry()
+    spy = Spy(responder=_wander)
+    r = run_agent(spy, "census", TOOLS, reg, max_steps=50, max_cost_usd=0.002)
+    assert r.stopped_because == "cost_budget", f"expected 'cost_budget', got {r.stopped_because!r}"
+    i, o = _totals(spy.responses)
+    i_prev, o_prev = _totals(spy.responses[:-1])
+    assert cost_usd(al.MODEL, i, o) > 0.002 >= cost_usd(al.MODEL, i_prev, o_prev), \
+        "stop on the first response that takes the cost over the budget"
+    assert math.isclose(r.cost_usd, cost_usd(al.MODEL, i, o)), "report the total cost"
+    assert len(runs) == r.steps - 1, "do not run the tools of the response that broke the budget"
+
+def test_repeated_call():
+    runs, reg = _counting_registry()
+    spy = Spy(responder=lambda req: al.tool_call("search", {"q": "Atlantis census"}))
+    r = run_agent(spy, "census", TOOLS, reg, max_steps=50, max_identical_calls=2)
+    assert r.stopped_because == "repeated_call", f"expected 'repeated_call', got {r.stopped_because!r}"
+    assert r.steps == 3, f"the third identical request triggers the stop; steps should be 3, got {r.steps}"
+    assert runs == ["Atlantis census", "Atlantis census"], f"the tool should run exactly twice, ran {len(runs)} times"
+
+def test_repeat_ignores_key_order():
+    runs, reg = _counting_registry()
+    tools = [{"name": "search", "description": "Search.",
+              "input_schema": {"type": "object", "properties": {"q": {"type": "string"}, "n": {"type": "integer"}}}}]
+    reg = {"search": lambda q, n: runs.append(q) or "0 results"}
+    spy = Spy([al.tool_call("search", {"q": "a", "n": 1}), al.tool_call("search", {"n": 1, "q": "a"}), "done"])
+    r = run_agent(spy, "census", tools, reg, max_identical_calls=1)
+    assert r.stopped_because == "repeated_call", "the same input with keys in another order is a repeat"
+
+def test_earlier_behavior_kept():
+    runs, reg = _counting_registry()
+    r = run_agent(Spy(responder=_wander), "census", TOOLS, reg, max_steps=3)
+    assert r.stopped_because == "max_steps" and r.steps == 3, f"max_steps still applies, got {r}"
+    r = run_agent(Spy([al.tool_call("search", {"q": "x"}), al.refusal("cyber")]), "census", TOOLS, reg)
+    assert r.stopped_because == "refusal", f"refusal still handled, got {r.stopped_because!r}"
+    r = run_agent(Spy([al.tool_call("search", {"q": "x"}), "No census exists."]), "census", TOOLS, reg)
+    assert r.stopped_because == "end_turn" and r.answer == "No census exists.", f"normal finish still works, got {r}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Create <code>seen = Counter()</code> before the loop. After the
+        stop-reason check, compare <code>cost_usd(al.MODEL, input_tokens, output_tokens)</code> with the budget, then
+        the token total. Then collect <code>calls = [b for b in response.content if b.type == "tool_use"]</code>,
+        increment <code>seen[b.name + ":" + json.dumps(b.input, sort_keys=True)]</code> for each, and stop if
+        <code>max(seen.values()) &gt; max_identical_calls</code>. Only then run the calls.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import json
+from collections import Counter
+from dataclasses import dataclass, field
+import agentlab as al
+
+PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50)}
+
+def cost_usd(model, input_tokens, output_tokens):
+    price_in, price_out = PRICES[model]
+    return (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+
+@dataclass
+class RunResult:
+    answer: str
+    stopped_because: str
+    steps: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    messages: list = field(default_factory=list, repr=False)
+
+def run_agent(client, task, tools, registry, *, max_steps=10, max_tokens=1024,
+              max_total_tokens=50_000, max_cost_usd=0.50, max_identical_calls=2):
+    messages = [{"role": "user", "content": task}]
+    steps = input_tokens = output_tokens = 0
+    seen = Counter()
+
+    def finish(why, answer):
+        return RunResult(answer, why, steps, input_tokens, output_tokens,
+                         cost_usd(al.MODEL, input_tokens, output_tokens), messages)
+
+    while steps &lt; max_steps:
+        response = client.messages.create(model=al.MODEL, max_tokens=max_tokens, tools=tools, messages=messages)
+        steps += 1
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        if response.content:
+            messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return finish(response.stop_reason, response.text)
+        if cost_usd(al.MODEL, input_tokens, output_tokens) &gt; max_cost_usd:
+            return finish("cost_budget", response.text)
+        if input_tokens + output_tokens &gt; max_total_tokens:
+            return finish("token_budget", response.text)
+        calls = [b for b in response.content if b.type == "tool_use"]
+        for b in calls:
+            seen[b.name + ":" + json.dumps(b.input, sort_keys=True)] += 1
+        if max(seen.values()) &gt; max_identical_calls:
+            return finish("repeated_call", response.text)
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+                   for b in calls]
+        messages.append({"role": "user", "content": results})
+    return finish("max_steps", "")</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a budgeted research runner</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">budgeted_agent.py: every run ends with a report</span></div>
+      <div class="widget-body">
+        <p>Combine M10's robust loop with this module's stop conditions into a command-line runner that prints a run
+          report and appends it to a JSON Lines file, so you can see cost and stop reasons across many runs.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir budgeted-agent &amp;&amp; cd budgeted-agent
+pixi init
+pixi add python=3.14 anthropic structlog pytest
+# copy agentlab into the workspace or add it as described in M00, then:
+pixi run python budgeted_agent.py "Summarize the notes in notes/ about pricing"
+pixi run pytest</code></pre>
+        <p><strong>What to build:</strong></p>
+        <ul>
+          <li><code>RunResult</code> and <code>run_agent(...)</code> with every stop condition from this lesson:
+            <code>max_steps</code>, <code>max_total_tokens</code>, <code>max_cost_usd</code>, a wall-clock
+            <code>time_limit</code> with an injectable clock, repeated-call nudging then stopping, and correct handling
+            of <code>max_tokens</code> and <code>refusal</code>.</li>
+          <li>M10's <code>execute_tool</code> and <code>call_with_retry</code> at the two boundaries.</li>
+          <li>A graceful wrap-up: when the step limit is reached, one final request with
+            <code>tool_choice={"type": "none"}</code>, counted in the report.</li>
+          <li>A <code>PRICES</code> table keyed by model id, and a <code>--model</code> option so you can compare the
+            same task on Opus, Sonnet and Haiku.</li>
+          <li>Use <code>al.get_client()</code> when available and fall back to an <code>al.MockClient</code> script
+            otherwise. Log one structlog event per run with every <code>RunResult</code> field except the transcript,
+            and append the same record to <code>runs.jsonl</code>.</li>
+        </ul>
+        <ul class="checklist" data-id="m11-mini">
+          <li>Every run, successful or not, produces a <code>RunResult</code> and one line in <code>runs.jsonl</code></li>
+          <li>Tests cover each <code>stopped_because</code> value with an <code>al.MockClient</code> script or responder</li>
+          <li>Tool functions never run for a response that broke a budget or was truncated</li>
+          <li>No assistant message with empty content is ever appended</li>
+          <li>Token and cost totals in the report equal the sum over every response, checked by a test with a spy client</li>
+          <li>The deadline test uses a fake clock and runs in milliseconds</li>
+          <li>Prices come from one table; switching <code>--model</code> changes the cost</li>
+          <li>No API key appears in code, logs, or <code>runs.jsonl</code></li>
+        </ul>
+        <p><strong>Stretch goals:</strong> estimate the next request with <code>al.estimate_request_tokens</code> (or
+          <code>count_tokens</code> on the real API) and stop <em>before</em> exceeding the budget; on
+          <code>max_tokens</code>, retry once with double the limit before stopping; add a small script that reads
+          <code>runs.jsonl</code> and prints total spend and a count of runs per <code>stopped_because</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m11-quiz">
+      <script type="application/json">
+      {"title": "Stop Conditions & Budgets quiz", "passScore": 0.7, "questions": [
+        {"type": "single", "prompt": "Why does each step of an agent loop usually cost more input tokens than the step before?", "options": ["The model gets slower over time", "The API is stateless, so every request re-sends the whole growing history", "Prices rise during a run", "Tool definitions are sent twice per step"], "answer": 1, "explanation": "<p>Each step appends an assistant turn and tool results, and the next request sends all of it again. Per-step input grows linearly, so a run's total grows roughly with the square of its length.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "PRICES = {\"claude-opus-5-5\": (4.00, 20.00)}\ni, o = 500_000, 10_000\np_in, p_out = PRICES[\"claude-opus-5-5\"]\nprint((i * p_in + o * p_out) / 1_000_000)", "answer": "2.2", "explanation": "<p>500,000 input tokens at $4 per million is $2.00; 10,000 output tokens at $20 per million is $0.20. Total $2.20. Note how input dominates, as it usually does in agent runs.</p>"},
+        {"type": "single", "prompt": "Where should a token or cost budget be checked?", "options": ["Before the first request only", "After each response is counted, before running that response's tools", "After running the tools, before appending results", "Only at the end of the run"], "answer": 1, "explanation": "<p>The response is already paid for, but nothing after it is. Checking before tools avoids slow or side-effecting work whose results only feed a request you will not make.</p>"},
+        {"type": "multi", "prompt": "Which of these values of <code>stopped_because</code> come from your code rather than the model's <code>stop_reason</code>?", "options": ["<code>max_steps</code>", "<code>end_turn</code>", "<code>cost_budget</code>", "<code>refusal</code>", "<code>repeated_call</code>"], "answer": [0, 2, 4], "explanation": "<p><code>end_turn</code> and <code>refusal</code> are API stop reasons passed through. Step limits, budgets, and loop detection are decisions your loop makes, which is why the run-level field has a different name from the response-level <code>stop_reason</code>.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import json\nkey = lambda n, i: n + \":\" + json.dumps(i, sort_keys=True)\nprint(key(\"search\", {\"q\": \"x\", \"limit\": 5}) == key(\"search\", {\"limit\": 5, \"q\": \"x\"}))", "answer": "True", "explanation": "<p><code>sort_keys=True</code> serializes keys in sorted order, so inputs that differ only in key order produce the same key and count as the same call.</p>"},
+        {"type": "single", "prompt": "A response has <code>stop_reason == \"max_tokens\"</code> and its content is only <code>[TextBlock(\"I'll save the report now.\")]</code>; the tool call did not fit. What should the loop do?", "options": ["Run the tool with an empty input", "Append the content and a user message with an empty results list", "Stop with reason max_tokens (or retry the same request with a larger max_tokens, without appending the truncated response)", "Ignore it and send the same messages with a new user turn saying continue"], "answer": 2, "explanation": "<p>A truncated tool call is not usable. Appending an empty results list is a 400. Either stop and report, or re-send the same request with more room, bounded so it cannot loop.</p>"},
+        {"type": "single", "prompt": "The model refuses on step 4 of a run. What does <code>response.content</code> usually contain, and what should you do?", "options": ["The partial answer; return it as end_turn", "Nothing; stop with reason refusal, log stop_details.category and explanation, and do not append the empty turn", "A tool call; run it", "An error block; retry with backoff"], "answer": 1, "explanation": "<p>A refusal usually has no content and carries <code>stop_details</code>. Appending empty content corrupts the history, and retrying the same conversation is not a fix.</p>"},
+        {"type": "single", "prompt": "What does <code>tool_choice={\"type\": \"none\"}</code> do in the graceful wrap-up request?", "options": ["Removes the tools from the request", "Lets the model answer only with text on this turn, even though tools are still defined", "Forces a specific tool", "Disables thinking"], "answer": 1, "explanation": "<p><code>none</code> means the model may not call tools on this request, so it must answer with what it has. Keep sending <code>tools</code>, since the history contains tool_use blocks. Forcing a tool (<code>any</code>/<code>tool</code>) is rejected on Opus 5.5.</p>"},
+        {"type": "single", "prompt": "Why use <code>time.monotonic()</code> for a run's deadline rather than <code>time.time()</code>?", "options": ["It is more precise", "It never goes backwards, so system clock adjustments cannot shorten or extend the deadline", "It returns minutes", "It works offline"], "answer": 1, "explanation": "<p>Wall-clock time can jump when the system clock is corrected. A monotonic clock only moves forward, which is what you want for measuring durations.</p>"},
+        {"type": "single", "prompt": "Your budget check runs after each response. What is the worst-case overshoot?", "options": ["None; it is exact", "About one request's worth of tokens", "Double the budget", "Unbounded"], "answer": 1, "explanation": "<p>You learn the cost of a request only after making it, so the last request can carry you over. If that matters, estimate the next request first with <code>count_tokens</code> (real API) or <code>al.estimate_request_tokens</code> (mock).</p>"},
+        {"type": "multi", "prompt": "Which tools would cause false alarms with strict identical-call detection?", "options": ["<code>get_job_status(job_id)</code> polled until a job finishes", "<code>get_current_time()</code>", "<code>read_file(path)</code> on a file nothing changes", "<code>search(q)</code> over a static index"], "answer": [0, 1], "explanation": "<p>Polling and clock tools legitimately repeat identical calls because the answer changes. Exempt them or give them a higher limit. Reading an unchanged file or searching a static index again returns the same result, so a repeat there really is a loop.</p>"},
+        {"type": "text", "prompt": "Which attribute of a response holds <code>input_tokens</code> and <code>output_tokens</code>?", "answer": ["usage", "response.usage"], "explanation": "<p><code>response.usage</code> reports the tokens one request read and generated. Sum it over the run for totals.</p>"},
+        {"type": "single", "prompt": "How do task budgets on the real API relate to the budgets in this module?", "options": ["They replace them, so loop checks are unnecessary", "They tell the model its budget so it can pace itself; they complement your hard limits rather than replace them", "They only apply to streaming", "They are the same as max_tokens"], "answer": 1, "explanation": "<p>Task budgets (beta) are model-aware: the model knows how much it has and can plan. Your loop's checks are the guarantee. Use both: one improves the ending, the other bounds the bill.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>The model decides when it is done; your code decides when it has spent enough. Every loop needs both.</li>
+      <li>History grows every step, so each request costs more than the last.</li>
+      <li>A step is one <code>messages.create</code> call. Stop at <code>max_steps</code>, and end gracefully with one
+        more request using <code>tool_choice={"type": "none"}</code> if you want a final answer.</li>
+      <li>Sum <code>usage.input_tokens</code> and <code>usage.output_tokens</code>; cost = (in × in price + out × out
+        price) / 1,000,000. Check budgets after each response and before its tools.</li>
+      <li>Key tool calls by name plus <code>json.dumps(input, sort_keys=True)</code>; nudge on a repeat, stop on
+        repeated repeats.</li>
+      <li>Branch on every <code>stop_reason</code>. Never run a tool from a <code>max_tokens</code> response and never
+        append empty content; stop on <code>refusal</code>.</li>
+      <li>Return a <code>RunResult</code>: answer, <code>stopped_because</code>, steps, tokens, cost. Only
+        <code>"end_turn"</code> is a natural finish.</li>
+      <li>Task budgets on the real API let the model pace itself; they complement, not replace, your limits.</li>
+    </ul>
+    <div class="flashcards" data-title="Stop Conditions & Budgets">
+      <script type="application/json">
+      [{"front": "Why can an agent loop run forever?", "back": "Its only natural exit is the model choosing not to call a tool, and nothing guarantees that happens."},
+       {"front": "What counts as one step?", "back": "One <code>messages.create</code> call (plus running the tools it asked for)."},
+       {"front": "Where do token counts come from?", "back": "<code>response.usage.input_tokens</code> and <code>response.usage.output_tokens</code>, summed over the run."},
+       {"front": "Cost formula", "back": "(input_tokens × input price + output_tokens × output price) / 1,000,000"},
+       {"front": "Opus 5.5 prices", "back": "$4 per million input tokens, $20 per million output tokens."},
+       {"front": "When do you check a budget?", "back": "Right after counting a response, before running its tools."},
+       {"front": "Key for detecting identical tool calls", "back": "<code>name + \":\" + json.dumps(input, sort_keys=True)</code>"},
+       {"front": "Two responses to a repeated call", "back": "First nudge with an error result; stop with <code>repeated_call</code> if it continues."},
+       {"front": "Handling <code>max_tokens</code> mid-loop", "back": "Do not run the (dropped or incomplete) tool call. Stop with the partial text, or retry the same request with a larger limit."},
+       {"front": "Handling <code>refusal</code> mid-loop", "back": "Stop with reason <code>refusal</code>, log <code>stop_details</code>, and do not append the empty turn."},
+       {"front": "How to end a capped run gracefully", "back": "Append an instruction after the last results and send one more request with <code>tool_choice={\"type\": \"none\"}</code>."},
+       {"front": "Fields of <code>RunResult</code>", "back": "answer, stopped_because, steps, input_tokens, output_tokens, cost_usd (plus the transcript for debugging)."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude docs: Pricing</a></li>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons">Claude docs: Handling stop reasons</a></li>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/token-counting">Claude docs: Token counting</a></li>
+      <li><a href="https://docs.python.org/3.14/library/dataclasses.html">Python docs: <code>dataclasses</code></a> and <a href="https://docs.python.org/3.14/library/collections.html#collections.Counter">collections.Counter</a></li>
+      <li><a href="../reference/agent-loop-cheatsheet.html">Agent loop cheatsheet</a> and <a href="../reference/glossary.html">glossary</a></li>
+      <li>Next: <a href="m12-tool-design.html">M12 Tool Design</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

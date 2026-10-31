@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="ref-roadmap">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · The path</p>
+    <h1>Roadmap: Levels 1-4</h1>
+    <p class="lede">The practicum is eight stages in four levels, each level ending in a capstone. Level 1 takes you
+      from your first API call to a tool-using research agent you can write from a blank file. Levels 2 to 4 take
+      that agent to context management, evaluation, safety, shipping, and multi-agent systems. This page shows the
+      whole path, what each stage covers, how long it takes, and the gate you should pass before moving on.</p>
+    <div class="lesson-meta"><span>⏱ About 110-140 hours end to end</span><span>Level 1 available now; Levels 2-4 planned</span></div>
+    <ul class="objectives">
+      <li>See every stage and capstone in order, with approximate hours</li>
+      <li>Know which level is available now and which are planned</li>
+      <li>Check yourself against the gate between levels before moving on</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="overview">
+    <h2>The whole path at a glance</h2>
+    <pre class="mermaid">
+flowchart TD
+  M0[M00 Orientation] --> S1
+  subgraph L1[Level 1 Novice - available]
+    S1[Stage 1 Talking to a model] --> S2[Stage 2 Tool use and the agent loop] --> C1[Capstone 1 Research agent]
+  end
+  C1 --> G1{{Gate 1}}
+  G1 --> S3
+  subgraph L2[Level 2 Practitioner - planned]
+    S3[Stage 3 Context and memory] --> S4[Stage 4 Workflows vs agents] --> S5[Stage 5 Evaluation] --> C2[Capstone 2 Retrieval agent + eval suite]
+  end
+  C2 --> G2{{Gate 2}}
+  G2 --> S6
+  subgraph L3[Level 3 Production - planned]
+    S6[Stage 6 Reliability and safety] --> S7[Stage 7 Shipping agents] --> C3[Capstone 3 MCP server + hardened agent]
+  end
+  C3 --> G3{{Gate 3}}
+  G3 --> S8
+  subgraph L4[Level 4 Professional - planned]
+    S8[Stage 8 Advanced agent systems] --> C4[Capstone 4 Coding agent]
+  end
+</pre>
+    <table>
+      <thead><tr><th>Level</th><th>Stages</th><th>Capstone</th><th>Approx. hours</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>1 Novice</td><td>1 Talking to a model, 2 Tool use and the agent loop</td><td>Research agent</td><td>25-30</td><td><span class="tag">available</span></td></tr>
+        <tr><td>2 Practitioner</td><td>3 Context and memory, 4 Workflows vs agents, 5 Evaluation</td><td>Retrieval agent with a 30-case eval suite</td><td>34-42</td><td><span class="tag">planned</span></td></tr>
+        <tr><td>3 Production</td><td>6 Reliability and safety, 7 Shipping agents</td><td>MCP server plus hardened agent</td><td>28-35</td><td><span class="tag">planned</span></td></tr>
+        <tr><td>4 Professional</td><td>8 Advanced agent systems</td><td>Coding agent that fixes a failing test</td><td>25-34</td><td><span class="tag">planned</span></td></tr>
+      </tbody>
+    </table>
+    <p>Hours are for a developer who already knows Python and does every exercise and mini-project. They include the
+      capstone. Reading only is much faster; building is where the learning happens.</p>
+    <aside class="callout note"><p>Everything in Level 1 runs in your browser against agentlab's scripted
+      <code>MockClient</code>, with optional real-API mini-projects run locally through Pixi. Later levels will lean more
+      on local projects and the real API, because evaluation, retrieval, and deployment need real model behavior. See
+      <a href="../modules/m00-orientation.html">M00</a> for how the course works.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="level-1">
+    <h2>Level 1 · Novice <span class="tag">available</span></h2>
+    <p><strong>Outcome:</strong> you can write a tool-using agent from a blank file in under an hour and explain every
+      line of its transcript.</p>
+
+    <h3 id="stage-1">Stage 1 · Talking to a model (10-11 h)</h3>
+    <p>One request, one response. Everything an agent does is built from this call, so it pays to know it cold.</p>
+    <ul>
+      <li><a href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a>: tokens, context windows, why outputs vary, cost and latency</li>
+      <li><a href="../modules/m02-messages-api.html">M02 The Messages API</a>: roles, system prompts, content blocks, the response object, history as a list you own</li>
+      <li><a href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a>: <code>max_tokens</code>, stop sequences, effort, every <code>stop_reason</code></li>
+      <li><a href="../modules/m04-streaming.html">M04 Streaming</a>: <code>messages.stream</code>, stream events, <code>get_final_message</code></li>
+      <li><a href="../modules/m05-structured-output.html">M05 Structured Output</a>: JSON Schema, <code>output_config.format</code>, validating and recovering</li>
+      <li><a href="../modules/m06-prompting.html">M06 Prompting That Holds Up</a>: clear instructions, examples, XML-tagged inputs, prompts as tested code</li>
+    </ul>
+
+    <h3 id="stage-2">Stage 2 · Tool use and the agent loop (11-12 h)</h3>
+    <p>Give the model tools, run its calls, and loop until it is done: the small loop at the heart of every agent
+      framework.</p>
+    <ul>
+      <li><a href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a>: names, descriptions, input schemas, strict tools</li>
+      <li><a href="../modules/m08-one-tool-call.html">M08 One Tool Call by Hand</a>: <code>tool_use</code> to <code>tool_result</code>, by hand</li>
+      <li><a href="../modules/m09-agent-loop.html">M09 The Agent Loop</a>: stop reasons as control flow, parallel calls, a complete agent</li>
+      <li><a href="../modules/m10-errors-as-data.html">M10 Errors as Data</a>: <code>is_error</code> results, validating input, retry versus fix</li>
+      <li><a href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a>: step, token, cost, and time limits; loop detection</li>
+      <li><a href="../modules/m12-tool-design.html">M12 Tool Design</a>: fewer, clearer tools; readable results; testing tools alone</li>
+    </ul>
+
+    <h3 id="capstone-1">Capstone 1 · Research agent (5-7 h)</h3>
+    <p><a href="../projects/c1-research-agent.html">Build a research agent</a> that searches, reads sources, and writes a
+      cited answer, graded against a scripted model with <code>pixi run grade c1</code>.</p>
+  </section>
+
+  <section class="lesson-section" id="gate-1">
+    <h2>Gate 1: ready for Level 2?</h2>
+    <p>Before moving on, you should be able to do all of these without looking anything up:</p>
+    <ul class="checklist" data-id="roadmap-gate-1">
+      <li>Write a request with <code>model</code>, <code>max_tokens</code>, <code>system</code>, and multi-turn <code>messages</code>, and explain each field</li>
+      <li>Handle every <code>stop_reason</code>, including <code>max_tokens</code> and <code>refusal</code></li>
+      <li>Define a strict tool and explain why <code>additionalProperties: false</code> is required</li>
+      <li>Write the agent loop from memory, including parallel <code>tool_result</code>s in one user message</li>
+      <li>Turn tool failures into <code>is_error</code> results, and tell a 400 from a retryable error</li>
+      <li>Stop a run on steps, tokens, or cost, and return a structured report</li>
+      <li>Pass all of Capstone 1's graded checks</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="level-2">
+    <h2>Level 2 · Practitioner <span class="tag">planned</span></h2>
+    <p><strong>Outcome:</strong> you can keep an agent inside a context budget, choose between a workflow and an agent,
+      and prove a change made things better with an evaluation suite.</p>
+
+    <h3 id="stage-3">Stage 3 · Context and memory (8-10 h)</h3>
+    <ul>
+      <li>The context budget: what fills the window over a long run, and measuring it</li>
+      <li>Compaction: summarizing and dropping old turns without losing the thread</li>
+      <li>Retrieval as a tool: search over documents the agent calls, rather than stuffing everything into the prompt</li>
+      <li>Files as memory: notes the agent writes and reads back across steps and sessions</li>
+      <li>Prompt caching: reusing a stable prefix to cut cost and latency</li>
+      <li><strong>Lab:</strong> a docs Q&amp;A agent that must answer within a fixed token budget</li>
+    </ul>
+
+    <h3 id="stage-4">Stage 4 · Workflows vs agents (8-10 h)</h3>
+    <ul>
+      <li>Prompt chaining: fixed sequences of calls with checks between them</li>
+      <li>Routing: classify first, then send to a specialized prompt or model</li>
+      <li>Parallelization: sectioning and voting</li>
+      <li>Orchestrator-workers: one model plans, others execute</li>
+      <li>Evaluator-optimizer: generate, critique, revise</li>
+      <li>When an agent is the wrong choice, and a plain workflow or a single call is better</li>
+    </ul>
+
+    <h3 id="stage-5">Stage 5 · Evaluation (8-10 h)</h3>
+    <ul>
+      <li>Test sets: collecting realistic cases, including the hard ones</li>
+      <li>Graders: exact match, code checks, and rubrics</li>
+      <li>Model-as-judge: using a model to grade, and checking the judge</li>
+      <li>Trajectory evaluation: grading the path (tool calls, steps), not only the final answer</li>
+      <li>Evals in CI: running the suite on every change</li>
+      <li>Error analysis: reading failures and turning them into fixes</li>
+    </ul>
+
+    <h3 id="capstone-2">Capstone 2 · Retrieval agent with an eval suite (10-12 h)</h3>
+    <p>A retrieval agent over a document set, shipped with a 30-case evaluation suite that runs in CI and a written
+      error analysis of its failures.</p>
+  </section>
+
+  <section class="lesson-section" id="gate-2">
+    <h2>Gate 2: ready for Level 3?</h2>
+    <ul class="checklist" data-id="roadmap-gate-2">
+      <li>Keep a long-running agent inside a token budget using compaction or retrieval</li>
+      <li>Explain, for a given task, whether a workflow or an agent fits better, and why</li>
+      <li>Build an eval suite with at least two kinds of grader, and run it in CI</li>
+      <li>Show with numbers that a prompt or tool change improved results</li>
+      <li>Pass Capstone 2</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="level-3">
+    <h2>Level 3 · Production <span class="tag">planned</span></h2>
+    <p><strong>Outcome:</strong> you can run an agent where mistakes cost money or data, observe it, and ship it as a
+      service other systems can call.</p>
+
+    <h3 id="stage-6">Stage 6 · Reliability and safety (8-10 h)</h3>
+    <ul>
+      <li>Prompt injection: untrusted text in tool results that tries to take control, and defenses</li>
+      <li>Sandboxing: running tools with the least access they need</li>
+      <li>Permissions: which tools an agent may call, on whose behalf</li>
+      <li>Human in the loop: approvals that are fast enough to be used</li>
+      <li>Budgets and kill switches: hard limits that stop a run from outside</li>
+      <li>Idempotent tools: safe retries and exactly-once side effects</li>
+    </ul>
+
+    <h3 id="stage-7">Stage 7 · Shipping agents (8-10 h)</h3>
+    <ul>
+      <li>Tracing with structlog: a structured record of every step, tool call, and token</li>
+      <li>Retries and rate limits: backoff, jitter, and concurrency control</li>
+      <li>MCP servers: exposing tools over the Model Context Protocol</li>
+      <li>SDKs: the Anthropic SDK's tool runner, and the Claude Agent SDK</li>
+      <li>Cost engineering: model choice, effort, caching, and batching</li>
+      <li>Deployment: packaging, configuration, secrets, and monitoring</li>
+    </ul>
+
+    <h3 id="capstone-3">Capstone 3 · MCP server plus hardened agent (12-15 h)</h3>
+    <p>An MCP server exposing a small set of well-designed tools, and an agent that uses it with permissions,
+      approvals, budgets, tracing, and an injection test suite.</p>
+  </section>
+
+  <section class="lesson-section" id="gate-3">
+    <h2>Gate 3: ready for Level 4?</h2>
+    <ul class="checklist" data-id="roadmap-gate-3">
+      <li>Demonstrate a prompt injection against a naive agent, then block it</li>
+      <li>Gate every write tool and show the audit trail of approvals</li>
+      <li>Trace a run end to end and find its most expensive step</li>
+      <li>Serve tools over MCP and call them from an agent</li>
+      <li>Pass Capstone 3</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="level-4">
+    <h2>Level 4 · Professional <span class="tag">planned</span></h2>
+    <p><strong>Outcome:</strong> you can design, build, and judge complex agent systems, and keep up as the field
+      moves.</p>
+
+    <h3 id="stage-8">Stage 8 · Advanced agent systems (10-14 h)</h3>
+    <ul>
+      <li>Multi-agent systems: when several agents beat one, and when they do not</li>
+      <li>Subagents: delegating a scoped task with its own context</li>
+      <li>Long-running agents: checkpoints, resumption, and progress tracking</li>
+      <li>Coding agents: reading a repository, editing files, running tests</li>
+      <li>Computer use: agents that operate a screen</li>
+      <li>Designing a harness: the loop, tools, context, and guardrails as one system</li>
+      <li>Staying current: reading release notes and migrating deliberately</li>
+    </ul>
+
+    <h3 id="capstone-4">Capstone 4 · Coding agent (15-20 h)</h3>
+    <p>A coding agent that takes a repository with a failing test, finds the cause, makes a fix, and proves it by running
+      the test suite, inside a sandbox with budgets and an evaluation suite of its own.</p>
+  </section>
+
+  <section class="lesson-section" id="hours">
+    <h2>Time budget</h2>
+    <table>
+      <thead><tr><th>Part</th><th>Approx. hours</th></tr></thead>
+      <tbody>
+        <tr><td>M00 Orientation</td><td>0.75</td></tr>
+        <tr><td>Stage 1 Talking to a model</td><td>10-11</td></tr>
+        <tr><td>Stage 2 Tool use and the agent loop</td><td>11-12</td></tr>
+        <tr><td>Capstone 1</td><td>5-7</td></tr>
+        <tr><td>Stage 3 Context and memory</td><td>8-10</td></tr>
+        <tr><td>Stage 4 Workflows vs agents</td><td>8-10</td></tr>
+        <tr><td>Stage 5 Evaluation</td><td>8-10</td></tr>
+        <tr><td>Capstone 2</td><td>10-12</td></tr>
+        <tr><td>Stage 6 Reliability and safety</td><td>8-10</td></tr>
+        <tr><td>Stage 7 Shipping agents</td><td>8-10</td></tr>
+        <tr><td>Capstone 3</td><td>12-15</td></tr>
+        <tr><td>Stage 8 Advanced agent systems</td><td>10-14</td></tr>
+        <tr><td>Capstone 4</td><td>15-20</td></tr>
+        <tr><td><strong>Total</strong></td><td><strong>about 114-142, plus review</strong></td></tr>
+      </tbody>
+    </table>
+    <aside class="callout tip"><p>A steady pace of five to eight hours a week finishes Level 1 in about a month. Do not
+      skip the gates: each level assumes the one before it is solid.</p></aside>
+  </section>
+</main>
+</body>
+</html>

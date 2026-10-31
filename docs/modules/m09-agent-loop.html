@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M09 · The Agent Loop · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m09">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Module 09</p>
+    <h1>The Agent Loop</h1>
+    <p class="lede">An agent is a model in a loop with tools. In <a href="m08-one-tool-call.html">M08</a> you did one
+      round trip by hand. Here you put that round trip inside a loop that keeps going until the model says it is
+      done, handle several tool calls in one turn, and finish with a complete agent of about fifty lines that you
+      can write from a blank file. Every agent framework you will meet is built around this loop.</p>
+    <div class="lesson-meta"><span>⏱ ~2.5 hours</span><span>Prerequisites: <a href="m08-one-tool-call.html">M08 One Tool Call by Hand</a>, <a href="m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></span></div>
+    <ul class="objectives">
+      <li>Explain why a single round trip is not enough, and what makes the number of steps unknowable in advance</li>
+      <li>Use <code>stop_reason</code> as the loop's control flow: continue on <code>tool_use</code>, finish on <code>end_turn</code>, stop on anything else</li>
+      <li>Handle parallel tool calls by returning every result, in one user message, each with its matching id</li>
+      <li>Write a complete <code>run_agent(client, task, tools, registry, max_steps)</code> from a blank function</li>
+      <li>Bound the loop with a <code>max_steps</code> guard and explain why <code>while True</code> alone is unsafe</li>
+      <li>Read an agent's transcript with <code>al.format_transcript</code> and count its requests and tool calls</li>
+      <li>Describe what the SDK's beta tool runner automates, and what it hides from you</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-loop">
+    <h2>Why one round trip is not enough</h2>
+    <p>The M08 function made at most two requests: ask, run the tool, answer. That works when one tool call is
+      enough. Many real questions need more, and the model cannot know how many until it sees results.</p>
+    <p>Take "Is it warmer where I am or in Oslo?" The model does not know where you are. It must first call
+      <code>get_location</code>. Only after reading that result ("Lisbon") can it ask for the weather in Lisbon. The
+      second call depends on the first call's <em>output</em>. That dependency is what forces a loop: each result
+      can lead to another question, and only the model knows when it has enough to answer.</p>
+    <p>This gives us the working definition of an <strong>agent</strong> used throughout the course: a model that
+      decides, step by step, which tool to call next, running in a loop that your code controls. The model chooses
+      <em>what</em> to do; your loop decides <em>whether</em> it keeps going, runs the tools, and records the
+      history.</p>
+    <p>The visualizer below plays the <code>chain</code> scenario: one question, three requests, four tool calls.
+      Notice two things. The model asks for two independent lookups in a single response (parallel calls, covered
+      later in this module), and the second batch of calls exists only because of what the first batch returned.</p>
+    <div class="viz" data-viz="agent-loop" data-config='{"scenario": "chain"}'></div>
+    <aside class="callout think"><p>Count the requests in the visualizer. How many times was the full message list
+      sent? How long was the list on the last request? Every one of those blocks is paid for as input tokens on
+      every request that includes it.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the number of steps depends on tool results, so it
+      cannot be fixed in advance. An agent is a loop that runs until the model stops asking for tools.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="stop-reason">
+    <h2>stop_reason is the control flow</h2>
+    <p>Each response tells you why the model stopped generating, in <code>stop_reason</code>
+      (<a href="m03-limits-stop-reasons.html">M03</a> covers every value). Inside an agent loop, that one field
+      decides what happens next:</p>
+    <table>
+      <thead><tr><th><code>stop_reason</code></th><th>Meaning</th><th>What the loop does</th></tr></thead>
+      <tbody>
+        <tr><td><code>tool_use</code></td><td>The model wants one or more tools run</td><td>Run them, append the results, <strong>go around again</strong></td></tr>
+        <tr><td><code>end_turn</code></td><td>The model finished its answer</td><td><strong>Return</strong> the final text</td></tr>
+        <tr><td><code>max_tokens</code></td><td>The response hit your <code>max_tokens</code> limit and was cut off</td><td>Stop and report it (handling it gracefully is <a href="m11-stop-conditions.html">M11</a>)</td></tr>
+        <tr><td><code>refusal</code></td><td>The model declined; details are in <code>stop_details</code></td><td>Stop and report it</td></tr>
+        <tr><td>anything else</td><td>For example <code>stop_sequence</code>, or <code>pause_turn</code> from server tools</td><td>Stop and report it; this module's tools never produce these</td></tr>
+      </tbody>
+    </table>
+    <pre class="mermaid">flowchart TD
+    A[messages = task] --> B[call the model]
+    B --> C{stop_reason}
+    C -- tool_use --> D[append assistant turn<br/>run every tool<br/>append all results]
+    D --> B
+    C -- end_turn --> E[return the text]
+    C -- other --> F[stop and report]</pre>
+    <p>Why drive the loop by <code>stop_reason</code> instead of something that looks easier, such as "loop while
+      the response has no text"? Because text and tool calls can appear in the same response. The model often
+      writes "Let me check both cities." and then two <code>tool_use</code> blocks. A loop that stops at the first
+      text would return that sentence as the answer, with the tools never run. <code>stop_reason</code> is the one
+      field defined to answer the question "is the model done?"</p>
+    <p>Predict the loop's decision for each response before running the cell.</p>
+    <div class="runnable" data-title="Decide from stop_reason" data-predict>
+<textarea>
+import agentlab as al
+
+def next_action(response):
+    if response.stop_reason == "tool_use":
+        return "run tools"
+    if response.stop_reason == "end_turn":
+        return "finish"
+    return "stop: " + response.stop_reason
+
+responses = [
+    al.tool_call("get_weather", {"city": "Oslo"}, text="Let me check."),
+    al.reply("It is 4°C in Oslo."),
+    al.refusal("cyber"),
+]
+for r in responses:
+    print(next_action(r))
+</textarea>
+    </div>
+    <p>The first response contains text, yet the right action is to run tools. That is the case a text-based check
+      gets wrong.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>tool_use</code> → run tools and continue;
+      <code>end_turn</code> → return; anything else → stop and say why. Never decide "done" by looking for text.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="first-loop">
+    <h2>The first loop</h2>
+    <p>Take the M08 round trip and wrap it in <code>while True</code>. The body is the same five moves; the only
+      new idea is that after sending results we go back to the top instead of stopping.</p>
+    <pre><code class="language-python">messages = [{"role": "user", "content": task}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    results = [run_one(block) for block in response.content if block.type == "tool_use"]
+    messages.append({"role": "user", "content": results})</code></pre>
+    <p>Three details matter:</p>
+    <ul>
+      <li><strong>Append the assistant turn every time</strong>, before deciding anything. It holds the
+        <code>tool_use</code> blocks the next results must answer, and on the final step it holds the answer, which
+        keeps the history complete if you want to ask a follow-up later.</li>
+      <li><strong><code>messages</code> only grows.</strong> Each iteration adds an assistant turn and (if tools ran)
+        a user turn of results. Each request re-sends the whole list, because the API is stateless.</li>
+      <li><strong>The same <code>tools</code> go on every request.</strong> Tools are part of the request, not
+        remembered by the API.</li>
+    </ul>
+    <p>Here is that loop running a chained task. The model must find your location before it can ask for the
+      weather. The script has three steps, so the loop makes exactly three requests.</p>
+    <div class="runnable" data-title="A chained task in a while loop">
+<textarea>
+import agentlab as al
+
+TOOLS = [
+    {"name": "get_location", "description": "Get the user's current city. Takes no input.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_weather", "description": "Get the current weather for one city.",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+]
+REGISTRY = {
+    "get_location": lambda: "Lisbon",
+    "get_weather": lambda city: {"Lisbon": "21°C, sunny", "Oslo": "4°C, cloudy"}.get(city, "no data"),
+}
+
+client = al.MockClient([
+    al.tool_call("get_location", {}),                       # request 1: where is the user?
+    al.tool_call("get_weather", {"city": "Lisbon"}),        # request 2: depends on result 1
+    "It's 21°C and sunny where you are, in Lisbon.",        # request 3: the answer
+])
+
+messages = [{"role": "user", "content": "What's the weather where I am?"}]
+step = 0
+while True:
+    step += 1
+    response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    print(f"step {step}: stop_reason={response.stop_reason}")
+    if response.stop_reason != "tool_use":
+        break
+    results = []
+    for block in response.content:
+        if block.type == "tool_use":
+            output = REGISTRY[block.name](**block.input)
+            print(f"   ran {block.name}({block.input}) -> {output!r}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+    messages.append({"role": "user", "content": results})
+
+print("answer:", "".join(b.text for b in response.content if b.type == "text"))
+</textarea>
+    </div>
+    <p>This is a working agent. It has two weaknesses we will fix while building the final version: it treats
+      <em>any</em> non-<code>tool_use</code> stop as success (a <code>max_tokens</code> cut-off would be returned as if
+      it were a full answer), and <code>while True</code> has no limit. If the model kept asking for tools forever,
+      this loop would run forever, spending money on every iteration.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> the agent loop is the M08 round trip repeated: call,
+      append the assistant turn, stop unless <code>tool_use</code>, run the tools, append the results, repeat.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="parallel">
+    <h2>Parallel tool calls: all results in one message</h2>
+    <p>When the model needs several pieces of information that do not depend on each other, it can ask for all of
+      them in <strong>one</strong> response. This is called <strong>parallel tool use</strong>, and it is on by
+      default. "Is it warmer in Lisbon or Oslo?" usually produces one response with two <code>tool_use</code>
+      blocks, each with its own id.</p>
+    <p>The rule for answering is strict: <strong>every</strong> <code>tool_result</code> goes in <strong>one</strong>
+      user message, each with the <code>tool_use_id</code> of its call, before any text. The loop you just wrote
+      already does this, because it collects a <code>results</code> list across all blocks and appends it once.</p>
+    <p>The tempting mistake is to append one user message per result inside the loop over blocks. Run it and read
+      the error.</p>
+    <div class="runnable" data-title="One message per result is wrong">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Get the current weather for one city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+weather = {"Lisbon": "21°C, sunny", "Oslo": "4°C, cloudy"}
+
+client = al.MockClient([
+    al.tool_calls([("get_weather", {"city": "Lisbon"}), ("get_weather", {"city": "Oslo"})]),
+    "Lisbon is warmer: 21°C against 4°C in Oslo.",
+])
+messages = [{"role": "user", "content": "Is it warmer in Lisbon or Oslo?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=TOOLS, messages=messages)
+messages.append({"role": "assistant", "content": response.content})
+
+wrong = list(messages)
+for block in response.content:                     # BUG: one user message per result
+    wrong.append({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": block.id, "content": weather[block.input["city"]]}]})
+try:
+    client.messages.create(model=al.MODEL, max_tokens=4096, tools=TOOLS, messages=wrong)
+except al.BadRequestError as e:
+    print("rejected:", e)
+
+results = [{"type": "tool_result", "tool_use_id": b.id, "content": weather[b.input["city"]]}
+           for b in response.content if b.type == "tool_use"]
+messages.append({"role": "user", "content": results})   # FIX: all results, one message
+final = client.messages.create(model=al.MODEL, max_tokens=4096, tools=TOOLS, messages=messages)
+print()
+print(al.format_transcript(messages, final))
+</textarea>
+    </div>
+    <p>The error names <code>toolu_mock_0002</code>: the first user message after the assistant turn answered only
+      the Lisbon call, so the Oslo call had no result "immediately after". The fixed transcript shows the right
+      shape: two <code>tool_use</code> lines in one assistant turn, then two <code>tool_result</code> lines in one
+      user turn, ids matching.</p>
+    <p>Some practical points about parallel calls:</p>
+    <ul>
+      <li><strong>Order.</strong> Returning results in the same order as the calls is the clearest choice, and the
+        natural result of looping over <code>response.content</code>. The ids, not the order, do the pairing.</li>
+      <li><strong>Running them.</strong> The calls are independent, so you <em>may</em> run them concurrently (for
+        example, several slow HTTP requests at once). Running them one after another is also correct and is what this
+        module does. Concurrency is an optimization for later stages.</li>
+      <li><strong>Never drop one.</strong> If one of the calls fails, you still return a result for it, marked as an
+        error. That is the subject of <a href="m10-errors-as-data.html">M10</a>; for now, every call gets a result.</li>
+      <li><strong>Splitting results teaches the model a bad habit.</strong> Even where a split would be accepted,
+        returning results across several messages makes the model less inclined to make parallel calls later. One
+        message, every result.</li>
+    </ul>
+    <aside class="callout tip"><p><strong>Remember:</strong> one assistant turn with N <code>tool_use</code> blocks
+      is answered by one user message with N <code>tool_result</code> blocks, each carrying its call's id.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="build-agent">
+    <h2>Building run_agent step by step</h2>
+    <p>Now we turn the loop into a reusable function with a clear contract. This is the Level 1 centerpiece: by the
+      end of the module you should be able to write it without looking.</p>
+    <pre><code class="language-python">def run_agent(client, task, tools, registry, max_steps=10) -&gt; str:
+    """Run the model with tools until it answers; return the final text."""</code></pre>
+    <ul>
+      <li><code>client</code>: anything with <code>messages.create</code>, a <code>MockClient</code> or a real
+        <code>anthropic.Anthropic()</code>. Passing it in (rather than creating it inside) is what lets tests give it
+        a script.</li>
+      <li><code>task</code>: the user's request, a string.</li>
+      <li><code>tools</code>: the tool definitions sent to the model.</li>
+      <li><code>registry</code>: tool name → Python function, the allow-list from M08.</li>
+      <li><code>max_steps</code>: the most model calls this run may make.</li>
+    </ul>
+
+    <h3>Step 1: two small helpers</h3>
+    <p>Keep the loop readable by pulling out the two things it does to responses: read the text, and run the
+      tools. <code>run_tools</code> is M08's dispatch and result-building, applied to every <code>tool_use</code>
+      block, returning the list that becomes one user message.</p>
+    <pre><code class="language-python">def text_of(response) -&gt; str:
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def run_tools(response, registry) -&gt; list[dict]:
+    results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        output = registry[block.name](**block.input)
+        content = output if isinstance(output, str) else json.dumps(output)
+        results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+    return results</code></pre>
+
+    <h3>Step 2: start the history</h3>
+    <pre><code class="language-python">    messages = [{"role": "user", "content": task}]</code></pre>
+    <p>The list belongs to your code. It is the agent's whole memory: nothing else is carried between requests.</p>
+
+    <h3>Step 3: a bounded loop</h3>
+    <pre><code class="language-python">    for step in range(max_steps):
+        response = client.messages.create(
+            model=al.MODEL, max_tokens=4096, tools=tools, messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})</code></pre>
+    <p><code>for step in range(max_steps)</code> replaces <code>while True</code>. It reads as "at most
+      <code>max_steps</code> model calls", and it cannot spin forever. One <strong>step</strong> here means one call
+      to the model, together with the tools that response asked for.</p>
+
+    <h3>Step 4: branch on stop_reason</h3>
+    <pre><code class="language-python">        if response.stop_reason == "end_turn":
+            return text_of(response)
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(f"agent stopped early: stop_reason={response.stop_reason}")</code></pre>
+    <p>Success is <code>end_turn</code> only. Everything that is neither <code>end_turn</code> nor
+      <code>tool_use</code> raises, with the stop reason in the message, so a truncated or refused run is never
+      mistaken for an answer. Raising is deliberately blunt; <a href="m11-stop-conditions.html">M11</a> replaces it
+      with a structured run result that reports why the run stopped.</p>
+
+    <h3>Step 5: run the tools and continue</h3>
+    <pre><code class="language-python">        messages.append({"role": "user", "content": run_tools(response, registry)})</code></pre>
+    <p>All results, one user message. Then the <code>for</code> loop goes around.</p>
+
+    <h3>Step 6: what happens when steps run out</h3>
+    <pre><code class="language-python">    raise RuntimeError(f"agent did not finish within {max_steps} steps")</code></pre>
+    <p>If the loop finishes without returning, the model was still asking for tools after <code>max_steps</code>
+      calls. Raising makes that impossible to miss. The next section shows why this matters.</p>
+
+    <h3>The complete agent</h3>
+    <p>Here are all the pieces together, with a <code>verbose</code> flag that prints the transcript at the end.
+      Run it: the demo task needs a location lookup first, then three lookups at once (two weather calls and a time
+      call), then the answer. That is three model calls.</p>
+    <div class="runnable" data-title="run_agent: the complete agent">
+<textarea>
+import json
+import agentlab as al
+
+
+def text_of(response):
+    """Join the text blocks of a response."""
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def run_tools(response, registry):
+    """Run every tool_use block; return the tool_result blocks for one user message."""
+    results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        output = registry[block.name](**block.input)
+        content = output if isinstance(output, str) else json.dumps(output)
+        results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+    return results
+
+
+def run_agent(client, task, tools, registry, max_steps=10, verbose=False):
+    """Run the model with tools until it answers; return the final text."""
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        response = client.messages.create(
+            model=al.MODEL, max_tokens=4096, tools=tools, messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "end_turn":
+            if verbose:
+                print(al.format_transcript(messages))
+                print(f"(finished in {step + 1} steps)")
+            return text_of(response)
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(f"agent stopped early: stop_reason={response.stop_reason}")
+        messages.append({"role": "user", "content": run_tools(response, registry)})
+    raise RuntimeError(f"agent did not finish within {max_steps} steps")
+
+
+# ---- demo -------------------------------------------------------------
+def city_schema():
+    return {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+
+TOOLS = [
+    {"name": "get_location", "description": "Get the user's current city. Takes no input.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_weather", "description": "Current weather for one city.", "input_schema": city_schema()},
+    {"name": "get_time", "description": "Current local time (HH:MM) in one city.", "input_schema": city_schema()},
+]
+REGISTRY = {
+    "get_location": lambda: "Lisbon",
+    "get_weather": lambda city: {"Lisbon": {"temp_c": 21, "sky": "sunny"}, "Oslo": {"temp_c": 4, "sky": "cloudy"}}[city],
+    "get_time": lambda city: {"Lisbon": "14:05", "Oslo": "15:05"}[city],
+}
+client = al.MockClient([
+    al.tool_call("get_location", {}),
+    al.tool_calls([("get_weather", {"city": "Lisbon"}), ("get_weather", {"city": "Oslo"}),
+                   ("get_time", {"city": "Lisbon"})], text="Let me check all three."),
+    "It's warmer where you are: 21°C and sunny in Lisbon against 4°C in Oslo. It's 14:05 in Lisbon.",
+])
+
+answer = run_agent(client, "Is it warmer here or in Oslo, and what time is it here?", TOOLS, REGISTRY, verbose=True)
+print()
+print("ANSWER:", answer)
+</textarea>
+    </div>
+    <p>Without the demo and docstrings, the agent is under forty lines. Everything an agent framework adds
+      (retries, budgets, logging, memory, sub-agents) is built around exactly this core. The rest of Stage 2 hardens
+      it: <a href="m10-errors-as-data.html">M10</a> makes tool failures and API errors survivable,
+      <a href="m11-stop-conditions.html">M11</a> adds budgets and a structured result, and
+      <a href="m12-tool-design.html">M12</a> improves the tools themselves.</p>
+    <aside class="callout pro"><p>Notice what <code>run_agent</code> does <em>not</em> know: which tools exist, what
+      the task is, or how many steps it takes. All of that is data passed in. Keeping the loop generic is what lets
+      you test it with scripted runs and reuse it for every agent you build.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> history list → bounded <code>for</code> loop → call →
+      append <code>response.content</code> → <code>end_turn</code> returns, other non-<code>tool_use</code> raises →
+      append all results → repeat → raise when steps run out.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="max-steps">
+    <h2>The max_steps guard</h2>
+    <p>Why insist on a limit? Because the loop's exit is controlled by the model. If the model keeps asking for
+      tools (a confusing tool result, a task it cannot complete, a tool that returns the same unhelpful answer), the
+      loop keeps calling it. Each call costs money and time, and the history grows, so each call costs more than the
+      last. A loop with no limit turns a confused model into an unbounded bill.</p>
+    <p>The mock can simulate that with a <code>responder</code>: a function that answers every request after the
+      script runs out. This one always asks for the weather again.</p>
+    <div class="runnable" data-title="A model that never stops">
+<textarea>
+import json
+import agentlab as al
+
+def text_of(response):
+    return "".join(b.text for b in response.content if b.type == "text")
+
+def run_tools(response, registry):
+    return [{"type": "tool_result", "tool_use_id": b.id, "content": str(registry[b.name](**b.input))}
+            for b in response.content if b.type == "tool_use"]
+
+def run_agent(client, task, tools, registry, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "end_turn":
+            return text_of(response)
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(f"agent stopped early: stop_reason={response.stop_reason}")
+        messages.append({"role": "user", "content": run_tools(response, registry)})
+    raise RuntimeError(f"agent did not finish within {max_steps} steps")
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for one city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+stubborn = al.MockClient(responder=lambda request: al.tool_call("get_weather", {"city": "Oslo"}))
+
+try:
+    run_agent(stubborn, "Weather in Oslo?", TOOLS, {"get_weather": lambda city: "4°C"}, max_steps=5)
+except RuntimeError as e:
+    print("stopped:", e)
+
+print("requests made:", len(stubborn.requests))
+for i, req in enumerate(stubborn.requests, 1):
+    print(f"request {i}: {len(req.messages)} messages sent")
+</textarea>
+    </div>
+    <p>Five requests, then a clear error. The message counts (1, 3, 5, 7, 9) show the cost growing: each step
+      re-sends everything before it. Without the guard, the loop would never end.</p>
+    <p>How big should <code>max_steps</code> be? Large enough for real tasks, small enough to stop a runaway quickly.
+      For the small agents in this stage, 10 to 20 is reasonable. A step limit is the simplest budget;
+      <a href="m11-stop-conditions.html">M11</a> adds token, cost, and time budgets and detects a model calling the
+      same tool with the same input over and over.</p>
+    <aside class="callout warn"><p>Never ship <code>while True</code> around a model call. Every agent loop needs at
+      least a step limit, even in a prototype; prototypes are where runaway loops happen.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the model controls when the loop wants to end; your code
+      controls when it <em>must</em> end. <code>for step in range(max_steps)</code> plus a final <code>raise</code>
+      is the minimum.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="tracing">
+    <h2>Reading the transcript</h2>
+    <p>When an agent gives a wrong answer, the question is always "what did it see, and what did it ask for?" The
+      answer is in the message list. <code>al.format_transcript(messages)</code> prints it one block per line, as
+      introduced in <a href="m00-orientation.html">M00</a>; you can pass a response not yet appended as a second
+      argument. Here is the transcript from the complete agent's demo run:</p>
+    <pre><code class="language-text">user: Is it warmer here or in Oslo, and what time is it here?
+assistant: tool_use get_location {} [toolu_mock_0001]
+user: tool_result [toolu_mock_0001] Lisbon
+assistant: Let me check all three.
+assistant: tool_use get_weather {"city": "Lisbon"} [toolu_mock_0003]
+assistant: tool_use get_weather {"city": "Oslo"} [toolu_mock_0004]
+assistant: tool_use get_time {"city": "Lisbon"} [toolu_mock_0005]
+user: tool_result [toolu_mock_0003] {"temp_c": 21, "sky": "sunny"}
+user: tool_result [toolu_mock_0004] {"temp_c": 4, "sky": "cloudy"}
+user: tool_result [toolu_mock_0005] 14:05
+assistant: It's warmer where you are: 21°C and sunny in Lisbon against 4°C in Oslo. It's 14:05 in Lisbon.</code></pre>
+    <p>(The ids skip <code>toolu_mock_0002</code> because the mock numbers response ids and tool ids from one counter. Never rely on an id's format; just copy it.)</p>
+    <p>How to read it:</p>
+    <ul>
+      <li><strong>Each run of <code>assistant:</code> lines is one model call.</strong> Consecutive lines with the same
+        role are blocks of one message. Here there are three assistant turns, so three requests.</li>
+      <li><strong>Count tool calls by <code>tool_use</code> lines:</strong> four, in two batches. The second batch
+        was a parallel call of three.</li>
+      <li><strong>Pair ids by eye.</strong> Every bracketed id on a <code>tool_use</code> line appears on a
+        <code>tool_result</code> line in the next user turn. If one is missing, you have found your bug.</li>
+      <li><strong>Check that inputs follow from results.</strong> <code>Lisbon</code> in the second batch came from
+        the first result. If the model asked for a city that appears nowhere in the transcript, it guessed, and the
+        tool description or prompt needs work (M12).</li>
+      <li><strong>Read the results as the model did.</strong> The model only knows what the
+        <code>tool_result</code> lines say. A vague or truncated result explains many wrong answers.</li>
+    </ul>
+    <p>Tests (and you, while debugging) can also read what each request carried through the mock's
+      <code>client.requests</code>. Each entry has <code>.messages</code>, <code>.tools</code>, and
+      <code>.tool_results</code> (the results in its last message). Predict the three
+      printed lines before running this loop.</p>
+    <div class="runnable" data-title="How many requests? How many messages?" data-predict>
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for one city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+client = al.MockClient([
+    al.tool_calls([("get_weather", {"city": "Lisbon"}), ("get_weather", {"city": "Oslo"})]),
+    al.tool_call("get_weather", {"city": "Rome"}),
+    "Lisbon 21°C, Oslo 4°C, Rome 25°C.",
+])
+messages = [{"role": "user", "content": "Weather in Lisbon, Oslo and Rome?"}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    messages.append({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": b.id, "content": "ok"}
+        for b in response.content if b.type == "tool_use"]})
+
+print("requests:", len(client.requests))
+print("tool results per request:", [len(r.tool_results) for r in client.requests])
+print("messages per request:", [len(r.messages) for r in client.requests])
+</textarea>
+    </div>
+    <p>Three requests. The first carries no results; the second carries two (the parallel batch, in one message);
+      the third carries one. The message counts grow 1, 3, 5: a reminder that the whole history rides along on
+      every call.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> one assistant turn per model call; count
+      <code>tool_use</code> lines for tool calls; match bracketed ids; check that each tool input is justified by
+      something earlier in the transcript.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="tool-runner">
+    <h2>What the SDK tool runner automates</h2>
+    <p>The Anthropic Python SDK has a beta helper, the <strong>tool runner</strong>, that runs this loop for you. You
+      decorate plain Python functions with <code>@beta_tool</code>; the SDK builds each tool's input schema from the
+      function's signature and docstring, calls the model, runs the requested functions, sends the results back, and
+      repeats until the model stops asking for tools.</p>
+    <pre data-label="runner.py (real API, run locally)"><code class="language-python">import anthropic
+from anthropic import beta_tool
+
+client = anthropic.Anthropic()
+
+
+@beta_tool
+def get_weather(city: str) -&gt; str:
+    """Get the current weather for one city.
+
+    Args:
+        city: City name, for example "Paris".
+    """
+    return "18°C, light rain"
+
+
+runner = client.beta.messages.tool_runner(
+    model="claude-opus-5-5",
+    max_tokens=4096,
+    tools=[get_weather],
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+)
+for message in runner:            # one message per model call
+    print(message.stop_reason)</code></pre>
+    <p>Map it onto what you built:</p>
+    <table>
+      <thead><tr><th>Your <code>run_agent</code></th><th>The tool runner</th></tr></thead>
+      <tbody>
+        <tr><td>Hand-written <code>TOOLS</code> schemas</td><td>Generated from the decorated function's signature and docstring</td></tr>
+        <tr><td><code>registry</code> dict</td><td>The <code>tools=[...]</code> list of decorated functions</td></tr>
+        <tr><td><code>for step in range(max_steps)</code> + <code>stop_reason</code> check</td><td>The runner's iteration, ending when the model stops calling tools</td></tr>
+        <tr><td><code>run_tools</code>: dispatch, stringify, pair ids, one user message</td><td>Done for you on each iteration</td></tr>
+        <tr><td><code>messages.append(...)</code> twice per step</td><td>Done for you</td></tr>
+      </tbody>
+    </table>
+    <p>So why write the loop by hand first? Because the runner hides exactly the parts that break. When an agent
+      misbehaves you will be reading a transcript, and you can only debug what you understand: a missing pairing, a
+      result the model could not read, a loop that should have stopped. You now know every step the runner takes
+      for you. In production, the runner (or a framework) is often the right choice; your manual loop is the right
+      choice when you need control the helper does not give you, and it is always the right mental model.</p>
+    <aside class="callout note"><p>The tool runner is part of the regular <code>anthropic</code> package, reached via
+      <code>client.beta.messages</code>. It is not the same thing as the Claude Agent SDK, which is a separate
+      product with its own built-in tools. Both appear in later stages.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the tool runner automates schema generation, dispatch,
+      result pairing, and looping. It does not change the protocol; it runs the same loop you just wrote.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Four exercises building to the main event: writing <code>run_agent</code> from a blank function, graded by
+      several scripted runs. Tests give your functions their own <code>MockClient</code> and inspect
+      <code>client.requests</code>.</p>
+
+    <div class="exercise" data-id="m09-e1" data-title="Decide the next action">
+      <div class="exercise-prompt">
+        <p>Write <code>next_action(response)</code> that returns:</p>
+        <ul>
+          <li><code>"tools"</code> when <code>stop_reason</code> is <code>"tool_use"</code>, even if the response also
+            contains text;</li>
+          <li><code>"done"</code> when it is <code>"end_turn"</code>;</li>
+          <li><code>"stop"</code> for anything else (<code>max_tokens</code>, <code>refusal</code>,
+            <code>stop_sequence</code>, ...).</li>
+        </ul>
+      </div>
+<textarea class="starter">
+def next_action(response):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_tool_use():
+    assert next_action(al.tool_call("t", {})) == "tools", "stop_reason tool_use should give 'tools'"
+
+def test_tool_use_with_text():
+    r = al.tool_call("t", {}, text="Let me check.")
+    assert next_action(r) == "tools", "text before a call does not mean done; decide by stop_reason"
+
+def test_end_turn():
+    assert next_action(al.reply("All done.")) == "done", "end_turn should give 'done'"
+
+def test_other_reasons():
+    assert next_action(al.refusal("cyber")) == "stop", "refusal should give 'stop'"
+    truncated = al.Message(content=[al.TextBlock("partial")], stop_reason="max_tokens")
+    assert next_action(truncated) == "stop", "max_tokens should give 'stop', not 'done'"
+    seq = al.Message(content=[al.TextBlock("x")], stop_reason="stop_sequence")
+    assert next_action(seq) == "stop", "stop_sequence should give 'stop'"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Two <code>if</code> checks on
+        <code>response.stop_reason</code> and a fallback <code>return</code>. Do not look at the content.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">def next_action(response):
+    if response.stop_reason == "tool_use":
+        return "tools"
+    if response.stop_reason == "end_turn":
+        return "done"
+    return "stop"</code></pre></details>
+    </div>
+
+    <div class="exercise" data-id="m09-e2" data-title="Run every tool in a turn">
+      <div class="exercise-prompt">
+        <p>Write <code>run_tools(response, registry)</code> that returns the list of <code>tool_result</code> blocks
+          answering every <code>tool_use</code> block in <code>response.content</code>, in order.</p>
+        <ul>
+          <li>Skip non-<code>tool_use</code> blocks (text can appear anywhere).</li>
+          <li>Call <code>registry[block.name](**block.input)</code>; string outputs pass through, anything else goes
+            through <code>json.dumps</code>.</li>
+          <li>Each result is <code>{"type": "tool_result", "tool_use_id": block.id, "content": ...}</code>.</li>
+        </ul>
+        <p>The caller will put the whole list in one user message.</p>
+      </div>
+<textarea class="starter">
+import json
+
+def run_tools(response, registry):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import json
+import agentlab as al
+
+REG = {"weather": lambda city: f"{city}: sunny", "add": lambda a, b: a + b, "info": lambda: {"ok": True}}
+
+def test_single_call():
+    r = al.tool_call("weather", {"city": "Rome"}, id="toolu_a")
+    out = run_tools(r, REG)
+    assert out == [{"type": "tool_result", "tool_use_id": "toolu_a", "content": "Rome: sunny"}], f"got {out!r}"
+
+def test_parallel_calls_in_order():
+    r = al.tool_calls([("weather", {"city": "Oslo"}), ("add", {"a": 1, "b": 2}), ("info", {})],
+                      text="Checking.", ids=["t1", "t2", "t3"])
+    out = run_tools(r, REG)
+    assert [x["tool_use_id"] for x in out] == ["t1", "t2", "t3"], "one result per call, in call order, skipping text"
+    assert out[1]["content"] == "3", "non-string outputs must be converted with json.dumps"
+    assert json.loads(out[2]["content"]) == {"ok": True}, "dicts become JSON text"
+
+def test_no_tool_calls():
+    assert run_tools(al.reply("hi"), REG) == [], "a response without tool_use blocks gives an empty list"
+
+def test_works_in_a_real_turn():
+    tools = [{"name": "weather", "description": "w", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+    client = al.MockClient([al.tool_calls([("weather", {"city": "A"}), ("weather", {"city": "B"})]), "done"])
+    msgs = [{"role": "user", "content": "go"}]
+    resp = client.messages.create(model=al.MODEL, max_tokens=100, tools=tools, messages=msgs)
+    msgs += [{"role": "assistant", "content": resp.content}, {"role": "user", "content": run_tools(resp, REG)}]
+    final = client.messages.create(model=al.MODEL, max_tokens=100, tools=tools, messages=msgs)
+    assert final.stop_reason == "end_turn", "the mock API should accept your results as one user message"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Start with <code>results = []</code>, loop over
+        <code>response.content</code>, <code>continue</code> past blocks whose <code>type</code> is not
+        <code>"tool_use"</code>, and append one dict per call.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import json
+
+def run_tools(response, registry):
+    results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        output = registry[block.name](**block.input)
+        content = output if isinstance(output, str) else json.dumps(output)
+        results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+    return results</code></pre></details>
+    </div>
+
+    <div class="exercise" data-id="m09-e3" data-title="Fix this broken agent">
+      <div class="exercise-prompt">
+        <p>A teammate's <code>broken_agent</code> fails in three different ways depending on the task:</p>
+        <ul>
+          <li>On a parallel task it raises <code>BadRequestError: messages.2: tool_use ids were found without
+            tool_result blocks immediately after: toolu_mock_0002 ...</code></li>
+          <li>When the model writes "Let me check." before a tool call, it returns "Let me check." as the answer and
+            never runs the tool.</li>
+          <li>When the model never stops calling tools, it never returns.</li>
+        </ul>
+        <p>Fix all three. Keep the signature, and add a <code>max_steps=10</code> parameter: when the steps run out,
+          raise <code>RuntimeError</code>. When the stop reason is neither <code>tool_use</code> nor
+          <code>end_turn</code>, also raise <code>RuntimeError</code>.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def broken_agent(client, task, tools, registry):
+    messages = [{"role": "user", "content": task}]
+    while True:
+        response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.content[0].type == "text":
+            return response.content[0].text
+        for block in response.content:
+            if block.type == "tool_use":
+                output = str(registry[block.name](**block.input))
+                messages.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": block.id, "content": output}]})
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+REG = {"get_weather": lambda city: f"{city}: 20°C"}
+
+def test_parallel_results_in_one_message():
+    client = al.MockClient([al.tool_calls([("get_weather", {"city": "A"}), ("get_weather", {"city": "B"})]), "A and B: 20°C."])
+    try:
+        answer = broken_agent(client, "A and B?", TOOLS, REG)
+    except al.BadRequestError as e:
+        raise AssertionError(f"still rejected; put every tool_result in ONE user message: {e}")
+    assert answer == "A and B: 20°C.", f"got {answer!r}"
+    assert len(client.requests[1].tool_results) == 2, "both results belong in the same user message"
+
+def test_text_before_call_is_not_the_answer():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Oslo"}, text="Let me check."), "Oslo is 20°C."])
+    answer = broken_agent(client, "Oslo?", TOOLS, REG)
+    assert answer == "Oslo is 20°C.", f"decide by stop_reason, not by the first block's type; got {answer!r}"
+
+def test_max_steps_guard():
+    client = al.MockClient(responder=lambda req: al.tool_call("get_weather", {"city": "Oslo"}))
+    try:
+        broken_agent(client, "Oslo?", TOOLS, REG, max_steps=4)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a run that never ends must raise RuntimeError after max_steps")
+    assert len(client.requests) == 4, f"max_steps=4 should allow exactly 4 model calls, got {len(client.requests)}"
+
+def test_other_stop_reason_raises():
+    client = al.MockClient([al.refusal("cyber")])
+    try:
+        broken_agent(client, "x", TOOLS, REG)
+    except RuntimeError:
+        return
+    raise AssertionError("a refusal (or any stop_reason other than tool_use/end_turn) should raise RuntimeError")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Replace <code>while True</code> with
+        <code>for step in range(max_steps)</code>; replace the first-block check with a check of
+        <code>response.stop_reason</code>; build a <code>results</code> list inside the block loop and append one user
+        message <em>after</em> it.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import agentlab as al
+
+def broken_agent(client, task, tools, registry, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "end_turn":
+            return "".join(b.text for b in response.content if b.type == "text")
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(f"stopped early: {response.stop_reason}")
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = str(registry[block.name](**block.input))
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        messages.append({"role": "user", "content": results})
+    raise RuntimeError(f"did not finish within {max_steps} steps")</code></pre></details>
+    </div>
+
+    <div class="exercise" data-id="m09-e4" data-title="Write run_agent from a blank function">
+      <div class="exercise-prompt">
+        <p>The centerpiece. Write <code>run_agent(client, task, tools, registry, max_steps=10)</code> without looking
+          back. It must:</p>
+        <ol>
+          <li>Start the history with <code>task</code> as the only user message.</li>
+          <li>Make at most <code>max_steps</code> calls to <code>client.messages.create</code>, each with
+            <code>model=al.MODEL</code>, an explicit <code>max_tokens</code>, <code>tools=tools</code>, and the full
+            history.</li>
+          <li>Append each response's <code>content</code> as an assistant turn.</li>
+          <li>On <code>end_turn</code>, return the joined text of the response.</li>
+          <li>On <code>tool_use</code>, run every <code>tool_use</code> block through <code>registry</code> (non-string
+            outputs through <code>json.dumps</code>) and append all results in one user message.</li>
+          <li>On any other stop reason, raise <code>RuntimeError</code> naming it.</li>
+          <li>If <code>max_steps</code> calls happen without an <code>end_turn</code>, raise
+            <code>RuntimeError</code>.</li>
+        </ol>
+        <p>The tests run five scripted scenarios: a single tool, chained tools, parallel tools, no tools, and a model
+          that never stops.</p>
+      </div>
+<textarea class="starter">
+import json
+import agentlab as al
+
+def run_agent(client, task, tools, registry, max_steps=10):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import json
+import agentlab as al
+
+def _schema(*names):
+    return {"type": "object", "properties": {n: {"type": "string"} for n in names}, "required": list(names)}
+
+TOOLS = [
+    {"name": "get_location", "description": "User's city.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_weather", "description": "Weather for a city.", "input_schema": _schema("city")},
+    {"name": "get_time", "description": "Local time in a city.", "input_schema": _schema("city")},
+]
+CALLS = []
+
+def _location():
+    CALLS.append(("get_location", {}))
+    return "Lisbon"
+
+def _weather(city):
+    CALLS.append(("get_weather", {"city": city}))
+    return {"city": city, "temp_c": {"Lisbon": 21, "Oslo": 4}.get(city, 15)}
+
+def _time(city):
+    CALLS.append(("get_time", {"city": city}))
+    return "14:05"
+
+REG = {"get_location": _location, "get_weather": _weather, "get_time": _time}
+
+def test_single_tool():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Oslo"}), "Oslo is 4°C."])
+    answer = run_agent(client, "Weather in Oslo?", TOOLS, REG)
+    assert answer == "Oslo is 4°C.", f"return the final text, got {answer!r}"
+    assert len(client.requests) == 2, f"expected 2 model calls, got {len(client.requests)}"
+    result = client.requests[1].tool_results[0]
+    assert json.loads(result["content"]) == {"city": "Oslo", "temp_c": 4}, "dict outputs must be sent as JSON text"
+    assert all(r.tools for r in client.requests), "send tools on every request"
+    assert all(r.model == al.MODEL for r in client.requests), "use model=al.MODEL"
+
+def test_chained_tools():
+    CALLS.clear()
+    client = al.MockClient([
+        al.tool_call("get_location", {}),
+        al.tool_call("get_weather", {"city": "Lisbon"}, text="Now the weather."),
+        "21°C in Lisbon.",
+    ])
+    answer = run_agent(client, "Weather here?", TOOLS, REG)
+    assert answer == "21°C in Lisbon.", f"got {answer!r}"
+    assert len(client.requests) == 3, f"a two-step chain needs 3 model calls, got {len(client.requests)}"
+    assert CALLS == [("get_location", {}), ("get_weather", {"city": "Lisbon"})], f"tools ran as {CALLS}"
+    roles = [m["role"] for m in client.requests[2].messages]
+    assert roles == ["user", "assistant", "user", "assistant", "user"], f"history roles were {roles}"
+
+def test_parallel_tools():
+    client = al.MockClient([
+        al.tool_calls([("get_weather", {"city": "Lisbon"}), ("get_weather", {"city": "Oslo"}), ("get_time", {"city": "Lisbon"})]),
+        "Lisbon is warmer; it is 14:05 there.",
+    ])
+    answer = run_agent(client, "Lisbon vs Oslo, and the time?", TOOLS, REG)
+    assert answer == "Lisbon is warmer; it is 14:05 there.", f"got {answer!r}"
+    results = client.requests[1].tool_results
+    assert len(results) == 3, f"all 3 results must be in one user message, got {len(results)}"
+    sent_ids = [b["id"] for b in client.requests[1].messages[1]["content"] if b["type"] == "tool_use"]
+    assert [r["tool_use_id"] for r in results] == sent_ids, "each result must carry its call's id, in order"
+
+def test_no_tools_needed():
+    client = al.MockClient(["Hello!"])
+    assert run_agent(client, "Say hello", TOOLS, REG) == "Hello!", "an end_turn on the first call returns at once"
+    assert len(client.requests) == 1, "no extra calls when the model answers directly"
+
+def test_max_steps():
+    client = al.MockClient(responder=lambda req: al.tool_call("get_weather", {"city": "Oslo"}))
+    try:
+        run_agent(client, "Oslo?", TOOLS, REG, max_steps=3)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("raise RuntimeError when max_steps calls happen without end_turn")
+    assert len(client.requests) == 3, f"max_steps=3 allows exactly 3 calls, got {len(client.requests)}"
+
+def test_refusal_raises():
+    client = al.MockClient([al.refusal("cyber")])
+    try:
+        run_agent(client, "x", TOOLS, REG)
+    except RuntimeError as e:
+        assert "refusal" in str(e), "name the stop reason in the error message"
+        return
+    raise AssertionError("a stop_reason other than tool_use or end_turn must raise RuntimeError")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Write it in the order of the section:
+        <code>messages = [...]</code>; <code>for step in range(max_steps):</code>; create; append
+        <code>response.content</code>; <code>if end_turn: return text</code>; <code>if not tool_use: raise</code>;
+        build results and append one user message; after the loop, <code>raise</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import json
+import agentlab as al
+
+def run_agent(client, task, tools, registry, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=4096, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason == "end_turn":
+            return "".join(b.text for b in response.content if b.type == "text")
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(f"agent stopped early: stop_reason={response.stop_reason}")
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = registry[block.name](**block.input)
+                content = output if isinstance(output, str) else json.dumps(output)
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+        messages.append({"role": "user", "content": results})
+    raise RuntimeError(f"agent did not finish within {max_steps} steps")</code></pre></details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a file-question agent</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">notes_agent.py: answer questions about a folder of notes</span></div>
+      <div class="widget-body">
+        <p>Build a local agent that answers questions about a folder of text files, using your own
+          <code>run_agent</code>. Questions like "Which note mentions the budget, and what does it say?" need a chain
+          (list files, then read the right one) and often parallel reads, which is exactly what the loop is for.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir notes-agent &amp;&amp; cd notes-agent
+pixi init
+pixi add python=3.14 anthropic structlog
+mkdir notes   # put three or four short .txt files here
+# write agent.py and notes_agent.py, then:
+pixi run python notes_agent.py "Which note mentions the budget?"</code></pre>
+        <p><strong>What to build</strong></p>
+        <ul>
+          <li><code>agent.py</code>: your <code>run_agent(client, task, tools, registry, max_steps=10)</code>, the same
+            contract as exercise 4.</li>
+          <li>Two tools in <code>notes_agent.py</code>: <code>list_notes()</code> returning the file names in
+            <code>notes/</code>, and <code>read_note(name)</code> returning one file's text. <code>read_note</code>
+            must refuse names outside the folder (reject anything containing <code>/</code> or <code>..</code>):
+            the model chooses the argument, so the tool enforces the boundary.</li>
+          <li>A client chooser: <code>al.get_client()</code> for the real API, falling back to an
+            <code>al.MockClient</code> script (list, then two parallel reads, then an answer) when it raises
+            <code>al.LiveModelUnavailableError</code>.</li>
+          <li>structlog events for each model call (step number, <code>stop_reason</code>, input and output tokens
+            from <code>usage</code>) and each tool call (name, input, id). Structured events let you reconstruct a run
+            later without re-running it.</li>
+        </ul>
+        <ul class="checklist" data-id="m09-mini">
+          <li><code>run_agent</code> lives in its own module and knows nothing about notes</li>
+          <li>The loop is bounded by <code>max_steps</code> and raises when steps run out</li>
+          <li>Parallel <code>read_note</code> calls are answered in one user message</li>
+          <li><code>read_note("../secret.txt")</code> is refused by the tool itself</li>
+          <li>The mock fallback run makes exactly the number of requests its script has steps</li>
+          <li>Each model call and tool call produces one structlog event</li>
+          <li>Works against the real API with <code>model="claude-opus-5-5"</code>, with the key only in the environment</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> add a <code>--trace</code> flag that prints
+          <code>al.format_transcript</code> of the final history (return the history from a variant of
+          <code>run_agent</code>); total the input and output tokens across the run and print the cost at Opus 5.5
+          prices ($4 and $20 per million tokens); add a <code>search_notes(term)</code> tool and see whether the model
+          prefers it to reading every file.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m09-quiz">
+<script type="application/json">
+{"title": "The Agent Loop quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Why can an agent not know in advance how many model calls a task will need?", "options": ["The API limits calls per minute", "Later tool calls can depend on the results of earlier ones, which only exist at run time", "The model forgets the tools between calls", "max_tokens changes on every call"], "answer": 1, "explanation": "<p>\"Weather where I am\" needs the location before the weather call can be formed. Each result can lead to another request, so only the model, seeing the results, knows when it is done.</p>"},
+  {"type": "single", "prompt": "What should decide whether the loop continues?", "options": ["Whether the response contains any text", "<code>response.stop_reason</code>", "Whether <code>response.content</code> is empty", "The number of tools offered"], "answer": 1, "explanation": "<p>Responses can contain text <em>and</em> tool calls. <code>stop_reason == \"tool_use\"</code> means continue; <code>end_turn</code> means done.</p>"},
+  {"type": "multi", "prompt": "In this module's <code>run_agent</code>, which stop reasons end the run by raising <code>RuntimeError</code>?", "options": ["<code>end_turn</code>", "<code>tool_use</code>", "<code>max_tokens</code>", "<code>refusal</code>"], "answer": [2, 3], "explanation": "<p><code>end_turn</code> returns the answer and <code>tool_use</code> continues the loop. Anything else stops the run loudly so a truncated or refused response is never mistaken for an answer. M11 replaces the exception with a structured result.</p>"},
+  {"type": "single", "prompt": "The model returns three <code>tool_use</code> blocks in one response. How do you send the results?", "options": ["Three user messages, one result each", "One user message containing three tool_result blocks, each with its call's id", "Only the first result; the model will ask again for the others", "One tool_result whose content joins all three outputs"], "answer": 1, "explanation": "<p>All results go in the very next user message, each paired by <code>tool_use_id</code>. Splitting them leaves calls unanswered \"immediately after\" and is rejected.</p>"},
+  {"type": "output", "prompt": "A run makes 3 requests. The first sends 1 message. Each step that runs tools adds an assistant turn and a user turn of results. How many messages does request 3 send?", "code": "counts = [1]\nfor _ in range(2):\n    counts.append(counts[-1] + 2)\nprint(counts[-1])", "answer": "5", "explanation": "<p>1, 3, 5: the history grows by two messages per tool step, and every request re-sends all of it. That growth is why long runs get more expensive per step.</p>"},
+  {"type": "single", "prompt": "Why replace <code>while True</code> with <code>for step in range(max_steps)</code>?", "options": ["for loops are faster in Python", "The model controls when it stops asking for tools; without a limit a confused model could make the loop run, and bill, forever", "The API requires a step count", "while loops cannot call functions"], "answer": 1, "explanation": "<p>The exit condition depends on the model. A step limit is the minimum budget every agent needs. M11 adds token, cost, and time budgets.</p>"},
+  {"type": "single", "prompt": "A loop returns as soon as <code>response.content[0].type == \"text\"</code>. The model replies with \"Let me check.\" followed by a tool call. What happens?", "options": ["The tool runs and the loop continues", "The function returns \"Let me check.\" as the answer and the tool never runs", "BadRequestError", "The loop runs forever"], "answer": 1, "explanation": "<p>That is exactly why the loop must decide by <code>stop_reason</code>: this response has <code>stop_reason=\"tool_use\"</code> despite starting with text.</p>"},
+  {"type": "single", "prompt": "Why append the assistant turn <em>before</em> checking <code>stop_reason</code>?", "options": ["The API requires it to be last", "It holds the tool_use blocks the next results must answer, and on the last step it keeps the final answer in the history", "It resets the model's memory", "It reduces token usage"], "answer": 1, "explanation": "<p>Appending first keeps the history correct in every branch: results can pair with their calls, and the finished conversation is complete if you continue it later. The one exception is a refusal, whose empty content must not be appended (M11 shows why).</p>"},
+  {"type": "text", "prompt": "Which attribute of an agentlab <code>MockClient</code> records every request it accepted, for tests to inspect?", "answer": ["requests", "client.requests"], "explanation": "<p><code>client.requests</code> is a list of <code>al.Request</code> objects with <code>.messages</code>, <code>.tools</code>, <code>.tool_results</code> and more.</p>"},
+  {"type": "single", "prompt": "In a transcript printed by <code>al.format_transcript</code>, how do you count model calls?", "options": ["Count all lines", "Count groups of consecutive <code>assistant:</code> lines (one assistant turn per call)", "Count <code>tool_result</code> lines", "Count user lines"], "answer": 1, "explanation": "<p>Consecutive lines with the same role are blocks of one message. Each assistant message is one response, so one model call.</p>"},
+  {"type": "multi", "prompt": "What does the SDK's beta tool runner (<code>client.beta.messages.tool_runner</code> with <code>@beta_tool</code>) do for you?", "options": ["Generates input schemas from decorated functions", "Runs requested tools and sends results back with matching ids", "Repeats until the model stops calling tools", "Makes tools run on Anthropic's servers"], "answer": [0, 1, 2], "explanation": "<p>The runner automates the loop you wrote. Your functions still run in your own process; only server tools (a different feature) run on Anthropic's side.</p>"},
+  {"type": "single", "prompt": "Is the tool runner the same thing as the Claude Agent SDK?", "options": ["Yes, two names for one package", "No: the tool runner is a helper in the regular <code>anthropic</code> SDK; the Claude Agent SDK is a separate product", "Yes, but only in TypeScript", "No: the tool runner is deprecated"], "answer": 1, "explanation": "<p>The tool runner loops over tools you define. The Claude Agent SDK is a separate product with its own built-in tools, covered in a later stage.</p>"},
+  {"type": "single", "prompt": "Two parallel calls are independent. Must you run them concurrently?", "options": ["Yes, or the API rejects the results", "No; running them one after the other is correct. Concurrency is an optional speed-up", "Yes, the ids expire", "Only for more than two calls"], "answer": 1, "explanation": "<p>The API only cares that all results arrive in one message with matching ids. How you execute them is your choice.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>An agent is a model in a loop with tools. The loop exists because later tool calls depend on earlier
+        results, so the number of steps is unknown in advance.</li>
+      <li><code>stop_reason</code> drives the loop: <code>tool_use</code> continues, <code>end_turn</code> returns,
+        anything else stops and reports. Never decide "done" by looking for text.</li>
+      <li>Each step: call with the full history and tools, append <code>response.content</code>, run every
+        <code>tool_use</code> block, append all results in one user message.</li>
+      <li>Parallel calls: N <code>tool_use</code> blocks in one turn are answered by N <code>tool_result</code> blocks
+        in one message, paired by id.</li>
+      <li>Bound the loop: <code>for step in range(max_steps)</code> and a final <code>raise</code>. The history, and so
+        the cost per call, grows every step.</li>
+      <li>Debug with <code>al.format_transcript</code>: one assistant turn per call, ids paired by eye, inputs justified
+        by earlier results.</li>
+      <li>The SDK's beta tool runner automates this loop; knowing the manual loop is what lets you debug it.</li>
+    </ul>
+    <div class="flashcards" data-title="The agent loop">
+      <script type="application/json">
+      [{"front": "What is an agent, in one line?", "back": "A model in a loop with tools: it decides which tool to call next; your loop runs the tools and decides whether to continue."},
+       {"front": "Which field drives the agent loop?", "back": "<code>response.stop_reason</code>."},
+       {"front": "<code>stop_reason</code> = <code>tool_use</code>", "back": "Run every requested tool, append all results in one user message, call again."},
+       {"front": "<code>stop_reason</code> = <code>end_turn</code>", "back": "The model is done. Return the joined text."},
+       {"front": "<code>max_tokens</code> or <code>refusal</code> inside the loop", "back": "Stop and report it (this module raises; M11 returns a structured result). Never treat it as a finished answer."},
+       {"front": "Answering parallel tool calls", "back": "One user message with one <code>tool_result</code> per call, each with the matching <code>tool_use_id</code>, before any text."},
+       {"front": "Why <code>max_steps</code>?", "back": "The model controls when the loop wants to end; a step limit guarantees it ends, capping cost on a runaway."},
+       {"front": "What grows on every step?", "back": "The message list, which is re-sent in full, so input tokens per call grow too."},
+       {"front": "How to count model calls in a transcript", "back": "Count assistant turns (groups of consecutive <code>assistant:</code> lines)."},
+       {"front": "What the beta tool runner automates", "back": "Schemas from <code>@beta_tool</code> functions, dispatch, result pairing, appending history, and looping until done."},
+       {"front": "The skeleton of <code>run_agent</code>", "back": "history → for step in range(max_steps) → create → append content → end_turn: return → not tool_use: raise → append results → after loop: raise."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Claude docs: Tool use overview</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use">Claude docs: How to implement tool use</a> (parallel tool use and the tool runner)</li>
+      <li><a href="https://github.com/anthropics/anthropic-sdk-python">Anthropic Python SDK on GitHub</a> (examples, including the tool runner)</li>
+      <li><a href="../reference/agent-loop-cheatsheet.html">Agent loop cheatsheet</a>, <a href="../reference/agentlab.html">agentlab reference</a>, and <a href="../reference/glossary.html">glossary</a></li>
+      <li>Next: <a href="m10-errors-as-data.html">M10 Errors as Data</a>, where tool failures and API errors stop crashing your agent</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

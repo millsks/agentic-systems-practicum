@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentlab Reference · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-page="ref-agentlab">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · Library</p>
+    <h1>agentlab Reference</h1>
+    <p class="lede"><code>agentlab</code> is the practicum's teaching library: a scripted, offline stand-in for the
+      Anthropic Python SDK's Messages API, plus a few helpers for reading transcripts, validating JSON, and estimating
+      tokens. Every runnable cell and exercise in the course uses it. This page documents every public name and how
+      each one maps to the real SDK.</p>
+    <div class="lesson-meta"><span>⏱ Look things up as you go</span><span><code>import agentlab as al</code></span><span>Source: <code>src/agentlab/</code></span></div>
+    <ul class="objectives">
+      <li>Script a <code>MockClient</code> with every kind of step</li>
+      <li>Know exactly which requests the mock rejects, and with which exception</li>
+      <li>Read responses, stream events, and recorded requests</li>
+      <li>Move code from the mock to the real <code>anthropic</code> client by changing one line</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="at-a-glance">
+    <h2>At a glance</h2>
+    <pre><code class="language-python">import agentlab as al
+
+client = al.MockClient([
+    al.tool_call("get_weather", {"city": "Paris"}),   # answers request 1
+    "It is 18 C in Paris.",                             # answers request 2 (shorthand for al.reply)
+])
+response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+response.stop_reason            # "tool_use"
+response.content[0]             # ToolUseBlock(id="toolu_mock_0001", name="get_weather", input={...})
+client.requests[0].tool_names   # ["get_weather"]</code></pre>
+    <table>
+      <thead><tr><th>Group</th><th>Names</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#mockclient">Client</a></td><td><code>MockClient</code>, <code>MODEL</code> / <code>DEFAULT_MODEL</code> (<code>"claude-opus-5-5"</code>)</td></tr>
+        <tr><td><a href="#steps">Script steps</a></td><td><code>reply</code>, <code>tool_call</code>, <code>tool_calls</code>, <code>refusal</code>, <code>fail</code>, <code>one_of</code>, <code>Failure</code>, plain strings, functions</td></tr>
+        <tr><td><a href="#request">Requests</a></td><td><code>Request</code></td></tr>
+        <tr><td><a href="#responses">Responses</a></td><td><code>Message</code>, <code>TextBlock</code>, <code>ToolUseBlock</code>, <code>Usage</code>, <code>StopDetails</code>, <code>MessageTokensCount</code></td></tr>
+        <tr><td><a href="#streaming">Streaming</a></td><td><code>MessageStream</code>, <code>StreamEvent</code></td></tr>
+        <tr><td><a href="#errors">Errors</a></td><td><code>APIError</code>, <code>APIConnectionError</code>, <code>APIStatusError</code>, <code>BadRequestError</code>, <code>AuthenticationError</code>, <code>NotFoundError</code>, <code>RateLimitError</code>, <code>InternalServerError</code>, <code>OverloadedError</code>, <code>MockScriptError</code></td></tr>
+        <tr><td><a href="#helpers">Helpers</a></td><td><code>format_transcript</code>, <code>format_block</code>, <code>as_dict</code>, <code>validate</code>, <code>estimate_tokens</code>, <code>estimate_request_tokens</code></td></tr>
+        <tr><td><a href="#live">Live API</a></td><td><code>get_client</code>, <code>LiveModelUnavailableError</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="mockclient">
+    <h2>MockClient</h2>
+    <pre><code class="language-python">al.MockClient(script=None, *, responder=None, seed=0)</code></pre>
+    <p>A client with the same <code>messages</code> surface as <code>anthropic.Anthropic()</code>. Each request is first
+      <a href="#validation">validated like the real API</a>, recorded in <code>client.requests</code>, then answered by the
+      next script step.</p>
+    <table>
+      <thead><tr><th>Parameter / attribute</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>script</code></td><td>List of <a href="#steps">steps</a>, consumed one per request, in order.</td></tr>
+        <tr><td><code>responder</code></td><td>A function <code>Request -&gt; step</code> used for every request once the script is empty. Without it, an empty script raises <code>MockScriptError</code>.</td></tr>
+        <tr><td><code>seed</code></td><td>Seeds the client's <code>random.Random</code>, shared with <code>one_of</code> and with function steps through <code>request.rng</code>. Same seed, same choices.</td></tr>
+        <tr><td><code>client.requests</code></td><td>Every validated <a href="#request"><code>Request</code></a>, in order. Requests that fail validation are not recorded and do not consume a step.</td></tr>
+        <tr><td><code>client.remaining</code></td><td>Number of script steps not yet used.</td></tr>
+        <tr><td><code>client.messages</code></td><td>The Messages resource: <code>create</code>, <code>stream</code>, <code>count_tokens</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="create">messages.create(**kwargs)</h3>
+    <p>Accepted keyword arguments: <code>model</code> and <code>max_tokens</code> (required), <code>messages</code>,
+      <code>system</code>, <code>tools</code>, <code>tool_choice</code>, <code>stop_sequences</code>,
+      <code>output_config</code>, <code>thinking</code>, <code>metadata</code>, <code>cache_control</code>,
+      <code>stream</code>. Returns a <a href="#responses"><code>Message</code></a>. With <code>stream=True</code> it returns
+      an iterator of <a href="#streaming"><code>StreamEvent</code></a>s instead.</p>
+    <p>After choosing a step, the mock finishes the response in this order:</p>
+    <ol>
+      <li>Gives every <code>ToolUseBlock</code> without an id a generated one (<code>toolu_mock_0001</code>, ...).</li>
+      <li>For tools defined with <code>"strict": True</code>, checks the scripted input against the schema
+        (<code>MockScriptError</code> if it does not match).</li>
+      <li>Applies <code>stop_sequences</code>: when the response would end with <code>end_turn</code> or
+        <code>tool_use</code> and a text block contains a sequence, the text is cut before the earliest one, later
+        blocks are dropped, <code>stop_reason</code> becomes <code>"stop_sequence"</code>, and
+        <code>stop_sequence</code> names the match.</li>
+      <li>Applies <code>max_tokens</code> at about 4 characters per token: blocks that do not fit are cut (text) or
+        dropped (tool use), and <code>stop_reason</code> becomes <code>"max_tokens"</code>.</li>
+      <li>When <code>output_config.format</code> is set and the response ended with <code>end_turn</code>, checks that the
+        text parses as JSON and matches the schema (<code>MockScriptError</code> otherwise).</li>
+      <li>Sets <code>id</code> (<code>msg_mock_0002</code>, ...; tool and message ids share one counter),
+        <code>model</code> (the requested id), and <code>usage</code> (estimated <code>input_tokens</code> and
+        <code>output_tokens</code>; cache counters stay 0).</li>
+    </ol>
+
+    <h3 id="stream-method">messages.stream(**kwargs)</h3>
+    <p>Same arguments as <code>create</code>. Returns a <a href="#streaming"><code>MessageStream</code></a> to use as a
+      context manager. The mock builds the whole response immediately and replays it as events, so a scripted failure or
+      validation error is raised by the <code>stream(...)</code> call itself.</p>
+
+    <h3 id="count-tokens">messages.count_tokens(**kwargs)</h3>
+    <p>Takes <code>model</code>, <code>messages</code>, and optionally <code>system</code> and <code>tools</code>
+      (<code>max_tokens</code> is optional here). The request is validated like <code>create</code> but nothing is
+      generated, no step is consumed, and nothing is added to <code>client.requests</code>. Returns a
+      <code>MessageTokensCount</code> whose <code>input_tokens</code> is the same estimate
+      <code>estimate_request_tokens</code> gives.</p>
+  </section>
+
+  <section class="lesson-section" id="steps">
+    <h2>Script steps</h2>
+    <table>
+      <thead><tr><th>Step</th><th>Produces</th></tr></thead>
+      <tbody>
+        <tr><td><code>"some text"</code></td><td>Shorthand for <code>al.reply("some text")</code>.</td></tr>
+        <tr><td><code>al.reply(text)</code></td><td>One <code>TextBlock</code>, <code>stop_reason="end_turn"</code>.</td></tr>
+        <tr><td><code>al.tool_call(name, input=None, *, text=None, id=None)</code></td><td>An optional leading <code>TextBlock</code>, one <code>ToolUseBlock</code>, <code>stop_reason="tool_use"</code>. The id is generated unless given.</td></tr>
+        <tr><td><code>al.tool_calls([(name, input), ...], *, text=None, ids=None)</code></td><td>Parallel tool use: several <code>ToolUseBlock</code>s in one response, <code>stop_reason="tool_use"</code>. <code>ids</code> gives one id per call.</td></tr>
+        <tr><td><code>al.refusal(category=None, explanation="The request was declined.")</code></td><td>Empty <code>content</code>, <code>stop_reason="refusal"</code>, and <code>stop_details=StopDetails(category, explanation)</code>.</td></tr>
+        <tr><td><code>al.fail(error)</code></td><td>A <code>Failure</code>: the call raises <code>error</code>, for example <code>al.fail(al.RateLimitError())</code>. The request is still recorded.</td></tr>
+        <tr><td><code>al.one_of(*answers)</code></td><td>A function step that replies with one answer chosen by the seeded generator, to show output varying between runs.</td></tr>
+        <tr><td>Any function <code>request -&gt; step</code></td><td>Called with the validated <code>Request</code>; may return any step, including another function. Use it to answer based on <code>request.tool_results</code> or <code>request.last_user_text</code>.</td></tr>
+        <tr><td>A <code>Message</code> you build</td><td>Used as is (deep-copied), for shapes the helpers do not cover.</td></tr>
+      </tbody>
+    </table>
+    <p>Count steps carefully: one step answers one <code>create</code> or <code>stream</code> call. An agent loop that makes
+      three requests needs three steps (or a <code>responder</code>).</p>
+    <pre><code class="language-python">def answer_from_result(request):
+    weather = request.tool_results[0]["content"]          # what your code sent back
+    return f"Here is the forecast: {weather}"
+
+client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}), answer_from_result])
+client = al.MockClient(responder=lambda request: f"echo: {request.last_user_text}")   # answers forever</code></pre>
+  </section>
+
+  <section class="lesson-section" id="request">
+    <h2>Request</h2>
+    <p>The validated form of a request, passed to function steps and stored in <code>client.requests</code>. Message
+      content is normalized: every block (including SDK or agentlab block objects) becomes a plain dict.</p>
+    <table>
+      <thead><tr><th>Field / property</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>model</code></td><td><code>str</code></td><td>Model id.</td></tr>
+        <tr><td><code>max_tokens</code></td><td><code>int</code></td><td>Output limit.</td></tr>
+        <tr><td><code>messages</code></td><td><code>list[dict]</code></td><td>The conversation, normalized to dicts.</td></tr>
+        <tr><td><code>system</code></td><td><code>str | list | None</code></td><td>System prompt.</td></tr>
+        <tr><td><code>tools</code></td><td><code>list[dict]</code></td><td>Tool definitions (empty when none).</td></tr>
+        <tr><td><code>stop_sequences</code></td><td><code>list[str]</code></td><td>Stop sequences.</td></tr>
+        <tr><td><code>output_config</code></td><td><code>dict</code></td><td>Effort and format settings (empty when none).</td></tr>
+        <tr><td><code>tool_choice</code></td><td><code>dict | None</code></td><td>Tool choice setting.</td></tr>
+        <tr><td><code>rng</code></td><td><code>random.Random</code></td><td>The client's seeded generator.</td></tr>
+        <tr><td><code>last_user_text</code></td><td>property, <code>str</code></td><td>Text of the most recent user message, ignoring tool results.</td></tr>
+        <tr><td><code>tool_results</code></td><td>property, <code>list[dict]</code></td><td><code>tool_result</code> blocks in the last message when it is a user message.</td></tr>
+        <tr><td><code>turn</code></td><td>property, <code>int</code></td><td>Assistant turns already in the history (0 on the first request).</td></tr>
+        <tr><td><code>tool_names</code></td><td>property, <code>list[str]</code></td><td>Names of offered tools.</td></tr>
+        <tr><td><code>effort</code></td><td>property, <code>str</code></td><td><code>output_config["effort"]</code>, defaulting to <code>"medium"</code>.</td></tr>
+        <tr><td><code>tool(name)</code></td><td>method</td><td>The offered tool definition with that name, or <code>None</code>.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="responses">
+    <h2>Responses and blocks</h2>
+    <p>Dataclasses shaped like the SDK's <code>anthropic.types</code> models.</p>
+    <table>
+      <thead><tr><th>Class</th><th>Fields</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>Message</code></td><td><code>id</code>, <code>type="message"</code>, <code>role="assistant"</code>, <code>model</code>, <code>content</code>, <code>stop_reason</code>, <code>stop_sequence</code>, <code>stop_details</code>, <code>usage</code></td><td><code>.text</code> joins all text blocks (mock-only convenience). <code>.to_dict()</code>, <code>.to_json()</code>.</td></tr>
+        <tr><td><code>TextBlock</code></td><td><code>type="text"</code>, <code>text</code></td><td><code>.to_dict()</code></td></tr>
+        <tr><td><code>ToolUseBlock</code></td><td><code>type="tool_use"</code>, <code>id</code>, <code>name</code>, <code>input</code> (a dict)</td><td><code>.to_dict()</code>. Your <code>tool_result</code> echoes <code>id</code> as <code>tool_use_id</code>.</td></tr>
+        <tr><td><code>Usage</code></td><td><code>input_tokens</code>, <code>output_tokens</code>, <code>cache_creation_input_tokens</code>, <code>cache_read_input_tokens</code></td><td>Estimates; cache counters are always 0 in the mock.</td></tr>
+        <tr><td><code>StopDetails</code></td><td><code>type="refusal"</code>, <code>category</code>, <code>explanation</code></td><td>Set only when <code>stop_reason == "refusal"</code>.</td></tr>
+        <tr><td><code>MessageTokensCount</code></td><td><code>input_tokens</code></td><td>Returned by <code>count_tokens</code>.</td></tr>
+      </tbody>
+    </table>
+    <p><code>stop_reason</code> is one of <code>"end_turn"</code>, <code>"max_tokens"</code>, <code>"stop_sequence"</code>,
+      <code>"tool_use"</code>, <code>"pause_turn"</code>, <code>"refusal"</code>. The mock produces all of them except
+      <code>pause_turn</code> on its own; build a <code>Message(content=[...], stop_reason="pause_turn")</code> step to
+      practice handling it. You can append <code>response.content</code> straight into <code>messages</code>: the mock
+      converts blocks to dicts when it validates the next request, just as the SDK accepts its own block objects.</p>
+  </section>
+
+  <section class="lesson-section" id="streaming">
+    <h2>Streaming</h2>
+    <pre><code class="language-python">with client.messages.stream(model=al.MODEL, max_tokens=512, messages=messages) as stream:
+    for text in stream.text_stream:
+        print(text, end="")
+    final = stream.get_final_message()     # the complete Message</code></pre>
+    <table>
+      <thead><tr><th><code>MessageStream</code> member</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>with ... as stream</code></td><td>Context manager; returns itself.</td></tr>
+        <tr><td><code>for event in stream</code></td><td>Yields the remaining <code>StreamEvent</code>s.</td></tr>
+        <tr><td><code>stream.text_stream</code></td><td>Yields only text fragments (from <code>text_delta</code> events).</td></tr>
+        <tr><td><code>stream.get_final_message()</code></td><td>Consumes the rest and returns the <code>Message</code>.</td></tr>
+        <tr><td><code>stream.until_done()</code></td><td>Consumes the rest.</td></tr>
+      </tbody>
+    </table>
+    <p>Iteration, <code>text_stream</code>, and <code>get_final_message</code> share one underlying event iterator:
+      events consumed by one are not seen by another.</p>
+    <p><strong>Event sequence</strong> (each a <code>StreamEvent</code> with <code>type</code>, <code>index</code>,
+      <code>message</code>, <code>content_block</code>, <code>delta</code>, <code>usage</code>):</p>
+    <ol>
+      <li><code>message_start</code>: <code>message</code> is the response with empty <code>content</code>.</li>
+      <li>For each block: <code>content_block_start</code> (<code>content_block</code> is an empty <code>TextBlock</code>,
+        or a <code>ToolUseBlock</code> with <code>input={}</code>), then <code>content_block_delta</code> events
+        (<code>delta.type</code> <code>"text_delta"</code> with <code>delta.text</code>, one per word; or
+        <code>"input_json_delta"</code> with <code>delta.partial_json</code>, 16-character chunks of the input JSON), then
+        <code>content_block_stop</code>.</li>
+      <li><code>message_delta</code>: <code>delta.stop_reason</code>, <code>delta.stop_sequence</code>, and
+        <code>usage.output_tokens</code>.</li>
+      <li><code>message_stop</code>.</li>
+    </ol>
+    <p><code>client.messages.create(..., stream=True)</code> returns an iterator over the same events.</p>
+  </section>
+
+  <section class="lesson-section" id="validation">
+    <h2>Validation rules</h2>
+    <p>The mock checks each request before using the script. A rejected request raises immediately, is not recorded, and
+      does not consume a step.</p>
+    <table>
+      <thead><tr><th>Rule</th><th>Raises</th></tr></thead>
+      <tbody>
+        <tr><td><code>temperature</code>, <code>top_p</code>, or <code>top_k</code> passed</td><td><code>BadRequestError</code></td></tr>
+        <tr><td>Unknown keyword argument (for example <code>output_format</code>, <code>prefill</code>)</td><td><code>TypeError</code></td></tr>
+        <tr><td><code>model</code> or <code>max_tokens</code> missing or wrong type</td><td><code>TypeError</code></td></tr>
+        <tr><td><code>model</code> does not start with <code>claude-</code></td><td><code>NotFoundError</code></td></tr>
+        <tr><td><code>max_tokens</code> outside 1 to 128,000</td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>thinking</code> other than <code>{"type": "adaptive"}</code> (including <code>disabled</code> and <code>budget_tokens</code>)</td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>tool_choice</code> type not one of <code>auto</code>, <code>none</code>, <code>any</code>, <code>tool</code>; or forced (<code>any</code>/<code>tool</code>)</td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>output_config</code> not a dict; <code>effort</code> not <code>low</code>/<code>medium</code>/<code>high</code>/<code>xhigh</code>/<code>max</code>; <code>format</code> not <code>{"type": "json_schema", "schema": {...}}</code></td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>tools</code> not a list; a tool not a dict; name not matching <code>^[a-zA-Z0-9_-]{1,64}$</code>; duplicate names; <code>input_schema</code> missing or not <code>type: object</code></td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>messages</code> empty or not a list; a message not a dict; role not <code>user</code>/<code>assistant</code> (a <code>system</code> role is allowed only after the first message)</td><td><code>BadRequestError</code></td></tr>
+        <tr><td>Content empty, whitespace-only, or an empty list; an empty text block</td><td><code>BadRequestError</code></td></tr>
+        <tr><td>First message not <code>user</code></td><td><code>BadRequestError</code></td></tr>
+        <tr><td>Last message is <code>assistant</code> (prefill)</td><td><code>BadRequestError</code></td></tr>
+        <tr><td>An assistant <code>tool_use</code> not answered by a <code>tool_result</code> with that id in the very next (user) message</td><td><code>BadRequestError</code></td></tr>
+        <tr><td>A <code>tool_result</code> whose id matches no <code>tool_use</code> in the previous assistant message, or a <code>tool_result</code> with no preceding <code>tool_use</code></td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>tool_result</code> blocks after other content (text first) in the same message</td><td><code>BadRequestError</code></td></tr>
+        <tr><td><code>stop_sequences</code> not a list of non-empty strings; <code>system</code> not a string or list</td><td><code>BadRequestError</code></td></tr>
+      </tbody>
+    </table>
+    <p>Script problems raise <code>MockScriptError</code>, which means the exercise or cell is wrong, not your agent: the
+      script is used up with no <code>responder</code>; a scripted tool call names a tool when the request offered no
+      tools; a strict tool's scripted input fails its schema; or <code>output_config.format</code> is set and the scripted
+      reply is not matching JSON. (A scripted call to a tool name that is not offered, when other tools are, is allowed,
+      so you can practice handling unknown tools.)</p>
+  </section>
+
+  <section class="lesson-section" id="errors">
+    <h2>Errors</h2>
+    <table>
+      <thead><tr><th>agentlab</th><th>Status</th><th>Mirrors</th><th>What to do</th></tr></thead>
+      <tbody>
+        <tr><td><code>APIError</code></td><td></td><td><code>anthropic.APIError</code></td><td>Base class; has <code>.message</code>.</td></tr>
+        <tr><td><code>APIConnectionError</code></td><td></td><td><code>anthropic.APIConnectionError</code></td><td>Network failure or timeout; retry with backoff.</td></tr>
+        <tr><td><code>APIStatusError</code></td><td>any</td><td><code>anthropic.APIStatusError</code></td><td>Base for HTTP errors; has <code>.status_code</code> (override with <code>status_code=</code>).</td></tr>
+        <tr><td><code>BadRequestError</code></td><td>400</td><td><code>anthropic.BadRequestError</code></td><td>Fix the request; retrying unchanged fails again.</td></tr>
+        <tr><td><code>AuthenticationError</code></td><td>401</td><td><code>anthropic.AuthenticationError</code></td><td>Fix the API key in the environment.</td></tr>
+        <tr><td><code>NotFoundError</code></td><td>404</td><td><code>anthropic.NotFoundError</code></td><td>Fix the model id.</td></tr>
+        <tr><td><code>RateLimitError(message, *, retry_after=1.0)</code></td><td>429</td><td><code>anthropic.RateLimitError</code></td><td>Wait <code>.retry_after</code> seconds, then retry.</td></tr>
+        <tr><td><code>InternalServerError</code></td><td>500</td><td><code>anthropic.InternalServerError</code></td><td>Retry with backoff.</td></tr>
+        <tr><td><code>OverloadedError</code></td><td>529</td><td>an HTTP 529 status error</td><td>Retry with backoff.</td></tr>
+        <tr><td><code>MockScriptError</code></td><td></td><td>mock-only</td><td>The script is wrong; fix the exercise, not the agent.</td></tr>
+        <tr><td><code>LiveModelUnavailableError</code></td><td></td><td>mock-only</td><td><code>get_client()</code> cannot create a real client here.</td></tr>
+      </tbody>
+    </table>
+    <p>Every status error subclasses <code>APIStatusError</code>, which subclasses <code>APIError</code>, so
+      <code>except al.APIStatusError as e: e.status_code</code> works as in the SDK. Unlike the SDK, the mock never retries
+      on its own.</p>
+  </section>
+
+  <section class="lesson-section" id="helpers">
+    <h2>Helpers</h2>
+    <table>
+      <thead><tr><th>Function</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>al.format_transcript(messages, response=None)</code></td><td>One line per block: <code>user: ...</code>, <code>assistant: tool_use name {...} [id]</code>, <code>user: tool_result [id] (error) ...</code>. With <code>response</code>, appends it and a <code>(stop_reason=...)</code> line. Long text is clipped to 160 characters.</td></tr>
+        <tr><td><code>al.format_block(block_dict)</code></td><td>The one-line rendering of a single block dict.</td></tr>
+        <tr><td><code>al.as_dict(block)</code></td><td>A plain dict from a dict, an agentlab block (<code>to_dict</code>), or an SDK block (<code>model_dump</code>); <code>TypeError</code> otherwise.</td></tr>
+        <tr><td><code>al.validate(value, schema)</code></td><td>A list of problems like <code>"$.city: expected string, got int"</code>; empty when valid. Supports <code>type</code> (name or list), <code>enum</code>, <code>const</code>, <code>properties</code>, <code>required</code>, <code>additionalProperties</code> (boolean), <code>items</code>, <code>minItems</code>, <code>maxItems</code>, <code>minLength</code>, <code>maxLength</code>, <code>minimum</code>, <code>maximum</code>. Other keywords are ignored. Booleans are not integers.</td></tr>
+        <tr><td><code>al.estimate_tokens(text)</code></td><td><code>ceil(len(text) / 4)</code>. An order-of-magnitude estimate, not a tokenizer.</td></tr>
+        <tr><td><code>al.estimate_request_tokens(messages, *, system=None, tools=None)</code></td><td>Estimated input tokens of a whole request: tools (as JSON), system, every message, plus 3 per message.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="live">
+    <h2>The live API: get_client</h2>
+    <pre><code class="language-python">client = al.get_client(**options)   # anthropic.Anthropic(**options)</code></pre>
+    <p>Returns a real <code>anthropic.Anthropic</code> client when the <code>anthropic</code> package is installed (locally,
+      after <code>pixi add anthropic</code>). Credentials come from the environment (<code>ANTHROPIC_API_KEY</code> or an
+      <code>ant auth login</code> profile); never pass a key in code. In the browser it raises
+      <code>LiveModelUnavailableError</code>. A common local pattern:</p>
+    <pre><code class="language-python">import agentlab as al
+
+try:
+    client = al.get_client()
+except al.LiveModelUnavailableError:
+    client = al.MockClient(responder=lambda request: "mock answer: the real API is not available here")</code></pre>
+  </section>
+
+  <section class="lesson-section" id="mock-vs-real">
+    <h2>Mock vs real SDK</h2>
+    <table>
+      <thead><tr><th>Topic</th><th>agentlab <code>MockClient</code></th><th>Real <code>anthropic.Anthropic()</code></th></tr></thead>
+      <tbody>
+        <tr><td>Create a client</td><td><code>al.MockClient(script)</code></td><td><code>anthropic.Anthropic()</code> or <code>al.get_client()</code></td></tr>
+        <tr><td>Where answers come from</td><td>Your script, in order; deterministic</td><td>The model; varies run to run</td></tr>
+        <tr><td>Network and key</td><td>None needed; runs in the browser</td><td>Network and an API key in the environment</td></tr>
+        <tr><td><code>messages.create</code> / <code>stream</code> / <code>count_tokens</code></td><td>Same names and arguments</td><td>Same</td></tr>
+        <tr><td>Request validation</td><td>The common 400s listed <a href="#validation">above</a></td><td>Full server-side validation</td></tr>
+        <tr><td>Content block types</td><td><code>text</code> and <code>tool_use</code> only</td><td>Can include other block types</td></tr>
+        <tr><td><code>response.text</code></td><td>Available (joins text blocks)</td><td>Not available; join <code>block.text</code> for text blocks yourself</td></tr>
+        <tr><td>Token counts</td><td>Estimates at about 4 characters per token</td><td>Exact counts from the tokenizer</td></tr>
+        <tr><td>Cache usage fields</td><td>Always 0</td><td>Filled when prompt caching is used</td></tr>
+        <tr><td><code>stop_reason="pause_turn"</code></td><td>Only if you script it</td><td>Server tools can return it</td></tr>
+        <tr><td>Refusals</td><td><code>al.refusal(category)</code></td><td>Model decision; check <code>stop_details</code></td></tr>
+        <tr><td>Errors</td><td>Same class names; raised by <code>al.fail(...)</code> steps or validation</td><td>Raised by the server or network</td></tr>
+        <tr><td>Automatic retries</td><td>None</td><td>Retries 408/409/429/5xx twice by default</td></tr>
+        <tr><td>Streaming timing</td><td>Response built at once, replayed as events</td><td>Events arrive as the model generates</td></tr>
+        <tr><td>Recorded requests</td><td><code>client.requests</code></td><td>Not available; log requests yourself</td></tr>
+        <tr><td>Script errors</td><td><code>MockScriptError</code></td><td>Not applicable</td></tr>
+      </tbody>
+    </table>
+    <p>Because the surface matches, moving code to the real API is one line. The only change below is how
+      <code>client</code> is created:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()          # was: client = al.MockClient([...])
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Say hello in five words."}],
+)
+print(response.stop_reason, "".join(b.text for b in response.content if b.type == "text"))</code></pre>
+  </section>
+
+  <section class="lesson-section" id="try-it">
+    <h2>Try it</h2>
+    <p>This cell exercises most of the library: a function step, recorded requests, streaming, token counting, a
+      validation error, and a scripted rate limit.</p>
+    <div class="runnable" data-title="agentlab tour">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "add", "description": "Add two integers.",
+          "input_schema": {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                           "required": ["a", "b"]}}]
+
+def answer(request):
+    return f"The sum is {request.tool_results[0]['content']}."
+
+client = al.MockClient([al.tool_call("add", {"a": 2, "b": 3}), answer, "streamed reply here",
+                        al.fail(al.RateLimitError(retry_after=2.0))])
+
+messages = [{"role": "user", "content": "What is 2 + 3?"}]
+r1 = client.messages.create(model=al.MODEL, max_tokens=256, tools=TOOLS, messages=messages)
+call = r1.content[0]
+messages += [{"role": "assistant", "content": r1.content},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call.id,
+                                           "content": str(call.input["a"] + call.input["b"])}]}]
+r2 = client.messages.create(model=al.MODEL, max_tokens=256, tools=TOOLS, messages=messages)
+print(al.format_transcript(messages, r2))
+print("turn of request 2:", client.requests[1].turn, "| usage:", r2.usage.input_tokens, r2.usage.output_tokens)
+
+with client.messages.stream(model=al.MODEL, max_tokens=256, messages=[{"role": "user", "content": "hi"}]) as s:
+    print("stream:", "|".join(s.text_stream))
+
+print("count_tokens:", client.messages.count_tokens(model=al.MODEL, messages=messages, tools=TOOLS).input_tokens)
+
+try:
+    client.messages.create(model=al.MODEL, max_tokens=256, temperature=0.2, messages=[{"role": "user", "content": "x"}])
+except al.BadRequestError as e:
+    print("BadRequestError:", e.status_code)
+
+try:
+    client.messages.create(model=al.MODEL, max_tokens=256, messages=[{"role": "user", "content": "x"}])
+except al.RateLimitError as e:
+    print("RateLimitError: retry after", e.retry_after, "s; steps left:", client.remaining)
+</textarea>
+    </div>
+  </section>
+</main>
+</body>
+</html>

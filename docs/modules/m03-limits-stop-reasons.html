@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M03 · Limits, Effort &amp; Stop Reasons · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m03">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Talking to a Model · Module 03</p>
+    <h1>Limits, Effort &amp; Stop Reasons</h1>
+    <p class="lede">Every response tells you why the model stopped writing. The answer might be finished, it might
+      be cut off mid-sentence, the model might want a tool, or it might have declined. Code that reads
+      <code>content</code> without checking first will eventually show a user half an answer or crash on an
+      empty list. This module covers every stop reason and how to handle each one, the limits you set on a
+      request, and the controls you have instead of the sampling settings older tutorials still show.</p>
+    <div class="lesson-meta"><span>⏱ ~1.5 hours</span><span>Prerequisites: <a href="m02-messages-api.html">M02 The Messages API</a></span></div>
+    <ul class="objectives">
+      <li>Name all six stop reasons (<code>end_turn</code>, <code>max_tokens</code>, <code>stop_sequence</code>,
+        <code>tool_use</code>, <code>pause_turn</code>, <code>refusal</code>) and the right response to each</li>
+      <li>Detect a reply truncated by <code>max_tokens</code> and choose between raising the limit and asking the
+        model to continue</li>
+      <li>Use <code>stop_sequences</code> to end a reply at a marker, and read <code>response.stop_sequence</code></li>
+      <li>Handle a refusal safely using <code>stop_details</code>, without crashing or corrupting the history</li>
+      <li>Write a <code>handle(response)</code> function that branches on every <code>stop_reason</code> and fails
+        loudly on one it does not know</li>
+      <li>Set <code>output_config.effort</code>, explain the trade-off between levels, and know that Opus 5.5
+        defaults to <code>medium</code></li>
+      <li>Explain why <code>temperature</code>, <code>top_p</code>, <code>top_k</code>, prefill, and thinking budgets
+        are rejected, and what to use instead</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="check-first">
+    <h2>Check stop_reason first</h2>
+    <p>Generation is the model writing its reply one token at a time (<a href="m01-llm-calls.html">M01</a>). It
+      keeps going until something stops it. Every response carries a <strong><code>stop_reason</code></strong>
+      field naming what that something was. There are six values:</p>
+    <table>
+      <thead><tr><th><code>stop_reason</code></th><th>What happened</th><th>What your code should do</th></tr></thead>
+      <tbody>
+        <tr><td><code>end_turn</code></td><td>The model finished its reply naturally.</td><td>Use the answer.</td></tr>
+        <tr><td><code>max_tokens</code></td><td>The reply hit the <code>max_tokens</code> limit you set and was cut off.</td><td>Treat the text as incomplete: raise the limit, ask the model to continue, or report it.</td></tr>
+        <tr><td><code>stop_sequence</code></td><td>The model generated one of your <code>stop_sequences</code>.</td><td>Use the text up to the marker; <code>response.stop_sequence</code> says which one.</td></tr>
+        <tr><td><code>tool_use</code></td><td>The model wants your code to run a tool.</td><td>Run it and send the result back (<a href="m08-one-tool-call.html">M08</a>).</td></tr>
+        <tr><td><code>pause_turn</code></td><td>A long turn using server-side tools was paused.</td><td>Send the request again with the paused turn appended so the model can continue.</td></tr>
+        <tr><td><code>refusal</code></td><td>The model declined the request.</td><td>Do not use <code>content</code> as an answer; read <code>stop_details</code> and tell the user.</td></tr>
+      </tbody>
+    </table>
+    <p>The rule that follows from this table is short: <strong>always check <code>stop_reason</code> before you read
+      <code>content</code></strong>. Only <code>end_turn</code> (and, if you asked for it, <code>stop_sequence</code>)
+      means "here is a complete answer". The cell below sends five requests that each stop for a different reason.
+      Look at how different the content is in each case.</p>
+    <div class="runnable" data-title="Five requests, five stop reasons">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+client = al.MockClient([
+    "Paris.",
+    "The French Revolution began in 1789 and reshaped politics across Europe for a century.",
+    "1. Bread\n2. Milk\nEND\n3. This line is never sent",
+    al.tool_call("get_weather", {"city": "Paris"}),
+    al.refusal("cyber"),
+])
+calls = [
+    {"max_tokens": 100},
+    {"max_tokens": 8},
+    {"max_tokens": 100, "stop_sequences": ["END"]},
+    {"max_tokens": 100, "tools": TOOLS},
+    {"max_tokens": 100},
+]
+for extra in calls:
+    r = client.messages.create(model=al.MODEL, messages=[{"role": "user", "content": "..."}], **extra)
+    print(f"{r.stop_reason:14} blocks={[b.type for b in r.content]}  text={r.text!r}")
+</textarea>
+    </div>
+    <p>Only the first line is a complete answer you could show a user. The second stops mid-sentence. The third
+      stopped where it was told to. The fourth has no text at all, only a tool request. The fifth has no content
+      whatsoever. Code that does <code>print(response.content[0].text)</code> would show a broken sentence for
+      the second, crash with <code>AttributeError</code> on the fourth (a tool block has no <code>.text</code>),
+      and crash with <code>IndexError</code> on the fifth.</p>
+    <aside class="callout note"><p><code>r.text</code> is agentlab's mock-only shortcut for the joined text blocks
+      (<a href="m02-messages-api.html#response-object">M02</a>). It keeps lesson cells short. In code meant for the
+      real SDK, join <code>b.text</code> for blocks where <code>b.type == "text"</code>.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> six stop reasons. Check <code>stop_reason</code> before
+      <code>content</code>, every time. Only <code>end_turn</code> means a naturally finished answer.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="max-tokens">
+    <h2>max_tokens: a ceiling, not a target</h2>
+    <p><code>max_tokens</code> is the most tokens the model may generate in one reply. The model does not aim for
+      it or pad its answer to reach it; a two-word answer under <code>max_tokens=4000</code> is still two words.
+      But if the model has more to say when it reaches the limit, generation stops right there, possibly in the
+      middle of a word, and <code>stop_reason</code> is <code>"max_tokens"</code>.</p>
+    <p>The mock simulates this by keeping about four characters of scripted text per token of
+      <code>max_tokens</code>, the same rough ratio as <code>al.estimate_tokens</code>. Real tokenizers vary, but
+      the behavior is the same: text past the limit is simply never generated.</p>
+    <div class="runnable" data-title="A truncated reply" data-predict>
+<textarea>
+import agentlab as al
+
+answer = "Recursion is when a function calls itself. Every recursive function needs a base case."
+client = al.MockClient([answer, answer])
+question = [{"role": "user", "content": "What is recursion?"}]
+
+short = client.messages.create(model=al.MODEL, max_tokens=10, messages=question)
+print(short.stop_reason, short.usage.output_tokens)
+print(repr(short.text))
+
+full = client.messages.create(model=al.MODEL, max_tokens=200, messages=question)
+print(full.stop_reason, full.usage.output_tokens)
+</textarea>
+    </div>
+    <p>The truncated reply reads as a plausible sentence fragment. That is the danger: nothing about the text
+      itself tells you it is incomplete. Only <code>stop_reason</code> does. If you store or display it as if it
+      were complete, you ship half an answer, and in <a href="m05-structured-output.html">M05</a> you will see
+      that truncated JSON does not even parse.</p>
+    <h3>What to do about a truncated reply</h3>
+    <ol>
+      <li><strong>Raise <code>max_tokens</code></strong> if the limit was simply too low for the task. This is the
+        usual fix. Current models can generate up to 128K tokens in one reply; very large values need streaming
+        (<a href="m04-streaming.html">M04</a>) so the HTTP connection does not sit idle.</li>
+      <li><strong>Ask for a shorter answer</strong> in the prompt if long output is not what you want.</li>
+      <li><strong>Continue the reply.</strong> Append the partial reply as an assistant turn, then a user turn asking
+        the model to continue from where it stopped, and join the pieces. The history still ends with a user turn,
+        so this is valid. The seam between pieces is not always perfect, so prefer raising the limit when you can.</li>
+      <li><strong>Report it</strong> when none of the above apply: return an error or a clearly marked partial
+        result, never a silent half-answer.</li>
+    </ol>
+    <div class="runnable" data-title="Continuing a truncated reply">
+<textarea>
+import agentlab as al
+
+answer = "Recursion is when a function calls itself. Every recursive function needs a base case."
+client = al.MockClient([answer, answer[48:]])   # the second step is the rest of the answer
+
+messages = [{"role": "user", "content": "What is recursion?"}]
+parts = []
+for _ in range(3):
+    r = client.messages.create(model=al.MODEL, max_tokens=12, messages=messages)
+    parts.append(r.text)
+    if r.stop_reason == "end_turn":
+        break
+    messages.append({"role": "assistant", "content": r.content})
+    messages.append({"role": "user", "content": "Continue exactly where you stopped."})
+
+print("".join(parts))
+print(al.format_transcript(client.requests[-1].messages))
+</textarea>
+    </div>
+    <aside class="callout warn"><p>A <code>max_tokens</code> outside 1 to 128,000 is rejected with
+      <code>BadRequestError</code> before anything is generated. Picking a value is a judgment call: generous
+      enough for the longest useful answer, low enough that a runaway reply cannot cost you much.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>stop_reason == "max_tokens"</code> means the text
+      is incomplete even if it looks fine. Raise the limit, ask for less, continue, or report it.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="stop-sequences">
+    <h2>Stop sequences</h2>
+    <p>A <strong>stop sequence</strong> is a string that ends generation as soon as the model produces it. You pass
+      a list of them in <code>stop_sequences</code>. When one is hit, the response has
+      <code>stop_reason="stop_sequence"</code>, <code>response.stop_sequence</code> holds the string that matched,
+      and the text ends just <em>before</em> it: the marker itself is not included.</p>
+    <div class="runnable" data-title="Stopping at a closing tag">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["<answer>42</answer>\nI could also explain how I got there, if you like."])
+r = client.messages.create(
+    model=al.MODEL,
+    max_tokens=200,
+    system="Put your final answer inside <answer></answer> tags.",
+    stop_sequences=["</answer>"],
+    messages=[{"role": "user", "content": "What is 6 times 7?"}],
+)
+print(r.stop_reason, repr(r.stop_sequence))
+print(repr(r.text))
+print("answer:", r.text.removeprefix("<answer>"))
+</textarea>
+    </div>
+    <p>Stop sequences are useful when you know exactly where useful output ends: a closing tag, a delimiter like
+      <code>END</code> or <code>---</code>, or the start of a section you do not want. They save output tokens (the
+      model stops instead of writing commentary you would throw away) and they make the output easier to parse.</p>
+    <p>If you pass several, generation stops at whichever appears first:</p>
+    <div class="runnable" data-title="The first marker wins" data-predict>
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Step 1: mix.\n---\nStep 2: bake.\nEND"])
+r = client.messages.create(
+    model=al.MODEL, max_tokens=100, stop_sequences=["END", "---"],
+    messages=[{"role": "user", "content": "Give me the steps."}],
+)
+print(r.stop_sequence)
+print(r.text.strip())
+</textarea>
+    </div>
+    <aside class="callout warn"><p>Choose markers that cannot appear inside a legitimate answer. A stop sequence of
+      <code>"."</code> or <code>"\n"</code> cuts off almost everything. Each stop sequence must be a non-empty
+      string; an empty one is rejected.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>stop_sequences</code> end the reply at a marker
+      you choose. The marker is excluded from the text and reported in <code>response.stop_sequence</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="refusal">
+    <h2>Refusals</h2>
+    <p>Sometimes the model declines a request, for example one that asks for help with something harmful. The
+      response then has <code>stop_reason="refusal"</code> and a <code>stop_details</code> object explaining why:
+      a <code>category</code> (such as <code>"cyber"</code>, or <code>None</code>) and a short
+      <code>explanation</code>. The content may be empty or may hold only the start of a reply; either way it is
+      not an answer. <code>al.refusal(category)</code> scripts one in the mock.</p>
+    <div class="runnable" data-title="What a refusal looks like">
+<textarea>
+import agentlab as al
+
+client = al.MockClient([al.refusal("cyber")])
+r = client.messages.create(
+    model=al.MODEL, max_tokens=200,
+    messages=[{"role": "user", "content": "(a request the model declines)"}],
+)
+print("stop_reason:", r.stop_reason)
+print("content:", r.content)
+print("category:", r.stop_details.category)
+print("explanation:", r.stop_details.explanation)
+
+try:
+    print(r.content[0].text)
+except IndexError as e:
+    print("content[0] fails:", type(e).__name__, e)
+</textarea>
+    </div>
+    <p>Three rules for handling a refusal:</p>
+    <ol>
+      <li><strong>Do not index into <code>content</code>.</strong> Check <code>stop_reason</code> first, as the
+        previous section said.</li>
+      <li><strong>Do not append the refusal to the history as an assistant turn.</strong> An empty assistant turn
+        is itself a malformed request, so the <em>next</em> call fails. Roll back the user turn instead, the same
+        way the M02 wrapper does on an error, and tell the user the request was declined.</li>
+      <li><strong>Do not retry the same request in a loop.</strong> A refusal is a decision about the content of
+        the request, not a transient failure. Log the category so you can see patterns, and surface a clear
+        message.</li>
+    </ol>
+    <div class="runnable" data-title="The bug: storing a refusal in the history">
+<textarea>
+import agentlab as al
+
+client = al.MockClient([al.refusal("cyber"), "unused"])
+messages = [{"role": "user", "content": "(declined request)"}]
+r = client.messages.create(model=al.MODEL, max_tokens=200, messages=messages)
+
+messages.append({"role": "assistant", "content": r.content})      # wrong: content is []
+messages.append({"role": "user", "content": "OK, something else then."})
+try:
+    client.messages.create(model=al.MODEL, max_tokens=200, messages=messages)
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+</textarea>
+    </div>
+    <aside class="callout think"><p>An agent running unattended gets a refusal on step 4 of 10. What should it
+      return to whoever started it? <a href="m11-stop-conditions.html">M11</a> answers this with a structured run
+      result that records the reason the run stopped.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> a refusal has no usable content. Read
+      <code>stop_details</code>, keep it out of the history, tell the user, and do not loop on it.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="tool-use-pause-turn">
+    <h2>tool_use and pause_turn</h2>
+    <p>The last two stop reasons are about tools, which Stage 2 covers in depth. You need to recognize them now so
+      your handler does not mistake them for answers.</p>
+    <h3>tool_use: your code has work to do</h3>
+    <p>When you offer tools in the request (<a href="m07-tools-as-contracts.html">M07</a>), the model can stop and
+      ask your program to run one. The response then has <code>stop_reason="tool_use"</code> and its content holds
+      one or more <code>tool_use</code> blocks, each with an <code>id</code>, a tool <code>name</code>, and an
+      <code>input</code> dict. The reply is not finished: the model is waiting for your results.
+      <a href="m08-one-tool-call.html">M08</a> completes the round trip and <a href="m09-agent-loop.html">M09</a>
+      turns it into a loop.</p>
+    <div class="runnable" data-title="A tool request is not an answer">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+client = al.MockClient([al.tool_call("get_weather", {"city": "Lima"}, text="I'll look that up.")])
+r = client.messages.create(model=al.MODEL, max_tokens=300, tools=TOOLS,
+                           messages=[{"role": "user", "content": "Weather in Lima?"}])
+print(r.stop_reason)
+for block in r.content:
+    if block.type == "tool_use":
+        print("run", block.name, "with", block.input, "id", block.id)
+</textarea>
+    </div>
+    <h3>pause_turn: a long server-side turn, paused</h3>
+    <p>Some tools run on Anthropic's side rather than in your program; these are called <strong>server
+      tools</strong> (web search is a typical example). During a long turn that uses them, the API may stop and
+      return <code>stop_reason="pause_turn"</code>. Nothing is wrong. The model has not finished, and it is not
+      asking you to run anything. To let it continue, send the request again with the paused assistant turn
+      appended to the history exactly as you received it:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+response = client.messages.create(model="claude-opus-5-5", max_tokens=4096, tools=tools, messages=messages)
+
+while response.stop_reason == "pause_turn":
+    messages.append({"role": "assistant", "content": response.content})   # the paused turn, unchanged
+    response = client.messages.create(model="claude-opus-5-5", max_tokens=4096, tools=tools, messages=messages)</code></pre>
+    <p>This looks like prefill (the history ends with an assistant turn), but it is different: you are handing
+      back the model's own unfinished turn so it can resume, not writing words for it. The agentlab mock does not
+      simulate server tools, so this snippet is for reading, not running. A loop like this should also have a
+      limit on how many times it resumes, which is the kind of budget <a href="m11-stop-conditions.html">M11</a>
+      teaches.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>tool_use</code> means "run these tools and send
+      the results back". <code>pause_turn</code> means "send the same request again with my paused turn appended,
+      and I will carry on". Neither is a finished answer.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="handler">
+    <h2>One handler for every stop reason</h2>
+    <p>Rather than scattering <code>if response.stop_reason == ...</code> checks through a program, put the decision
+      in one function. <code>handle(response)</code> looks at the stop reason and returns a small, uniform
+      <strong>outcome</strong> that the rest of your code can act on: a status, the text (when there is any), and a
+      detail specific to that stop reason. Python's <code>match</code> statement fits this well, because each
+      stop reason becomes one readable <code>case</code>.</p>
+    <div class="runnable" data-title="handle(response): every stop reason, one place">
+<textarea>
+from dataclasses import dataclass
+
+import agentlab as al
+
+
+@dataclass
+class Outcome:
+    status: str          # done | truncated | stopped | needs_tools | paused | refused
+    text: str = ""
+    detail: object = None
+
+
+def text_of(response):
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+def handle(response):
+    """Turn any response into an Outcome; fail loudly on a stop reason we do not know."""
+    match response.stop_reason:
+        case "end_turn":
+            return Outcome("done", text_of(response))
+        case "max_tokens":
+            return Outcome("truncated", text_of(response))
+        case "stop_sequence":
+            return Outcome("stopped", text_of(response), response.stop_sequence)
+        case "tool_use":
+            calls = [b for b in response.content if b.type == "tool_use"]
+            return Outcome("needs_tools", text_of(response), calls)
+        case "pause_turn":
+            return Outcome("paused", text_of(response))
+        case "refusal":
+            details = response.stop_details
+            return Outcome("refused", "", details.category if details else None)
+        case other:
+            raise ValueError(f"unhandled stop_reason: {other!r}")
+
+
+TOOLS = [{"name": "search", "description": "Search the docs.",
+          "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}]
+client = al.MockClient([
+    "All done.",
+    "This answer is far too long for the limit it was given.",
+    "Result: ok\nEND\nextra",
+    al.tool_call("search", {"q": "stop reasons"}),
+    al.Message(content=[al.TextBlock("Searching the web...")], stop_reason="pause_turn"),
+    al.refusal("cyber"),
+])
+calls = [{}, {"max_tokens": 5}, {"stop_sequences": ["END"]}, {"tools": TOOLS}, {}, {}]
+for extra in calls:
+    request = {"model": al.MODEL, "max_tokens": 200, "messages": [{"role": "user", "content": "go"}]} | extra
+    outcome = handle(client.messages.create(**request))
+    detail = [c.name for c in outcome.detail] if outcome.status == "needs_tools" else outcome.detail
+    print(f"{outcome.status:12} text={outcome.text!r:30} detail={detail!r}")
+</textarea>
+    </div>
+    <p>Notice the design choices:</p>
+    <ul>
+      <li><strong>The last <code>case</code> raises.</strong> If a future API version adds a stop reason, this code
+        fails at the exact place that needs updating, instead of silently treating the new reason as an answer.
+        Failing loudly on the unknown is a habit worth keeping everywhere you branch on values that come from
+        outside your program.</li>
+      <li><strong><code>handle</code> decides, it does not act.</strong> It does not call the API again, print, or
+        change any history. That keeps it a pure function, trivial to test with scripted responses, and reusable
+        in a chat wrapper, a batch job, or the agent loop of <a href="m09-agent-loop.html">M09</a>, each of which
+        acts on the outcome differently.</li>
+      <li><strong>The pause_turn step was fabricated</strong> with <code>al.Message(..., stop_reason="pause_turn")</code>.
+        The mock accepts a hand-built <code>Message</code> as a script step, which is how you test code paths the
+        mock does not simulate.</li>
+    </ul>
+    <p>Here is how a caller might act on each outcome in a simple chat program:</p>
+    <pre><code class="language-python">outcome = handle(response)
+if outcome.status in ("done", "stopped"):
+    show(outcome.text)
+elif outcome.status == "truncated":
+    show(outcome.text + "\n[reply cut off: raise max_tokens or ask for less]")
+elif outcome.status == "refused":
+    show(f"The request was declined (category: {outcome.detail}).")
+else:   # needs_tools, paused: this program has no tools, so this is a bug in the request
+    raise RuntimeError(f"unexpected outcome: {outcome.status}")</code></pre>
+    <aside class="callout tip"><p><strong>Remember:</strong> one function maps every stop reason to an outcome.
+      Handle all six explicitly, raise on anything else, and keep the function free of side effects so it is easy
+      to test.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="effort">
+    <h2>Effort and adaptive thinking</h2>
+    <p><strong>Effort</strong> tells the model how much work to put into a reply: how carefully to reason, how
+      thoroughly to check, how much to write. You set it with
+      <code>output_config={"effort": level}</code>, where <code>level</code> is one of
+      <code>"low"</code>, <code>"medium"</code>, <code>"high"</code>, <code>"xhigh"</code>, or <code>"max"</code>.
+      If you leave it out, Claude Opus 5.5 uses <code>medium</code>.</p>
+    <table>
+      <thead><tr><th>Level</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td><code>low</code></td><td>Simple, well-defined tasks where speed and cost matter most: classification, short extraction, quick lookups, high-volume pipelines.</td></tr>
+        <tr><td><code>medium</code> (default)</td><td>A balanced starting point for most work.</td></tr>
+        <tr><td><code>high</code>, <code>xhigh</code></td><td>Harder problems: multi-step reasoning, careful code changes, agent tasks where a wrong step is expensive.</td></tr>
+        <tr><td><code>max</code></td><td>The hardest problems, where quality matters far more than time or cost.</td></tr>
+      </tbody>
+    </table>
+    <p>The trade-off is the one you met in <a href="m01-llm-calls.html">M01</a>: more effort generally means more
+      output tokens, so higher cost and longer latency, in exchange for better answers on hard problems. On an
+      easy task, extra effort buys little. Start at the default, measure, and move up or down per task, not per
+      application.</p>
+    <p>A mock cannot be smarter at <code>high</code> than at <code>low</code>, but it can show you the mechanics.
+      The responder below reads the effort level from each request through <code>request.effort</code> (which
+      reports <code>medium</code> when none was sent) and pretends that higher effort produces a longer answer, so
+      you can watch output tokens move.</p>
+    <div class="runnable" data-title="Setting effort (simulated)">
+<textarea>
+import agentlab as al
+
+LENGTH = {"low": 1, "medium": 3, "high": 6, "xhigh": 9, "max": 12}
+
+def pretend_model(request):
+    return "Reasoned carefully. " * LENGTH[request.effort]
+
+client = al.MockClient(responder=pretend_model)
+question = [{"role": "user", "content": "Is 221 prime?"}]
+
+r = client.messages.create(model=al.MODEL, max_tokens=500, messages=question)
+print(f"{'(default)':10} effort={client.requests[-1].effort:7} output_tokens={r.usage.output_tokens}")
+for level in ["low", "high", "max"]:
+    r = client.messages.create(model=al.MODEL, max_tokens=500, output_config={"effort": level}, messages=question)
+    print(f"{level:10} effort={client.requests[-1].effort:7} output_tokens={r.usage.output_tokens}")
+
+try:
+    client.messages.create(model=al.MODEL, max_tokens=500, output_config={"effort": "extreme"}, messages=question)
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+</textarea>
+    </div>
+    <p>In real SDK code the parameter is identical:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()   # the only change from the mock
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    output_config={"effort": "low"},
+    messages=[{"role": "user", "content": "Label this review positive, negative, or neutral: ..."}],
+)</code></pre>
+    <h3>Adaptive thinking</h3>
+    <p>Before answering, a model can reason internally; this is called <strong>thinking</strong>. On current
+      models thinking is <strong>adaptive</strong>: the model decides for itself whether a request needs thinking
+      and how much, guided by the effort level. You either omit the <code>thinking</code> parameter or send
+      <code>thinking={"type": "adaptive"}</code>. Older APIs let you switch thinking off or give it a fixed token
+      budget; on Opus 5.5 both forms are rejected. Effort is the control you use instead.</p>
+    <div class="runnable" data-title="Thinking settings that are rejected">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["ok"])
+question = [{"role": "user", "content": "Plan a three-step refactor."}]
+
+for thinking in [{"type": "disabled"}, {"type": "enabled", "budget_tokens": 4000}]:
+    try:
+        client.messages.create(model=al.MODEL, max_tokens=500, thinking=thinking, messages=question)
+    except al.BadRequestError as e:
+        print(thinking, "->", e)
+
+r = client.messages.create(model=al.MODEL, max_tokens=500, thinking={"type": "adaptive"}, messages=question)
+print("adaptive ->", r.stop_reason)
+</textarea>
+    </div>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>output_config={"effort": ...}</code> with
+      <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, or <code>max</code>; Opus 5.5
+      defaults to <code>medium</code>. Thinking is adaptive; do not send <code>disabled</code> or
+      <code>budget_tokens</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="sampling">
+    <h2>Why temperature, top_p and top_k are rejected</h2>
+    <p>Many tutorials and older code samples pass <code>temperature</code> (often <code>temperature=0</code> "for
+      determinism"), <code>top_p</code>, or <code>top_k</code>. These <strong>sampling parameters</strong> used to
+      adjust how the next token was picked from the model's probabilities. On current models and API versions,
+      all three are rejected with a 400 error:</p>
+    <div class="runnable" data-title="Old sampling settings">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+for setting in [{"temperature": 0}, {"top_p": 0.9}, {"top_k": 40}]:
+    try:
+        client.messages.create(model=al.MODEL, max_tokens=100,
+                               messages=[{"role": "user", "content": "Hi"}], **setting)
+    except al.BadRequestError as e:
+        print(setting, "->", e)
+</textarea>
+    </div>
+    <p>The fix when you meet them in old code is simply to delete them. What you actually wanted from them has
+      better tools now:</p>
+    <table>
+      <thead><tr><th>What the old setting was trying to do</th><th>What to use</th></tr></thead>
+      <tbody>
+        <tr><td>"Make answers consistent" (<code>temperature=0</code>)</td><td>A precise prompt with examples (<a href="m06-prompting.html">M06</a>) and a fixed output format (<a href="m05-structured-output.html">M05</a>). Output can still vary run to run (<a href="m01-llm-calls.html">M01</a>), so test properties of the answer, not exact strings.</td></tr>
+        <tr><td>"Make answers more focused or more careful"</td><td><code>output_config.effort</code></td></tr>
+        <tr><td>"Make answers more creative or varied"</td><td>Say so in the prompt: ask for several distinct options, a particular style, or an unusual angle.</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout warn"><p>Because the error is a 400, a retry loop will not help: the request is wrong
+      and will fail identically every time. This is a common reason ported code "suddenly" fails.
+      <a href="m10-errors-as-data.html">M10</a> builds the habit of telling fix-the-request errors from
+      retry-later errors.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> no <code>temperature</code>, <code>top_p</code>, or
+      <code>top_k</code>. Steer with the prompt and <code>output_config.effort</code>, and test behavior rather
+      than exact wording.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="no-prefill">
+    <h2>No prefill</h2>
+    <p><strong>Prefill</strong> was a technique of ending <code>messages</code> with a partial assistant turn, such
+      as <code>{"role": "assistant", "content": "{"}</code>, so the model would continue from your words. People
+      used it to force JSON output or to skip a preamble. On current models a history that ends with an assistant
+      turn is rejected:</p>
+    <div class="runnable" data-title="A prefilled request">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+try:
+    client.messages.create(
+        model=al.MODEL, max_tokens=200,
+        messages=[
+            {"role": "user", "content": "Give me a JSON object with a 'city' key."},
+            {"role": "assistant", "content": "{"},
+        ],
+    )
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+</textarea>
+    </div>
+    <p>Each old use of prefill has a direct replacement:</p>
+    <ul>
+      <li><strong>Forcing a format such as JSON</strong>: use structured output,
+        <code>output_config={"format": {"type": "json_schema", ...}}</code>, which guarantees the shape
+        (<a href="m05-structured-output.html">M05</a>).</li>
+      <li><strong>Skipping a preamble or setting a voice</strong>: say so in the system prompt ("Reply with the
+        answer only, no introduction").</li>
+      <li><strong>Ending output at a known point</strong>: add a stop sequence.</li>
+    </ul>
+    <p>Two patterns from this module end with an assistant turn and are <em>not</em> prefill. Continuing after
+      <code>max_tokens</code> appends the partial reply <em>and then a user turn</em>, so the history ends with
+      the user. Resuming after <code>pause_turn</code> hands back the model's own paused turn unchanged; you are
+      not writing words for it.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> never end <code>messages</code> with an assistant turn
+      you wrote. Use structured output, the system prompt, or stop sequences instead.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Each test scripts a <code>MockClient</code>, calls your function, and inspects both your return value and
+      <code>client.requests</code>. Work from top to bottom.</p>
+
+    <div class="exercise" data-id="m03-e1" data-title="A short answer with a stop marker">
+      <div class="exercise-prompt">
+        <p>Write <code>ask_until_end(client, question)</code> that sends <code>question</code> as the only user
+          message with <code>model=al.MODEL</code>, <code>max_tokens=150</code>, and
+          <code>stop_sequences=["END"]</code>. Return a tuple <code>(text, stop_reason)</code>, where
+          <code>text</code> is the joined text blocks with surrounding whitespace stripped.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def ask_until_end(client, question):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_request_settings():
+    client = al.MockClient(["Three facts.\nEND\nmore"])
+    ask_until_end(client, "Tell me three facts.")
+    assert client.requests, "no request was sent"
+    request = client.requests[0]
+    assert request.max_tokens == 150, f"use max_tokens=150, got {request.max_tokens}"
+    assert request.stop_sequences == ["END"], f"use stop_sequences=['END'], got {request.stop_sequences}"
+    assert request.last_user_text == "Tell me three facts.", "send the question as the user message"
+
+def test_stops_at_marker():
+    client = al.MockClient(["Three facts.\nEND\nmore"])
+    result = ask_until_end(client, "Tell me three facts.")
+    assert result == ("Three facts.", "stop_sequence"), f"expected ('Three facts.', 'stop_sequence'), got {result!r}"
+
+def test_natural_end():
+    client = al.MockClient(["  Just one fact.  "])
+    result = ask_until_end(client, "One fact.")
+    assert result == ("Just one fact.", "end_turn"), f"strip the text and report end_turn, got {result!r}"
+
+def test_refusal_does_not_crash():
+    client = al.MockClient([al.refusal()])
+    result = ask_until_end(client, "Something declined.")
+    assert result == ("", "refusal"), f"a refusal has no text blocks; expected ('', 'refusal'), got {result!r}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Pass <code>stop_sequences=["END"]</code> to
+        <code>create</code>. Join text blocks by filtering on <code>b.type == "text"</code> so an empty content list
+        gives <code>""</code>, then <code>.strip()</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def ask_until_end(client, question):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=150,
+        stop_sequences=["END"],
+        messages=[{"role": "user", "content": question}],
+    )
+    text = "".join(b.text for b in response.content if b.type == "text")
+    return text.strip(), response.stop_reason</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m03-e2" data-title="handle(response)">
+      <div class="exercise-prompt">
+        <p>Write <code>handle(response)</code> that returns a dict <code>{"status": ..., "text": ..., "detail": ...}</code>
+          based on <code>response.stop_reason</code>. <code>text</code> is always the joined text blocks
+          (<code>""</code> if none).</p>
+        <table>
+          <thead><tr><th><code>stop_reason</code></th><th><code>status</code></th><th><code>detail</code></th></tr></thead>
+          <tbody>
+            <tr><td><code>end_turn</code></td><td><code>"done"</code></td><td><code>None</code></td></tr>
+            <tr><td><code>max_tokens</code></td><td><code>"truncated"</code></td><td><code>None</code></td></tr>
+            <tr><td><code>stop_sequence</code></td><td><code>"stopped"</code></td><td><code>response.stop_sequence</code></td></tr>
+            <tr><td><code>tool_use</code></td><td><code>"needs_tools"</code></td><td>list of the tool names requested, in order</td></tr>
+            <tr><td><code>pause_turn</code></td><td><code>"paused"</code></td><td><code>None</code></td></tr>
+            <tr><td><code>refusal</code></td><td><code>"refused"</code></td><td><code>response.stop_details.category</code></td></tr>
+          </tbody>
+        </table>
+        <p>For any other stop reason, raise <code>ValueError</code>. Do not use the mock-only
+          <code>response.text</code>.</p>
+      </div>
+<textarea class="starter">
+def handle(response):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+from types import SimpleNamespace
+import agentlab as al
+
+TOOLS = [{"name": n, "description": n, "input_schema": {"type": "object", "properties": {}}} for n in ("search", "fetch")]
+
+def run(step, **extra):
+    client = al.MockClient([step])
+    request = {"model": al.MODEL, "max_tokens": 200, "messages": [{"role": "user", "content": "go"}]} | extra
+    return client.messages.create(**request)
+
+def plain(response):
+    return SimpleNamespace(content=response.content, stop_reason=response.stop_reason,
+                           stop_sequence=response.stop_sequence, stop_details=response.stop_details)
+
+def test_end_turn():
+    assert handle(plain(run("Hi."))) == {"status": "done", "text": "Hi.", "detail": None}, "end_turn should give status 'done' with the text"
+
+def test_max_tokens():
+    out = handle(plain(run("This reply is much too long for two tokens.", max_tokens=2)))
+    assert out == {"status": "truncated", "text": "This rep", "detail": None}, f"max_tokens should give 'truncated' with the partial text, got {out}"
+
+def test_stop_sequence():
+    out = handle(plain(run("Answer: 4\nEND\nmore", stop_sequences=["END"])))
+    assert out == {"status": "stopped", "text": "Answer: 4\n", "detail": "END"}, f"stop_sequence should report the matched sequence as detail, got {out}"
+
+def test_tool_use():
+    out = handle(plain(run(al.tool_calls([("search", {}), ("fetch", {})], text="Working."), tools=TOOLS)))
+    assert out == {"status": "needs_tools", "text": "Working.", "detail": ["search", "fetch"]}, f"tool_use should list tool names in order, got {out}"
+
+def test_pause_turn():
+    paused = al.Message(content=[al.TextBlock("Searching...")], stop_reason="pause_turn")
+    out = handle(plain(run(paused)))
+    assert out == {"status": "paused", "text": "Searching...", "detail": None}, f"pause_turn should give 'paused', got {out}"
+
+def test_refusal():
+    out = handle(plain(run(al.refusal("cyber"))))
+    assert out == {"status": "refused", "text": "", "detail": "cyber"}, f"refusal should give 'refused' with the category, got {out}"
+
+def test_unknown():
+    weird = SimpleNamespace(content=[], stop_reason="something_new", stop_sequence=None, stop_details=None)
+    try:
+        handle(weird)
+    except ValueError:
+        return
+    assert False, "an unknown stop_reason should raise ValueError"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Compute <code>text</code> once at the top, then use
+        <code>match response.stop_reason:</code> with one <code>case</code> per value and a final
+        <code>case other:</code> that raises. For tools:
+        <code>[b.name for b in response.content if b.type == "tool_use"]</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def handle(response):
+    text = "".join(b.text for b in response.content if b.type == "text")
+    match response.stop_reason:
+        case "end_turn":
+            return {"status": "done", "text": text, "detail": None}
+        case "max_tokens":
+            return {"status": "truncated", "text": text, "detail": None}
+        case "stop_sequence":
+            return {"status": "stopped", "text": text, "detail": response.stop_sequence}
+        case "tool_use":
+            names = [b.name for b in response.content if b.type == "tool_use"]
+            return {"status": "needs_tools", "text": text, "detail": names}
+        case "pause_turn":
+            return {"status": "paused", "text": text, "detail": None}
+        case "refusal":
+            return {"status": "refused", "text": text, "detail": response.stop_details.category}
+        case other:
+            raise ValueError(f"unhandled stop_reason: {other!r}")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m03-e3" data-title="Port legacy code">
+      <div class="exercise-prompt">
+        <p>This sentiment classifier was copied from an old tutorial. It uses <code>temperature</code> and an
+          assistant prefill, so every call now fails with <code>BadRequestError</code>, and it never checks the stop
+          reason. Rewrite <code>classify(client, review)</code> so that it:</p>
+        <ul>
+          <li>sends no <code>temperature</code> and no prefill (the history ends with the user message);</li>
+          <li>puts the instruction in a non-empty <code>system</code> prompt, asking for a single word:
+            positive, negative, or neutral;</li>
+          <li>sends the review as the user message and uses <code>output_config={"effort": "low"}</code>,
+            <code>model=al.MODEL</code>, and <code>max_tokens=10</code>;</li>
+          <li>returns the reply text stripped and lowercased when <code>stop_reason</code> is
+            <code>end_turn</code>, and raises <code>RuntimeError</code> for any other stop reason.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def classify(client, review):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=10,
+        temperature=0,
+        messages=[
+            {"role": "user", "content": f"Classify the sentiment of this review: {review}"},
+            {"role": "assistant", "content": "Sentiment:"},
+        ],
+    )
+    return response.content[0].text.strip().lower()
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_request_is_accepted():
+    client = al.MockClient(["Positive"])
+    classify(client, "Loved it.")
+    assert client.requests, "the request was rejected: remove temperature and the assistant prefill"
+
+def test_ends_with_user():
+    client = al.MockClient(["Positive"])
+    classify(client, "Loved it.")
+    last = client.requests[0].messages[-1]
+    assert last["role"] == "user", "the history must end with the user message (no prefill)"
+    assert "Loved it." in client.requests[0].last_user_text, "send the review in the user message"
+
+def test_system_and_effort():
+    client = al.MockClient(["Positive"])
+    classify(client, "Loved it.")
+    request = client.requests[0]
+    assert isinstance(request.system, str) and request.system.strip(), "put the instructions in a non-empty system prompt"
+    assert request.output_config.get("effort") == "low", "send output_config={'effort': 'low'}"
+    assert request.max_tokens == 10, "keep max_tokens=10"
+
+def test_normalizes_label():
+    client = al.MockClient(["  Negative\n"])
+    assert classify(client, "Terrible.") == "negative", "strip and lowercase the reply"
+
+def test_raises_on_truncation():
+    client = al.MockClient(["Positive, mostly, although the ending dragged on far too long."])
+    try:
+        classify(client, "Mixed feelings.")
+    except RuntimeError:
+        return
+    assert False, "a reply cut off at max_tokens should raise RuntimeError, not return partial text"
+
+def test_raises_on_refusal():
+    client = al.MockClient([al.refusal()])
+    try:
+        classify(client, "...")
+    except RuntimeError:
+        return
+    except IndexError:
+        assert False, "check stop_reason before reading content; a refusal has no blocks"
+    assert False, "a refusal should raise RuntimeError"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Delete <code>temperature=0</code> and the assistant dict. Add
+        <code>system="Classify the sentiment of the review. Reply with one word: positive, negative, or
+        neutral."</code> and <code>output_config={"effort": "low"}</code>. Check
+        <code>response.stop_reason != "end_turn"</code> before touching <code>content</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+SYSTEM = "Classify the sentiment of the review. Reply with one word: positive, negative, or neutral."
+
+def classify(client, review):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=10,
+        system=SYSTEM,
+        output_config={"effort": "low"},
+        messages=[{"role": "user", "content": review}],
+    )
+    if response.stop_reason != "end_turn":
+        raise RuntimeError(f"classification failed: stop_reason={response.stop_reason}")
+    text = "".join(b.text for b in response.content if b.type == "text")
+    return text.strip().lower()</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m03-e4" data-title="Continue until complete">
+      <div class="exercise-prompt">
+        <p>Write <code>complete(client, prompt, max_tokens=200, max_rounds=3)</code> that keeps asking until the
+          reply is complete:</p>
+        <ul>
+          <li>Start with <code>messages = [{"role": "user", "content": prompt}]</code> and call
+            <code>create</code> with <code>model=al.MODEL</code> and the given <code>max_tokens</code>.</li>
+          <li>Collect the text of every reply.</li>
+          <li>On <code>end_turn</code>, return all collected text joined with no separator.</li>
+          <li>On <code>max_tokens</code>, append the partial reply as
+            <code>{"role": "assistant", "content": response.content}</code>, then append
+            <code>{"role": "user", "content": "Continue exactly where you stopped."}</code>, and call again.</li>
+          <li>On any other stop reason, raise <code>RuntimeError</code>.</li>
+          <li>Make at most <code>max_rounds</code> requests; if the reply is still truncated after that, raise
+            <code>RuntimeError</code>.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+CONTINUE = "Continue exactly where you stopped."
+
+def complete(client, prompt, max_tokens=200, max_rounds=3):
+    messages = [{"role": "user", "content": prompt}]
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_single_round():
+    client = al.MockClient(["Short and complete."])
+    assert complete(client, "Hi") == "Short and complete.", "an end_turn reply should be returned as is"
+    assert len(client.requests) == 1, "a complete first reply needs only one request"
+
+def test_two_rounds():
+    client = al.MockClient(["A" * 40 + "B" * 8, "B" * 8])
+    result = complete(client, "Write it", max_tokens=10)
+    assert result == "A" * 40 + "B" * 8, f"join the partial reply and the continuation, got {result!r}"
+    assert len(client.requests) == 2, f"expected 2 requests, made {len(client.requests)}"
+
+def test_continuation_history():
+    client = al.MockClient(["A" * 40 + "B" * 8, "B" * 8])
+    complete(client, "Write it", max_tokens=10)
+    sent = client.requests[1].messages
+    roles = [m["role"] for m in sent]
+    assert roles == ["user", "assistant", "user"], f"the second request should be user, assistant, user; got {roles}"
+    assert isinstance(sent[1]["content"], list), "append the partial reply as response.content (blocks)"
+    assert sent[1]["content"][0]["text"] == "A" * 40, "the assistant turn should hold the truncated text"
+    assert sent[2]["content"] == "Continue exactly where you stopped.", "ask to continue with the exact text given"
+    assert client.requests[1].max_tokens == 10, "use the same max_tokens on every round"
+
+def test_gives_up():
+    long_reply = "x" * 100
+    client = al.MockClient([long_reply] * 5)
+    try:
+        complete(client, "Write it", max_tokens=5, max_rounds=3)
+    except RuntimeError:
+        assert len(client.requests) == 3, f"stop after max_rounds=3 requests, made {len(client.requests)}"
+        return
+    assert False, "raise RuntimeError when the reply is still truncated after max_rounds"
+
+def test_refusal():
+    client = al.MockClient([al.refusal()])
+    try:
+        complete(client, "...")
+    except RuntimeError:
+        return
+    assert False, "a refusal should raise RuntimeError"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Use <code>for _ in range(max_rounds):</code>. Inside: call,
+        append the text to a <code>parts</code> list, return on <code>end_turn</code>, extend the history on
+        <code>max_tokens</code>, raise otherwise. After the loop, raise because the rounds ran out.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+CONTINUE = "Continue exactly where you stopped."
+
+def complete(client, prompt, max_tokens=200, max_rounds=3):
+    messages = [{"role": "user", "content": prompt}]
+    parts = []
+    for _ in range(max_rounds):
+        response = client.messages.create(model=al.MODEL, max_tokens=max_tokens, messages=messages)
+        parts.append("".join(b.text for b in response.content if b.type == "text"))
+        if response.stop_reason == "end_turn":
+            return "".join(parts)
+        if response.stop_reason != "max_tokens":
+            raise RuntimeError(f"cannot continue after stop_reason={response.stop_reason}")
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": CONTINUE})
+    raise RuntimeError(f"reply still truncated after {max_rounds} rounds")</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a robust ask command</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">ask.py: one question, every stop reason handled</span></div>
+      <div class="widget-body">
+        <p>Build a command-line tool that sends one question and handles whatever comes back, then use it to
+          measure what effort levels cost on your own prompts.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir robust-ask &amp;&amp; cd robust-ask
+pixi init
+pixi add python=3.14 anthropic structlog
+# write ask.py, then:
+pixi run python ask.py "Explain a hash map in two sentences." --effort low --max-tokens 300</code></pre>
+        <p>Use <code>al.get_client()</code> when <code>ANTHROPIC_API_KEY</code> is set, and an
+          <code>al.MockClient</code> otherwise. For the mock, write a responder that returns different scripted
+          outcomes depending on a <code>--simulate</code> option (<code>truncate</code>, <code>refuse</code>,
+          <code>stop</code>), so you can exercise every branch without the real API.</p>
+        <p><strong>Spec</strong></p>
+        <ul>
+          <li>Options (via <code>argparse</code>): the question, <code>--effort</code> (choices:
+            low, medium, high, xhigh, max; omitted means the model default), <code>--max-tokens</code>,
+            <code>--stop</code> (repeatable, becomes <code>stop_sequences</code>), <code>--continue-rounds</code>.</li>
+          <li>A <code>handle(response)</code> function covering all six stop reasons and raising on anything else.</li>
+          <li><code>end_turn</code> and <code>stop_sequence</code> print the answer. <code>max_tokens</code> continues
+            up to <code>--continue-rounds</code> times, then prints the partial text with a clear "[truncated]"
+            marker. <code>refusal</code> prints the category and exits with status 2. <code>tool_use</code> and
+            <code>pause_turn</code> cannot happen without tools, so they exit with an error naming the stop reason.</li>
+          <li>Log one structlog event per request with <code>stop_reason</code>, effort, <code>input_tokens</code>,
+            <code>output_tokens</code>, and elapsed seconds. Structured fields let you compare runs later without
+            parsing text.</li>
+          <li>No <code>temperature</code>, <code>top_p</code>, <code>top_k</code>, prefill, or thinking budget anywhere.</li>
+        </ul>
+        <ul class="checklist" data-id="m03-mini">
+          <li>Runs against the mock with no API key set, and against the real API when one is set</li>
+          <li><code>--simulate truncate</code>, <code>--simulate refuse</code>, and <code>--simulate stop</code> each take the correct branch</li>
+          <li>A truncated reply is never printed without the "[truncated]" marker</li>
+          <li>A refusal exits with status 2 and never crashes on empty content</li>
+          <li>An unknown stop reason raises instead of printing anything</li>
+          <li>Every request logs stop_reason, effort, token counts, and latency as structured fields</li>
+          <li>You ran one real prompt at <code>low</code>, <code>medium</code>, and <code>high</code> effort and wrote down output tokens and latency for each</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> write pytest tests for <code>handle</code> using scripted
+          <code>MockClient</code> responses, including a hand-built <code>pause_turn</code> message; add a
+          <code>--json</code> flag that prints the outcome as JSON for use in shell scripts; compute the cost of each
+          run from <code>usage</code> with the prices from <a href="m01-llm-calls.html">M01</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m03-quiz">
+      <script type="application/json">
+      {"title": "Limits, effort and stop reasons quiz", "passScore": 0.7, "questions": [
+        {"type": "single", "prompt": "Which stop reason means the model finished its reply naturally?", "options": ["<code>stop_sequence</code>", "<code>end_turn</code>", "<code>max_tokens</code>", "<code>pause_turn</code>"], "answer": 1,
+         "explanation": "<p><code>end_turn</code> is a natural finish. <code>max_tokens</code> is a cut-off, <code>stop_sequence</code> means one of your markers was hit, and <code>pause_turn</code> means a server-tool turn was paused and should be resumed.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\n\nclient = al.MockClient([\"abcdefghijklmnopqrstuvwxyz\"])\nr = client.messages.create(model=al.MODEL, max_tokens=2,\n    messages=[{\"role\": \"user\", \"content\": \"alphabet\"}])\nprint(r.stop_reason, r.content[0].text)", "answer": "max_tokens abcdefgh",
+         "explanation": "<p>The mock keeps about four characters per token, so <code>max_tokens=2</code> keeps eight characters and sets <code>stop_reason</code> to <code>max_tokens</code>. A real model would also stop mid-reply, wherever its tokens ran out.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\n\nclient = al.MockClient([\"yes STOP no\"])\nr = client.messages.create(model=al.MODEL, max_tokens=50, stop_sequences=[\"STOP\"],\n    messages=[{\"role\": \"user\", \"content\": \"?\"}])\nprint(repr(r.content[0].text), r.stop_sequence)", "answer": "'yes ' STOP",
+         "explanation": "<p>Generation ends at the stop sequence, and the marker itself is not included in the text. <code>response.stop_sequence</code> reports which marker matched.</p>"},
+        {"type": "multi", "prompt": "A response has <code>stop_reason=\"refusal\"</code>. Which actions are correct?", "options": ["Read <code>stop_details</code> to see the category", "Append <code>response.content</code> to the history as the assistant turn", "Retry the identical request until it succeeds", "Tell the user the request was declined", "Check <code>stop_reason</code> before touching <code>content</code>"], "answer": [0, 3, 4],
+         "explanation": "<p>A refusal is a decision, not a transient failure, so retrying the same request is pointless. Its content is not an answer, and storing an empty assistant turn makes the next request invalid.</p>"},
+        {"type": "single", "prompt": "What should your code do on <code>stop_reason=\"pause_turn\"</code>?", "options": ["Treat the text as the final answer", "Run the requested tool locally", "Send the request again with the paused assistant turn appended so the model can continue", "Raise an error; the request failed"], "answer": 2,
+         "explanation": "<p><code>pause_turn</code> happens during long turns that use server tools. The model is not done and not waiting for you to run anything; re-send with its paused turn appended and it carries on.</p>"},
+        {"type": "single", "prompt": "What does <code>client.messages.create(model=al.MODEL, max_tokens=100, temperature=0, messages=msgs)</code> do on current models?", "options": ["Makes the output deterministic", "Raises <code>BadRequestError</code> (400)", "Is ignored silently", "Raises <code>NotFoundError</code>"], "answer": 1,
+         "explanation": "<p><code>temperature</code>, <code>top_p</code> and <code>top_k</code> are rejected with a 400. Delete them and steer with the prompt and <code>output_config.effort</code>.</p>"},
+        {"type": "text", "prompt": "Which effort level does Claude Opus 5.5 use when you do not set <code>output_config.effort</code>?", "answer": ["medium"],
+         "explanation": "<p>The default is <code>medium</code>. Move to <code>low</code> for simple, high-volume work and to <code>high</code> or above for hard reasoning.</p>"},
+        {"type": "multi", "prompt": "Which of these are valid on Claude Opus 5.5?", "options": ["<code>output_config={\"effort\": \"xhigh\"}</code>", "<code>thinking={\"type\": \"adaptive\"}</code>", "<code>thinking={\"type\": \"disabled\"}</code>", "<code>thinking={\"type\": \"enabled\", \"budget_tokens\": 2000}</code>", "Omitting <code>thinking</code> entirely"], "answer": [0, 1, 4],
+         "explanation": "<p>Thinking is adaptive: send <code>{\"type\": \"adaptive\"}</code> or nothing. Disabling it and fixed budgets are rejected; effort is the control.</p>"},
+        {"type": "single", "prompt": "Why does the handler end with <code>case other: raise ValueError(...)</code>?", "options": ["Python requires a default case in <code>match</code>", "So that a stop reason the code does not know fails loudly instead of being treated as an answer", "To retry the request", "To convert the response to a dict"], "answer": 1,
+         "explanation": "<p><code>match</code> does not require a default. Raising on the unknown means a new or unexpected value shows up as a clear error at the exact place that needs updating.</p>"},
+        {"type": "single", "prompt": "You want JSON output. Old code ended <code>messages</code> with <code>{\"role\": \"assistant\", \"content\": \"{\"}</code>. What should you do now?", "options": ["Keep it; prefill is still supported", "Use structured output with <code>output_config.format</code>", "Set <code>temperature=0</code>", "Put <code>{</code> in a stop sequence"], "answer": 1,
+         "explanation": "<p>Prefill is rejected on current models. Structured output guarantees the JSON shape (M05). <code>temperature</code> is rejected, and a stop sequence of <code>{</code> would stop the reply before it started.</p>"},
+        {"type": "single", "prompt": "A reply ends with <code>stop_reason=\"max_tokens\"</code> and the text reads like a complete sentence. What is true?", "options": ["The answer is complete; the sentence proves it", "The answer may be incomplete; only <code>stop_reason</code> tells you, and it says the limit was hit", "The model padded its answer to reach the limit", "The request was invalid"], "answer": 1,
+         "explanation": "<p>Truncated text often looks plausible. <code>max_tokens</code> means generation stopped at your limit, so treat the text as incomplete: raise the limit, continue, or report it.</p>"},
+        {"type": "single", "prompt": "To continue a truncated reply, which history is valid?", "options": ["<code>[user, assistant(partial)]</code>", "<code>[user, assistant(partial), user(\"Continue exactly where you stopped.\")]</code>", "<code>[assistant(partial), user(\"Continue\")]</code>", "<code>[user, user(\"Continue\")]</code>"], "answer": 1,
+         "explanation": "<p>The history must start with a user turn and end with one. Ending with the partial assistant turn is prefill, which is rejected; dropping the partial reply means the model does not know where it stopped.</p>"},
+        {"type": "multi", "prompt": "Which are good reasons to choose <code>effort=\"low\"</code>?", "options": ["Classifying thousands of short reviews", "A latency-sensitive autocomplete feature", "A difficult multi-step debugging task", "Simple field extraction from short text"], "answer": [0, 1, 3],
+         "explanation": "<p>Low effort suits simple, well-defined, high-volume or latency-sensitive work. Hard multi-step reasoning is where higher effort pays for its extra tokens and time.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Six stop reasons: <code>end_turn</code>, <code>max_tokens</code>, <code>stop_sequence</code>, <code>tool_use</code>, <code>pause_turn</code>, <code>refusal</code>. Check <code>stop_reason</code> before reading <code>content</code>.</li>
+      <li><code>max_tokens</code> is a ceiling. A truncated reply can look complete; raise the limit, ask for less, continue with a user "continue" turn, or report it.</li>
+      <li><code>stop_sequences</code> end the reply at a marker you choose; the marker is excluded and reported in <code>stop_sequence</code>.</li>
+      <li>A refusal has no usable content. Read <code>stop_details</code>, keep it out of the history, do not loop on it.</li>
+      <li><code>tool_use</code>: run tools and send results. <code>pause_turn</code>: re-send with the paused turn appended.</li>
+      <li>One pure <code>handle(response)</code> covers every stop reason and raises on unknown ones.</li>
+      <li><code>output_config={"effort": ...}</code> trades tokens and latency for quality; Opus 5.5 defaults to <code>medium</code>. Thinking is adaptive.</li>
+      <li><code>temperature</code>, <code>top_p</code>, <code>top_k</code>, prefill, disabled thinking, and <code>budget_tokens</code> are rejected. Use the prompt, effort, structured output, and stop sequences.</li>
+    </ul>
+    <div class="flashcards" data-title="Limits, effort and stop reasons">
+      <script type="application/json">
+      [{"front": "The six stop reasons", "back": "<code>end_turn</code>, <code>max_tokens</code>, <code>stop_sequence</code>, <code>tool_use</code>, <code>pause_turn</code>, <code>refusal</code>."},
+       {"front": "What to check before reading <code>content</code>", "back": "<code>response.stop_reason</code>."},
+       {"front": "<code>stop_reason=\"max_tokens\"</code> means...", "back": "The reply hit your limit and is incomplete, even if it reads well."},
+       {"front": "Is the stop sequence included in the text?", "back": "No. The text ends just before it; <code>response.stop_sequence</code> says which one matched."},
+       {"front": "Where do refusal details live?", "back": "<code>response.stop_details</code>: <code>category</code> and <code>explanation</code>."},
+       {"front": "How to handle <code>pause_turn</code>", "back": "Append the paused assistant turn unchanged and send the request again."},
+       {"front": "Effort levels and the Opus 5.5 default", "back": "<code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>. Default: <code>medium</code>."},
+       {"front": "How is thinking configured on Opus 5.5?", "back": "Adaptive: omit <code>thinking</code> or send <code>{\"type\": \"adaptive\"}</code>. Disabled and <code>budget_tokens</code> are rejected."},
+       {"front": "What happens with <code>temperature=0</code>?", "back": "<code>BadRequestError</code> (400). Delete it; steer with the prompt and effort."},
+       {"front": "What replaced prefill for JSON output?", "back": "Structured output: <code>output_config={\"format\": {\"type\": \"json_schema\", ...}}</code>."},
+       {"front": "Last case of a stop-reason handler", "back": "<code>case other: raise ValueError(...)</code>, so unknown values fail loudly."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons">Claude docs: Handling stop reasons</a></li>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/effort">Claude docs: Effort</a></li>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/extended-thinking">Claude docs: Thinking</a></li>
+      <li><a href="https://platform.claude.com/docs/en/api/messages">Claude API reference: Messages</a></li>
+      <li><a href="https://docs.python.org/3/tutorial/controlflow.html#match-statements">Python tutorial: match statements</a></li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> and <a href="../reference/glossary.html">Glossary</a></li>
+      <li>Next: <a href="m04-streaming.html">M04 Streaming</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

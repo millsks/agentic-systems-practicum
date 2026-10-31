@@ -1,0 +1,1297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M05 · Structured Output · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m05">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Talking to a Model · Module 05</p>
+    <h1>Structured Output</h1>
+    <p class="lede">Prose is for people. Programs need data: fields with names, types, and rules. This module turns a
+      model's answer into something your code can rely on, by describing the shape you want with JSON Schema, asking
+      the API to follow it, and checking what comes back before you trust it.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m02-messages-api.html">M02 The Messages API</a>, <a href="m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></span></div>
+    <ul class="objectives">
+      <li>Explain why parsing free-form text is fragile and what it means to treat JSON as a contract</li>
+      <li>Write JSON Schemas with <code>type</code>, <code>properties</code>, <code>required</code>, <code>additionalProperties</code>, <code>enum</code>, <code>items</code>, and nullable fields</li>
+      <li>Request schema-shaped output with <code>output_config={"format": {"type": "json_schema", "schema": ...}}</code></li>
+      <li>Check <code>stop_reason</code>, parse with <code>json.loads</code>, and validate with <code>al.validate</code> before using the data</li>
+      <li>Convert validated dicts into dataclasses, and enforce business rules a schema cannot express</li>
+      <li>Recover from wrong output with a bounded re-ask loop that sends the error back to the model</li>
+      <li>Design extraction prompts and schemas that say "unknown" instead of guessing</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-structure">
+    <h2>Why free text breaks programs</h2>
+    <p>Suppose your code asks a model to pull a customer's name and email out of a support message. You ask nicely
+      for JSON. Most of the time you get it. Sometimes you get this:</p>
+    <div class="runnable" data-title="The friendly reply that breaks json.loads">
+<textarea>
+import json
+import agentlab as al
+
+client = al.MockClient([
+    'Sure! Here is the information you asked for:\n{"name": "Ana Silva", "email": "ana@example.com"}\nLet me know if you need anything else.',
+])
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Return the customer's name and email as JSON. Message: Hi, Ana Silva here (ana@example.com)..."}],
+)
+try:
+    data = json.loads(response.content[0].text)
+except json.JSONDecodeError as e:
+    print("JSONDecodeError:", e)
+</textarea>
+    </div>
+    <p>The data is right there, wrapped in politeness. The usual first reaction is to write a regular expression that
+      grabs everything between the first <code>{</code> and the last <code>}</code>. That fixes today's reply and fails
+      on tomorrow's, which uses <code>'single quotes'</code>, or calls the field <code>"e-mail"</code>, or nests the
+      data under <code>"customer"</code>, or leaves out the email because there was none. Each patch makes the parser
+      longer and no more trustworthy.</p>
+    <p>The fix is to stop treating the answer as text you scrape and start treating it as a <strong>contract</strong>:
+      an agreement, written down in a machine-checkable form, about exactly what shape the data will have. Both
+      sides use the same document. You give it to the model so it knows what to produce, and you use it in your code
+      to check what you received. The standard language for such contracts is <strong>JSON Schema</strong>.</p>
+    <pre class="mermaid">
+flowchart LR
+  S["JSON Schema<br/>(the contract)"] --> R["Request<br/>output_config.format"]
+  R --> M["Model"]
+  M --> T["Reply text"]
+  T --> P["json.loads"]
+  P --> V["validate against<br/>the same schema"]
+  S --> V
+  V --> B["business rules"]
+  B --> D["dataclass your code uses"]
+    </pre>
+    <p>This module walks along that pipeline from left to right. Each stage removes one way for bad data to reach
+      the rest of your program.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> do not scrape data out of prose. Write the shape down as
+      a schema, ask for it, and check the reply against the same schema.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="json-schema">
+    <h2>JSON Schema in one sitting</h2>
+    <p>A <strong>JSON Schema</strong> is itself a JSON object (in Python, a dict) that describes what valid data
+      looks like. You only need a handful of keywords for almost everything in this course:</p>
+    <table>
+      <thead><tr><th>Keyword</th><th>Meaning</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><code>type</code></td><td>The JSON type: <code>object</code>, <code>array</code>, <code>string</code>, <code>integer</code>, <code>number</code>, <code>boolean</code>, <code>null</code>; or a list of them</td><td><code>{"type": "string"}</code>, <code>{"type": ["string", "null"]}</code></td></tr>
+        <tr><td><code>properties</code></td><td>For an object: a schema for each named field</td><td><code>{"name": {"type": "string"}}</code></td></tr>
+        <tr><td><code>required</code></td><td>For an object: the fields that must be present</td><td><code>["name", "email"]</code></td></tr>
+        <tr><td><code>additionalProperties</code></td><td>For an object: <code>false</code> forbids fields not listed in <code>properties</code></td><td><code>false</code></td></tr>
+        <tr><td><code>enum</code></td><td>The value must be one of a fixed list</td><td><code>{"enum": ["low", "medium", "high"]}</code></td></tr>
+        <tr><td><code>items</code></td><td>For an array: the schema every element must match</td><td><code>{"type": "array", "items": {"type": "string"}}</code></td></tr>
+        <tr><td><code>description</code></td><td>Human-readable notes; the model reads them too</td><td><code>"ISO 8601 date, e.g. 2026-03-01"</code></td></tr>
+      </tbody>
+    </table>
+    <p>JSON's types map onto Python's in the way you would expect after <code>json.loads</code>: object to
+      <code>dict</code>, array to <code>list</code>, string to <code>str</code>, integer to <code>int</code>,
+      number to <code>int</code> or <code>float</code>, boolean to <code>bool</code>, null to <code>None</code>.</p>
+    <p>agentlab includes a small validator, <code>al.validate(value, schema)</code>. It returns a list of problems,
+      one string per problem, and an empty list when the value is valid. Each problem names the location with a
+      path: <code>$</code> is the root, <code>$.email</code> a field, <code>$.tags[1]</code> an array element.</p>
+    <div class="runnable" data-title="Validate a few candidates">
+<textarea>
+import agentlab as al
+
+CONTACT = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "email": {"type": ["string", "null"], "description": "null when the message has no email"},
+        "priority": {"enum": ["low", "normal", "urgent"]},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["name", "email", "priority", "tags"],
+    "additionalProperties": False,
+}
+
+candidates = [
+    {"name": "Ana Silva", "email": "ana@example.com", "priority": "urgent", "tags": ["billing"]},
+    {"name": "Bo Chen", "email": None, "priority": "low", "tags": []},
+    {"name": "Cy", "priority": "normal", "tags": []},
+    {"name": "Di", "email": "di@example.com", "priority": "ASAP", "tags": ["x", 7]},
+    {"name": "Ed", "email": "ed@example.com", "priority": "low", "tags": [], "mood": "grumpy"},
+]
+for value in candidates:
+    print(al.validate(value, CONTACT) or "valid")
+</textarea>
+    </div>
+    <p>Three design choices in that schema are worth copying:</p>
+    <ul>
+      <li><strong>Every field is required, and "might be missing" is spelled <code>["string", "null"]</code>.</strong>
+        A field that may be absent forces every reader to write <code>data.get("email")</code> and wonder whether
+        missing means "no email" or "the model forgot". A required, nullable field makes the model say
+        <code>null</code> explicitly.</li>
+      <li><strong><code>additionalProperties: false</code>.</strong> Without it, any extra field is allowed, so a typo
+        such as <code>"emial"</code> passes validation and your code silently reads nothing.</li>
+      <li><strong><code>enum</code> for categories.</strong> If your code branches on priority, the model must choose
+        from the values your code handles. Free text like <code>"ASAP"</code> or <code>"Urgent!"</code> would fall
+        through every branch.</li>
+    </ul>
+    <p>Predict what the validator reports for this value before you run it. Watch the integer-versus-boolean case:
+      in Python <code>True</code> is technically an <code>int</code>, but JSON Schema treats booleans as their own
+      type.</p>
+    <div class="runnable" data-title="Predict the problems" data-predict>
+<textarea>
+import agentlab as al
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"sku": {"type": "string"}, "quantity": {"type": "integer"}},
+    "required": ["sku", "quantity"],
+    "additionalProperties": False,
+}
+print(al.validate({"sku": "A-1", "quantity": 2}, SCHEMA))
+print(al.validate({"sku": "A-1", "quantity": True}, SCHEMA))
+print(al.validate({"quantity": "2"}, SCHEMA))
+</textarea>
+    </div>
+    <aside class="callout note" data-title="A small validator on purpose">
+      <p><code>al.validate</code> supports the keywords above plus <code>const</code>, <code>minItems</code>,
+        <code>maxItems</code>, <code>minLength</code>, <code>maxLength</code>, <code>minimum</code> and
+        <code>maximum</code>, and ignores anything else. In a real project you would use the
+        <code>jsonschema</code> package or Pydantic (see <a href="#production">the last section</a>). The ideas are
+        identical.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> object schemas list <code>properties</code>, make every
+      field <code>required</code>, use <code>["type", "null"]</code> for "may be unknown", set
+      <code>additionalProperties: false</code>, and use <code>enum</code> for categories.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="output-config">
+    <h2>Asking for a schema: <code>output_config.format</code></h2>
+    <p>Writing "reply in JSON with these fields" in the prompt helps, but it is only a request. The Messages API lets
+      you attach the schema itself to the request, so the API constrains the model's reply to match it. You pass it
+      inside <code>output_config</code> (the same object that holds <code>effort</code> from
+      <a href="m03-limits-stop-reasons.html">M03</a>):</p>
+    <pre><code class="language-python">output_config={
+    "format": {
+        "type": "json_schema",
+        "schema": CONTACT,          # your JSON Schema dict
+    },
+}</code></pre>
+    <p>The reply is then a single text block whose text is JSON matching your schema: no greeting, no code fences,
+      no trailing remarks. You parse it with <code>json.loads</code>.</p>
+    <div class="runnable" data-title="Structured output end to end">
+<textarea>
+import json
+import agentlab as al
+
+CONTACT = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "email": {"type": ["string", "null"]},
+        "priority": {"enum": ["low", "normal", "urgent"]},
+    },
+    "required": ["name", "email", "priority"],
+    "additionalProperties": False,
+}
+message = "Hi, Ana Silva here (ana@example.com). Our checkout is down and customers cannot pay!"
+
+client = al.MockClient(['{"name": "Ana Silva", "email": "ana@example.com", "priority": "urgent"}'])
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=512,
+    messages=[{"role": "user", "content": f"Extract the sender's contact details and priority.\n\n{message}"}],
+    output_config={"format": {"type": "json_schema", "schema": CONTACT}},
+)
+print("stop_reason:", response.stop_reason)
+print("raw text:   ", response.content[0].text)
+data = json.loads(response.content[0].text)
+print("parsed:     ", data)
+print("priority is urgent:", data["priority"] == "urgent")
+</textarea>
+    </div>
+    <p>The same request against the real API; only the client line changes:</p>
+    <pre><code class="language-python">import json
+import anthropic
+
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=512,
+    messages=[{"role": "user", "content": f"Extract the sender's contact details and priority.\n\n{message}"}],
+    output_config={"format": {"type": "json_schema", "schema": CONTACT}},
+)
+data = json.loads(response.content[0].text)</code></pre>
+    <p>A few things people get wrong the first time:</p>
+    <ul>
+      <li><strong>The schema does not replace the instructions.</strong> It fixes the <em>shape</em>; the prompt still
+        has to say <em>what</em> to put in it ("the sender, not people mentioned in the message", "urgent means
+        customers are blocked"). Field <code>description</code>s are a good place for per-field rules.</li>
+      <li><strong>The old parameter name.</strong> Older examples on the internet use a top-level
+        <code>output_format=</code> argument. It is deprecated; use <code>output_config={"format": ...}</code>.</li>
+      <li><strong>Keep output schemas simple.</strong> Types, <code>properties</code>, <code>required</code>,
+        <code>enum</code>, <code>items</code>, nullable types, and <code>additionalProperties: false</code> cover
+        nearly every case. Check numeric ranges and cross-field rules in your own code (the
+        <a href="#business-rules">business rules</a> section), and consult the structured output documentation before
+        relying on more exotic schema keywords.</li>
+    </ul>
+    <aside class="callout note" data-title="How the mock handles output_config">
+      <p>When a request sets <code>output_config.format</code>, the mock checks that the <em>scripted</em> reply is
+        JSON matching the schema, because the real API guarantees that. If it is not, the mock raises
+        <code>al.MockScriptError</code>: that means the script is wrong, not your code. So every scripted reply for
+        such a request in this module is valid JSON. To practise handling bad output, examples below leave
+        <code>output_config</code> off, which is exactly the situation where bad output really happens.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong>
+      <code>output_config={"format": {"type": "json_schema", "schema": SCHEMA}}</code>, then
+      <code>json.loads(response.content[0].text)</code>. Instructions say what; the schema says what shape.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="check-first">
+    <h2>Check before you parse: stop reasons still matter</h2>
+    <p>"The API guarantees valid JSON" has an important condition attached: the model has to finish. Recall the stop
+      reasons from <a href="m03-limits-stop-reasons.html">M03</a>. If the reply hits <code>max_tokens</code>, the JSON
+      is cut off mid-string. If the model declines, <code>stop_reason</code> is <code>"refusal"</code> and there may be
+      no text at all. Parsing either one blindly crashes, or worse, half-works.</p>
+    <div class="runnable" data-title="Truncation and refusal with a schema">
+<textarea>
+import json
+import agentlab as al
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"summary": {"type": "string"}, "sentiment": {"enum": ["positive", "neutral", "negative"]}},
+    "required": ["summary", "sentiment"],
+    "additionalProperties": False,
+}
+fmt = {"format": {"type": "json_schema", "schema": SCHEMA}}
+client = al.MockClient([
+    '{"summary": "The customer loves the new dashboard but wants dark mode.", "sentiment": "positive"}',
+    al.refusal("cyber"),
+])
+
+r1 = client.messages.create(model=al.MODEL, max_tokens=8, output_config=fmt,
+                            messages=[{"role": "user", "content": "Summarise this review: ..."}])
+print(r1.stop_reason, repr(r1.content[0].text))
+try:
+    json.loads(r1.content[0].text)
+except json.JSONDecodeError as e:
+    print("JSONDecodeError:", e.msg)
+
+r2 = client.messages.create(model=al.MODEL, max_tokens=512, output_config=fmt,
+                            messages=[{"role": "user", "content": "Summarise this review: ..."}])
+print(r2.stop_reason, r2.content, r2.stop_details.category)
+</textarea>
+    </div>
+    <p>So every structured call goes through the same three gates, in this order:</p>
+    <ol>
+      <li><strong>Stop reason.</strong> Only <code>"end_turn"</code> means a complete answer. Anything else is handled
+        as in M03 (raise the limit, report the refusal) before you look at the text.</li>
+      <li><strong>Parse.</strong> <code>json.loads</code>, catching <code>json.JSONDecodeError</code>.</li>
+      <li><strong>Validate.</strong> <code>al.validate(data, schema)</code>. With <code>output_config.format</code>
+        this should never find a problem, and checking costs microseconds. Without it (an older code path, a
+        different provider, a cached reply, a schema you changed last week), it is your only protection.</li>
+    </ol>
+    <div class="runnable" data-title="A reusable parse_structured helper">
+<textarea>
+import json
+import agentlab as al
+
+class StructuredOutputError(ValueError):
+    """The reply could not be turned into valid data."""
+
+def parse_structured(response, schema):
+    """Return the reply as validated data, or raise StructuredOutputError saying why not."""
+    if response.stop_reason != "end_turn":
+        raise StructuredOutputError(f"incomplete reply: stop_reason={response.stop_reason}")
+    text = "".join(block.text for block in response.content if block.type == "text")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise StructuredOutputError(f"reply is not JSON: {e.msg} at position {e.pos}") from e
+    problems = al.validate(data, schema)
+    if problems:
+        raise StructuredOutputError("reply does not match the schema: " + "; ".join(problems))
+    return data
+
+SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"],
+          "additionalProperties": False}
+client = al.MockClient(['{"city": "Lisbon"}', '{"town": "Porto"}', "I think it is Faro."])
+for _ in range(3):
+    response = client.messages.create(model=al.MODEL, max_tokens=128,
+                                      messages=[{"role": "user", "content": "Which city? Reply as JSON."}])
+    try:
+        print("ok:", parse_structured(response, SCHEMA))
+    except StructuredOutputError as e:
+        print("error:", e)
+</textarea>
+    </div>
+    <p>Notice the helper joins text blocks itself instead of using the mock's <code>response.text</code> shortcut, so
+      it works unchanged with the real SDK. And it raises one specific exception type with a clear message. That
+      message is about to become very useful: in the re-ask section you will send it back to the model.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> stop reason, then parse, then validate. Turn every
+      failure into one exception type with a message that says exactly what was wrong.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="dataclasses">
+    <h2>From dicts to dataclasses</h2>
+    <p>A validated dict is safe, but it is still a dict: <code>data["priorty"]</code> is a <code>KeyError</code> at
+      run time, your editor cannot autocomplete field names, and mypy cannot check types. The last step of the
+      pipeline converts the dict into a <strong>dataclass</strong>, a class whose fields are declared with type hints
+      and whose <code>__init__</code> is generated for you.</p>
+    <div class="runnable" data-title="A nested structure, typed">
+<textarea>
+import json
+from dataclasses import dataclass
+
+import agentlab as al
+
+INVOICE = {
+    "type": "object",
+    "properties": {
+        "invoice_number": {"type": "string"},
+        "vendor": {"type": "string"},
+        "currency": {"enum": ["USD", "EUR", "GBP"]},
+        "lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "quantity": {"type": "integer"},
+                    "unit_price": {"type": "number"},
+                },
+                "required": ["description", "quantity", "unit_price"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["invoice_number", "vendor", "currency", "lines"],
+    "additionalProperties": False,
+}
+
+@dataclass(frozen=True)
+class Line:
+    description: str
+    quantity: int
+    unit_price: float
+
+    @property
+    def amount(self) -> float:
+        return round(self.quantity * self.unit_price, 2)
+
+@dataclass(frozen=True)
+class Invoice:
+    invoice_number: str
+    vendor: str
+    currency: str
+    lines: list[Line]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Invoice":
+        return cls(
+            invoice_number=data["invoice_number"],
+            vendor=data["vendor"],
+            currency=data["currency"],
+            lines=[Line(**line) for line in data["lines"]],
+        )
+
+    @property
+    def total(self) -> float:
+        return round(sum(line.amount for line in self.lines), 2)
+
+reply = json.dumps({"invoice_number": "INV-0042", "vendor": "Northwind", "currency": "EUR",
+                    "lines": [{"description": "Widgets", "quantity": 3, "unit_price": 4.5},
+                              {"description": "Shipping", "quantity": 1, "unit_price": 7.0}]})
+client = al.MockClient([reply])
+response = client.messages.create(
+    model=al.MODEL, max_tokens=1024,
+    messages=[{"role": "user", "content": "Extract the invoice: ..."}],
+    output_config={"format": {"type": "json_schema", "schema": INVOICE}},
+)
+data = json.loads(response.content[0].text)
+assert al.validate(data, INVOICE) == []
+invoice = Invoice.from_dict(data)
+print(invoice.vendor, invoice.currency, len(invoice.lines), "lines, total", invoice.total)
+print(invoice.lines[0])
+</textarea>
+    </div>
+    <p>Why validate first and convert second? <code>Line(**line)</code> trusts its input completely: an extra key
+      raises a confusing <code>TypeError</code>, a missing key raises another, and a string where a number belongs is
+      accepted silently (dataclasses do not check types at run time). Validation turns all of those into one clear
+      message <em>before</em> construction, and conversion then cannot fail. Keep the two steps in that order.</p>
+    <p><code>frozen=True</code> makes instances immutable, which suits data that came from outside: nobody downstream
+      can "fix up" a field by accident. Derived values such as <code>total</code> are computed properties, so they
+      can never disagree with the lines they come from. That last point matters: do not ask the model for numbers
+      your code can compute.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> validate, then build a dataclass with a
+      <code>from_dict</code> classmethod. Compute derived values in code instead of asking the model for them.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="business-rules">
+    <h2>Rules a schema cannot express</h2>
+    <p>A schema checks <em>shape</em>: this field is a string, that one is one of three words. Many real rules are
+      about <em>meaning</em> and relationships: the check-out date is after the check-in date; the stated total equals
+      the sum of the lines; a discount is between 0 and 100 percent; the email the model extracted actually appears
+      in the source text. These are <strong>business rules</strong> (also called semantic validation), and they
+      live in a plain Python function that returns a list of problems, just like <code>al.validate</code>.</p>
+    <div class="runnable" data-title="A business-rule checker">
+<textarea>
+from datetime import date
+
+def check_booking(data: dict, source_text: str) -> list[str]:
+    """Return problems with a schema-valid booking, or an empty list."""
+    problems = []
+    check_in = date.fromisoformat(data["check_in"])
+    check_out = date.fromisoformat(data["check_out"])
+    if check_out <= check_in:
+        problems.append(f"check_out {data['check_out']} must be after check_in {data['check_in']}")
+    if not 1 <= data["guests"] <= 8:
+        problems.append(f"guests must be between 1 and 8, got {data['guests']}")
+    if data["email"] is not None and data["email"] not in source_text:
+        problems.append(f"email {data['email']!r} does not appear in the message; use null if there is none")
+    return problems
+
+source = "Hi, two of us arriving 2026-05-02, leaving 2026-05-05. Reach me at kai@example.org."
+good = {"check_in": "2026-05-02", "check_out": "2026-05-05", "guests": 2, "email": "kai@example.org"}
+bad = {"check_in": "2026-05-05", "check_out": "2026-05-02", "guests": 2, "email": "kai@example.com"}
+print(check_booking(good, source))
+for problem in check_booking(bad, source):
+    print("-", problem)
+</textarea>
+    </div>
+    <p>Look at the last rule. The model swapped <code>.org</code> for <code>.com</code>, a plausible-looking value
+      that passes every type check. This kind of check, "is the extracted value actually in the source?", is one
+      of the cheapest and most effective defences in extraction work, because it catches values the model made up
+      rather than copied.</p>
+    <p>Write problem messages for two readers. A person debugging later wants to know what was wrong. The model, in
+      the next section, needs to know how to fix it. "check_out must be after check_in" serves both; "invalid
+      booking" serves neither.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> schema validation checks shape; business rules check
+      meaning. Return specific, fixable problem messages, and check that extracted values appear in the source.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="re-ask">
+    <h2>When the output is wrong: re-ask with the error</h2>
+    <p>When a reply fails validation or a business rule, the simplest recovery is to tell the model what was wrong and
+      ask again, in the same conversation. Because the API is stateless (<a href="m02-messages-api.html">M02</a>), "the
+      same conversation" means you append two messages to the history and send it all again:</p>
+    <ol>
+      <li>the model's bad reply, as an <code>assistant</code> turn (<code>response.content</code>), so it can see what
+        it produced;</li>
+      <li>a <code>user</code> turn that lists the problems and asks for a corrected reply.</li>
+    </ol>
+    <p>Then you loop, with a hard limit on attempts, because a loop without a limit is a bill without a limit.</p>
+    <pre class="mermaid">
+flowchart TD
+  A[send request] --> B{stop_reason end_turn?}
+  B -- no --> X[raise: incomplete or refused]
+  B -- yes --> C[parse + validate + business rules]
+  C -- no problems --> D[return data]
+  C -- problems --> E{attempts left?}
+  E -- no --> Y[raise with the last problems]
+  E -- yes --> F[append assistant reply + user message listing problems]
+  F --> A
+    </pre>
+    <p>Here is the loop, with a script in which the model first replies with prose around the JSON, then with a value
+      that breaks a business rule, and finally gets it right. There is no <code>output_config</code> here, so the bad
+      replies are realistic.</p>
+    <div class="runnable" data-title="A bounded re-ask loop">
+<textarea>
+import json
+import agentlab as al
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"title": {"type": "string"}, "minutes": {"type": "integer"}},
+    "required": ["title", "minutes"],
+    "additionalProperties": False,
+}
+
+def problems_with(response):
+    if response.stop_reason != "end_turn":
+        return [f"incomplete reply (stop_reason={response.stop_reason})"]
+    text = "".join(b.text for b in response.content if b.type == "text")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        return [f"not valid JSON ({e.msg}); reply with the JSON object only"]
+    problems = al.validate(data, SCHEMA)
+    if not problems and not 5 <= data["minutes"] <= 240:
+        problems.append(f"$.minutes: {data['minutes']} is outside 5..240")
+    return problems
+
+def ask_for_meeting(client, request_text, max_attempts=3):
+    history = [{"role": "user", "content":
+                f"Return a JSON object with 'title' and 'minutes' (5 to 240) for: {request_text}"}]
+    for attempt in range(1, max_attempts + 1):
+        response = client.messages.create(model=al.MODEL, max_tokens=256, messages=history)
+        problems = problems_with(response)
+        if not problems:
+            return json.loads(response.content[0].text), history
+        print(f"attempt {attempt} rejected: {problems}")
+        history.append({"role": "assistant", "content": response.content})
+        history.append({"role": "user", "content":
+                        "Your reply had these problems:\n- " + "\n- ".join(problems) +
+                        "\nReply again with only the corrected JSON object."})
+    raise ValueError(f"no valid reply after {max_attempts} attempts: {problems}")
+
+client = al.MockClient([
+    'Here you go: {"title": "Roadmap review", "minutes": 60}',
+    '{"title": "Roadmap review", "minutes": 600}',
+    '{"title": "Roadmap review", "minutes": 60}',
+])
+data, history = ask_for_meeting(client, "an hour-long roadmap review")
+print("accepted:", data)
+print(len(client.requests), "requests sent")
+print(al.format_transcript(history))
+</textarea>
+    </div>
+    <p>Read the transcript from the bottom up and you can see why this works: each new request carries the original
+      task, every earlier attempt, and the exact complaint about it. The model is not guessing what went wrong.</p>
+    <aside class="callout warn" data-title="When re-asking is the right tool">
+      <p>With <code>output_config.format</code> the real API guarantees schema-valid JSON on a completed reply, so you
+        should not need to re-ask for <em>shape</em> problems there. The re-ask pattern earns its keep in two
+        situations: business-rule failures (dates in the wrong order, a value not found in the source, totals that
+        do not add up), which no schema can prevent; and code paths that do not use <code>output_config</code> at
+        all. Do not re-ask on truncation or refusal: a <code>max_tokens</code> stop needs a bigger limit or a smaller
+        task, and a refusal needs handling, not repetition.</p>
+    </aside>
+    <p>Some practical rules for the loop:</p>
+    <ul>
+      <li><strong>Bound it.</strong> Two or three attempts. If the third fails, the prompt or schema is the problem,
+        and more attempts just spend money. Raise an exception with the last problems so a person can see them.</li>
+      <li><strong>Send specific errors.</strong> The validator's <code>$.minutes: 600 is outside 5..240</code> is far
+        more useful to the model than "invalid".</li>
+      <li><strong>Count the cost.</strong> Every retry resends the whole history, so attempt three pays for the input of
+        attempts one and two again. Track <code>usage</code> across attempts (<a href="m11-stop-conditions.html">M11</a>
+        turns this into a budget).</li>
+      <li><strong>Log rejections.</strong> A rising re-ask rate is an early warning that a prompt or a model version
+        changed behaviour.</li>
+    </ul>
+    <aside class="callout tip"><p><strong>Remember:</strong> append the bad reply as an assistant turn and the problems
+      as a user turn, then retry, at most two or three times. Re-ask for business rules or unconstrained output; never
+      for truncation or refusal.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="extraction">
+    <h2>Extraction tasks done well</h2>
+    <p><strong>Extraction</strong> means turning unstructured text (emails, tickets, PDFs converted to text, chat logs)
+      into records. It is one of the most common and most valuable things teams use models for, and it has one
+      characteristic failure: the model fills in a plausible value when the source does not contain one. You prevent
+      that with the schema, the prompt, and a check.</p>
+    <div class="two-col">
+      <div>
+        <h4>In the schema</h4>
+        <ul>
+          <li>Nullable types for anything the source may lack: <code>["string", "null"]</code>.</li>
+          <li><code>enum</code> with an explicit fallback such as <code>"other"</code> or <code>"unknown"</code>, so the
+            model is never forced into a wrong category.</li>
+          <li><code>description</code>s with formats: "ISO 8601 date", "amount in cents".</li>
+        </ul>
+      </div>
+      <div>
+        <h4>In the prompt</h4>
+        <ul>
+          <li>Say what to do when information is missing: "use null; never guess".</li>
+          <li>Separate the instructions from the document, for example inside
+            <code>&lt;document&gt;</code> tags (<a href="m06-prompting.html">M06</a> covers this in depth).</li>
+          <li>Say whose details you want when several people appear.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="runnable" data-title="Extract a support ticket">
+<textarea>
+import json
+from dataclasses import dataclass
+
+import agentlab as al
+
+TICKET = {
+    "type": "object",
+    "properties": {
+        "customer_name": {"type": ["string", "null"]},
+        "order_id": {"type": ["string", "null"], "description": "Exactly as written, e.g. ORD-1234"},
+        "category": {"enum": ["billing", "shipping", "product", "account", "other"]},
+        "summary": {"type": "string", "description": "One sentence, under 20 words"},
+    },
+    "required": ["customer_name", "order_id", "category", "summary"],
+    "additionalProperties": False,
+}
+
+@dataclass(frozen=True)
+class Ticket:
+    customer_name: str | None
+    order_id: str | None
+    category: str
+    summary: str
+
+PROMPT = """Extract a support ticket from the email in <email> tags.
+Rules: use null for any field the email does not state; never guess an order id.
+Pick the closest category, or "other".
+
+<email>
+{email}
+</email>"""
+
+email = "hello, my parcel never arrived and tracking hasn't moved in 9 days. thanks, Priya"
+client = al.MockClient([json.dumps({"customer_name": "Priya", "order_id": None, "category": "shipping",
+                                    "summary": "Parcel has not arrived; tracking unchanged for nine days."})])
+response = client.messages.create(
+    model=al.MODEL, max_tokens=512,
+    messages=[{"role": "user", "content": PROMPT.format(email=email)}],
+    output_config={"format": {"type": "json_schema", "schema": TICKET}},
+)
+if response.stop_reason != "end_turn":
+    raise RuntimeError(f"incomplete: {response.stop_reason}")
+ticket = Ticket(**json.loads(response.content[0].text))
+print(ticket)
+print("needs order lookup:", ticket.order_id is None)
+</textarea>
+    </div>
+    <p>The <code>order_id</code> of <code>None</code> is the system working: the email has no order number, and your
+      code can now ask the customer for one instead of looking up an invented <code>ORD-0000</code>.</p>
+    <aside class="callout think"><p>Your manager asks you to add a <code>confidence</code> field from 0 to 1 so you can
+      filter weak extractions. What would that number actually measure? A model's self-reported confidence is just
+      more generated text, not a calibrated probability. Checks you can compute (the value appears in the source,
+      the category is not "other", required fields are not null) are usually a more honest signal.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> nullable fields, an <code>"other"</code> category, a prompt
+      that says "null, never guess", and a check against the source text.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="production">
+    <h2>The production path: Pydantic and <code>messages.parse</code></h2>
+    <p>Everything so far uses plain dicts, <code>json</code>, <code>al.validate</code>, and dataclasses, so you can see
+      every step. In production most Python teams use <strong>Pydantic</strong>, a library where one class definition
+      is the schema, the validator, and the typed object at once. The Anthropic SDK builds on it:
+      <code>client.messages.parse(...)</code> takes a Pydantic model class, sends its schema as the output format,
+      and validates the reply into an instance of your class, available as <code>response.parsed_output</code>:</p>
+    <pre data-label="Real SDK (runs locally)"><code class="language-python">import anthropic
+from pydantic import BaseModel
+
+class Ticket(BaseModel):
+    customer_name: str | None
+    order_id: str | None
+    category: str
+    summary: str
+
+client = anthropic.Anthropic()
+response = client.messages.parse(
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Extract a support ticket from: ..."}],
+    output_format=Ticket,
+)
+ticket = response.parsed_output   # a validated Ticket instance</code></pre>
+    <p><code>.parse()</code> takes your Pydantic class through its own <code>output_format</code> argument and turns it
+      into the request's <code>output_config.format</code> for you. That convenience argument is not the deprecated
+      request-level <code>output_format</code> field mentioned earlier; on <code>messages.create</code>, always use
+      <code>output_config</code>.</p>
+    <p>To see what such a helper saves you, here is the same pipeline written by hand with Pydantic's own methods.
+      Pydantic is not available in the browser, so this one runs locally:</p>
+    <div class="runnable" data-title="What parse does, by hand with Pydantic" data-local="Needs the pydantic package and a real API key; run locally after pixi add pydantic anthropic.">
+<textarea>
+from pydantic import BaseModel, ConfigDict
+
+import agentlab as al
+
+class Ticket(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # becomes additionalProperties: false
+    customer_name: str | None
+    order_id: str | None
+    category: str
+    summary: str
+
+client = al.get_client()
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=512,
+    messages=[{"role": "user", "content": "Extract a support ticket from: ..."}],
+    output_config={"format": {"type": "json_schema", "schema": Ticket.model_json_schema()}},
+)
+assert response.stop_reason == "end_turn", response.stop_reason
+ticket = Ticket.model_validate_json(response.content[0].text)   # parse + validate + build, in one call
+print(ticket)
+</textarea>
+    </div>
+    <p>One class replaces the schema dict, the validator call, and the dataclass. That is why it is the production
+      path. The stop-reason check and business rules are still yours to write: a schema-valid ticket can still name
+      an order id that is not in the email.</p>
+    <p>You will meet schemas again, from the other direction, in <a href="m07-tools-as-contracts.html">M07</a>: a tool's
+      <code>input_schema</code> is the same JSON Schema language, describing the arguments the model sends to your
+      code instead of the answer it returns.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> production code usually defines one Pydantic model and lets
+      <code>client.messages.parse</code> handle schema, parsing, and validation. Stop reasons and business rules
+      remain your job.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser and are graded instantly. Tests build their own <code>MockClient</code> scripts
+      and inspect <code>client.requests</code>.</p>
+
+    <div class="exercise" data-id="m05-e1" data-title="Write a schema">
+      <div class="exercise-prompt">
+        <p>Define <code>USER_SCHEMA</code>, a JSON Schema for a user record with exactly these fields, all required:</p>
+        <ul>
+          <li><code>username</code>: a string</li>
+          <li><code>email</code>: a string, or <code>null</code> when unknown</li>
+          <li><code>plan</code>: one of <code>"free"</code>, <code>"pro"</code>, <code>"team"</code></li>
+          <li><code>roles</code>: an array of strings</li>
+        </ul>
+        <p>No other fields are allowed. The tests check your schema with <code>al.validate</code>.</p>
+      </div>
+<textarea class="starter">
+USER_SCHEMA = {
+    "type": "object",
+    # ...
+}
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+GOOD = {"username": "ada", "email": "ada@example.com", "plan": "pro", "roles": ["admin"]}
+
+def test_accepts_valid():
+    assert al.validate(GOOD, USER_SCHEMA) == [], f"a valid record was rejected: {al.validate(GOOD, USER_SCHEMA)}"
+    nulled = dict(GOOD, email=None, roles=[])
+    assert al.validate(nulled, USER_SCHEMA) == [], "email may be null and roles may be empty"
+
+def test_requires_every_field():
+    for key in GOOD:
+        partial = {k: v for k, v in GOOD.items() if k != key}
+        assert al.validate(partial, USER_SCHEMA), f"a record without {key!r} should be rejected; list it in required"
+
+def test_rejects_wrong_values():
+    assert al.validate(dict(GOOD, plan="enterprise"), USER_SCHEMA), "plan must be one of free, pro, team"
+    assert al.validate(dict(GOOD, roles=["admin", 3]), USER_SCHEMA), "roles must contain only strings"
+    assert al.validate(dict(GOOD, email=42), USER_SCHEMA), "email must be a string or null"
+    assert al.validate(dict(GOOD, username=None), USER_SCHEMA), "username must be a string, not null"
+
+def test_rejects_extra_fields():
+    assert al.validate(dict(GOOD, age=30), USER_SCHEMA), "set additionalProperties to False"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Use <code>"properties"</code> with one entry per field,
+        <code>{"type": ["string", "null"]}</code> for email, <code>{"enum": [...]}</code> for plan,
+        <code>{"type": "array", "items": {"type": "string"}}</code> for roles, a <code>"required"</code> list, and
+        <code>"additionalProperties": False</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">USER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "username": {"type": "string"},
+        "email": {"type": ["string", "null"]},
+        "plan": {"enum": ["free", "pro", "team"]},
+        "roles": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["username", "email", "plan", "roles"],
+    "additionalProperties": False,
+}</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e2" data-title="Three gates: stop reason, parse, validate">
+      <div class="exercise-prompt">
+        <p>Write <code>parse_structured(response, schema)</code> that returns the reply's data as a dict, or raises
+          <code>ValueError</code> with a helpful message when:</p>
+        <ul>
+          <li><code>response.stop_reason</code> is not <code>"end_turn"</code> (include the stop reason in the message);</li>
+          <li>the text is not valid JSON;</li>
+          <li>the data fails <code>al.validate(data, schema)</code> (include the problems in the message).</li>
+        </ul>
+        <p>Join the text of every <code>text</code> block yourself (do not rely on the mock-only <code>.text</code>).</p>
+      </div>
+<textarea class="starter">
+import json
+import agentlab as al
+
+def parse_structured(response, schema):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+          "required": ["city", "population"], "additionalProperties": False}
+
+def _response(step, max_tokens=256, structured=False):
+    client = al.MockClient([step])
+    extra = {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}} if structured else {}
+    return client.messages.create(model=al.MODEL, max_tokens=max_tokens,
+                                  messages=[{"role": "user", "content": "go"}], **extra)
+
+def _raises(response, needle):
+    try:
+        parse_structured(response, SCHEMA)
+    except ValueError as e:
+        assert needle in str(e), f"the ValueError message should mention {needle!r}, got {str(e)!r}"
+        return
+    raise AssertionError(f"expected ValueError mentioning {needle!r}")
+
+def test_valid():
+    data = parse_structured(_response('{"city": "Accra", "population": 2500000}', structured=True), SCHEMA)
+    assert data == {"city": "Accra", "population": 2500000}, f"return the parsed dict, got {data!r}"
+
+def test_truncated():
+    _raises(_response('{"city": "Accra", "population": 2500000}', max_tokens=3, structured=True), "max_tokens")
+
+def test_refusal():
+    _raises(_response(al.refusal("cyber"), structured=True), "refusal")
+
+def test_not_json():
+    try:
+        parse_structured(_response("The city is Accra."), SCHEMA)
+    except ValueError:
+        return
+    raise AssertionError("prose that is not JSON should raise ValueError (catch json.JSONDecodeError)")
+
+def test_schema_problems():
+    _raises(_response('{"city": "Accra"}'), "population")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Check <code>stop_reason</code> first. Build the text with
+        <code>"".join(b.text for b in response.content if b.type == "text")</code>. Wrap <code>json.loads</code> in
+        <code>try/except json.JSONDecodeError</code> and re-raise as <code>ValueError</code>. Join the validator's
+        problems with <code>"; "</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import json
+import agentlab as al
+
+def parse_structured(response, schema):
+    if response.stop_reason != "end_turn":
+        raise ValueError(f"incomplete reply: stop_reason={response.stop_reason}")
+    text = "".join(b.text for b in response.content if b.type == "text")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"reply is not JSON: {e.msg}") from e
+    problems = al.validate(data, schema)
+    if problems:
+        raise ValueError("schema problems: " + "; ".join(problems))
+    return data</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e3" data-title="Dicts into dataclasses">
+      <div class="exercise-prompt">
+        <p>The dataclasses below describe an order. Write <code>order_from_dict(data)</code> that builds an
+          <code>Order</code> (with a list of <code>Item</code> objects) from an already validated dict, and complete
+          the <code>total</code> property so it returns the sum of <code>quantity * unit_price</code> over all items,
+          rounded to 2 decimals.</p>
+        <pre><code class="language-python">{"order_id": "A-17", "customer": "Lee",
+ "items": [{"sku": "PEN", "quantity": 3, "unit_price": 1.25}, {"sku": "INK", "quantity": 1, "unit_price": 6.0}]}</code></pre>
+        <p>becomes an <code>Order</code> whose <code>total</code> is <code>9.75</code>.</p>
+      </div>
+<textarea class="starter">
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Item:
+    sku: str
+    quantity: int
+    unit_price: float
+
+@dataclass(frozen=True)
+class Order:
+    order_id: str
+    customer: str
+    items: list[Item]
+
+    @property
+    def total(self) -> float:
+        ...
+
+def order_from_dict(data: dict) -> Order:
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+DATA = {"order_id": "A-17", "customer": "Lee",
+        "items": [{"sku": "PEN", "quantity": 3, "unit_price": 1.25}, {"sku": "INK", "quantity": 1, "unit_price": 6.0}]}
+
+def test_builds_order():
+    order = order_from_dict(DATA)
+    assert isinstance(order, Order), "return an Order instance"
+    assert order.order_id == "A-17" and order.customer == "Lee", "copy order_id and customer"
+
+def test_items_are_dataclasses():
+    order = order_from_dict(DATA)
+    assert len(order.items) == 2, "one Item per entry in items"
+    assert all(isinstance(i, Item) for i in order.items), "items must be Item objects, not dicts"
+    assert order.items[0].sku == "PEN" and order.items[0].quantity == 3, "keep item order and values"
+
+def test_total():
+    assert order_from_dict(DATA).total == 9.75, f"total should be 9.75, got {order_from_dict(DATA).total}"
+    empty = order_from_dict({"order_id": "B", "customer": "Max", "items": []})
+    assert empty.total == 0, "an order with no items totals 0"
+
+def test_rounding():
+    order = order_from_dict({"order_id": "C", "customer": "Q",
+                             "items": [{"sku": "X", "quantity": 3, "unit_price": 0.1}]})
+    assert order.total == 0.3, f"round to 2 decimals: 3 * 0.1 should give 0.3, got {order.total}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Build the items with a list comprehension:
+        <code>[Item(**item) for item in data["items"]]</code>. For the total, use
+        <code>round(sum(i.quantity * i.unit_price for i in self.items), 2)</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Item:
+    sku: str
+    quantity: int
+    unit_price: float
+
+@dataclass(frozen=True)
+class Order:
+    order_id: str
+    customer: str
+    items: list[Item]
+
+    @property
+    def total(self) -> float:
+        return round(sum(i.quantity * i.unit_price for i in self.items), 2)
+
+def order_from_dict(data: dict) -> Order:
+    return Order(
+        order_id=data["order_id"],
+        customer=data["customer"],
+        items=[Item(**item) for item in data["items"]],
+    )</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e4" data-title="An extractor with output_config">
+      <div class="exercise-prompt">
+        <p>Write <code>extract_event(client, text)</code> that asks the model to extract an event from
+          <code>text</code> and returns an <code>Event</code>. Requirements:</p>
+        <ul>
+          <li>Use <code>model=al.MODEL</code>, <code>max_tokens=512</code>, and one user message that contains
+            <code>text</code>.</li>
+          <li>Request structured output with <code>output_config={"format": {"type": "json_schema", "schema": EVENT_SCHEMA}}</code>.</li>
+          <li>If <code>stop_reason</code> is not <code>"end_turn"</code>, raise <code>ValueError</code>.</li>
+          <li>Otherwise parse the JSON and return <code>Event(**data)</code>.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import json
+from dataclasses import dataclass
+
+import agentlab as al
+
+EVENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "date": {"type": ["string", "null"], "description": "ISO 8601 date, or null if not stated"},
+        "city": {"type": ["string", "null"]},
+    },
+    "required": ["title", "date", "city"],
+    "additionalProperties": False,
+}
+
+@dataclass(frozen=True)
+class Event:
+    title: str
+    date: str | None
+    city: str | None
+
+def extract_event(client, text):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import json
+import agentlab as al
+
+TEXT = "Join us for PyCon Lisbon on 2026-09-14!"
+
+def test_returns_event():
+    client = al.MockClient([json.dumps({"title": "PyCon Lisbon", "date": "2026-09-14", "city": "Lisbon"})])
+    event = extract_event(client, TEXT)
+    assert isinstance(event, Event), "return an Event dataclass"
+    assert event == Event("PyCon Lisbon", "2026-09-14", "Lisbon"), f"got {event!r}"
+
+def test_request_uses_output_config():
+    client = al.MockClient([json.dumps({"title": "Meetup", "date": None, "city": None})])
+    extract_event(client, "A meetup, details soon.")
+    req = client.requests[0]
+    fmt = req.output_config.get("format")
+    assert fmt is not None, "pass output_config={'format': {...}}"
+    assert fmt.get("type") == "json_schema" and fmt.get("schema") == EVENT_SCHEMA, \
+        "the format must be {'type': 'json_schema', 'schema': EVENT_SCHEMA}"
+    assert req.max_tokens == 512, "use max_tokens=512"
+    assert "A meetup, details soon." in req.last_user_text, "include the text in the user message"
+
+def test_nulls_survive():
+    client = al.MockClient([json.dumps({"title": "Meetup", "date": None, "city": None})])
+    event = extract_event(client, "A meetup, details soon.")
+    assert event.date is None and event.city is None, "null fields should become None"
+
+def test_refusal_raises():
+    client = al.MockClient([al.refusal()])
+    try:
+        extract_event(client, TEXT)
+    except ValueError:
+        return
+    raise AssertionError("raise ValueError when stop_reason is not end_turn")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Build the prompt with an f-string that includes
+        <code>text</code>, call <code>client.messages.create(...)</code> with <code>output_config</code>, check
+        <code>response.stop_reason</code>, then <code>Event(**json.loads(response.content[0].text))</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import json
+from dataclasses import dataclass
+
+import agentlab as al
+
+EVENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "date": {"type": ["string", "null"], "description": "ISO 8601 date, or null if not stated"},
+        "city": {"type": ["string", "null"]},
+    },
+    "required": ["title", "date", "city"],
+    "additionalProperties": False,
+}
+
+@dataclass(frozen=True)
+class Event:
+    title: str
+    date: str | None
+    city: str | None
+
+def extract_event(client, text):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=512,
+        messages=[{"role": "user", "content": f"Extract the event. Use null for anything not stated.\n\n{text}"}],
+        output_config={"format": {"type": "json_schema", "schema": EVENT_SCHEMA}},
+    )
+    if response.stop_reason != "end_turn":
+        raise ValueError(f"incomplete reply: stop_reason={response.stop_reason}")
+    return Event(**json.loads(response.content[0].text))</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m05-e5" data-title="Re-ask until valid">
+      <div class="exercise-prompt">
+        <p>Write <code>ask_until_valid(client, prompt, schema, check, max_attempts=3)</code>. No
+          <code>output_config</code> here: the model may reply with anything. On each attempt:</p>
+        <ol>
+          <li>send the conversation so far (<code>model=al.MODEL</code>, <code>max_tokens=512</code>); the first
+            attempt sends just <code>prompt</code> as a user message;</li>
+          <li>collect problems: not JSON (one problem describing the error), else <code>al.validate(data, schema)</code>,
+            else <code>check(data)</code> (a function returning a list of business-rule problems);</li>
+          <li>no problems: return the data;</li>
+          <li>problems: append the reply as an assistant turn (<code>response.content</code>) and a user turn that
+            contains every problem string, then try again.</li>
+        </ol>
+        <p>After <code>max_attempts</code> failed attempts, raise <code>ValueError</code>. You may assume every reply
+          ends with <code>end_turn</code>.</p>
+      </div>
+<textarea class="starter">
+import json
+import agentlab as al
+
+def ask_until_valid(client, prompt, schema, check, max_attempts=3):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+SCHEMA = {"type": "object", "properties": {"low": {"type": "integer"}, "high": {"type": "integer"}},
+          "required": ["low", "high"], "additionalProperties": False}
+
+def ordered(data):
+    return [] if data["low"] < data["high"] else [f"low ({data['low']}) must be less than high ({data['high']})"]
+
+def test_first_try():
+    client = al.MockClient(['{"low": 1, "high": 5}'])
+    assert ask_until_valid(client, "Give a range.", SCHEMA, ordered) == {"low": 1, "high": 5}, "return the data"
+    assert len(client.requests) == 1, "a valid first reply needs exactly one request"
+
+def test_reasks_after_bad_json():
+    client = al.MockClient(["Sure! low is 1 and high is 5.", '{"low": 1, "high": 5}'])
+    assert ask_until_valid(client, "Give a range.", SCHEMA, ordered) == {"low": 1, "high": 5}
+    second = client.requests[1].messages
+    assert len(second) == 3, "the retry sends user, assistant (bad reply), user (problems)"
+    assert second[1]["role"] == "assistant", "append the bad reply as an assistant turn"
+    assert second[0]["content"] == "Give a range.", "keep the original prompt first"
+
+def test_reasks_with_business_rule_message():
+    client = al.MockClient(['{"low": 9, "high": 2}', '{"low": 2, "high": 9}'])
+    assert ask_until_valid(client, "Give a range.", SCHEMA, ordered) == {"low": 2, "high": 9}
+    feedback = client.requests[1].last_user_text
+    assert "low (9) must be less than high (2)" in feedback, f"send the check() problems back to the model, got {feedback!r}"
+
+def test_schema_problem_message():
+    client = al.MockClient(['{"low": 1}', '{"low": 1, "high": 2}'])
+    ask_until_valid(client, "Give a range.", SCHEMA, ordered)
+    assert "high" in client.requests[1].last_user_text, "send the al.validate problems back to the model"
+
+def test_gives_up():
+    client = al.MockClient(["nope", "still no", "no again", "never used"])
+    try:
+        ask_until_valid(client, "Give a range.", SCHEMA, ordered, max_attempts=3)
+    except ValueError:
+        assert len(client.requests) == 3, f"stop after max_attempts requests, sent {len(client.requests)}"
+        return
+    raise AssertionError("raise ValueError after max_attempts failures")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Keep a <code>history</code> list starting with the prompt. Inside
+        <code>for attempt in range(max_attempts):</code>, build <code>problems</code> step by step, calling
+        <code>check</code> only when parsing and validation passed. On problems, append two messages: the
+        assistant's <code>response.content</code> and a user message like
+        <code>"Fix these problems: " + "; ".join(problems)</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import json
+import agentlab as al
+
+def ask_until_valid(client, prompt, schema, check, max_attempts=3):
+    history = [{"role": "user", "content": prompt}]
+    problems = []
+    for _ in range(max_attempts):
+        response = client.messages.create(model=al.MODEL, max_tokens=512, messages=history)
+        text = "".join(b.text for b in response.content if b.type == "text")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            problems = [f"reply is not valid JSON ({e.msg}); reply with only the JSON object"]
+        else:
+            problems = al.validate(data, schema) or check(data)
+        if not problems:
+            return data
+        history.append({"role": "assistant", "content": response.content})
+        history.append({"role": "user", "content": "Fix these problems and reply with only JSON:\n- "
+                        + "\n- ".join(problems)})
+    raise ValueError(f"no valid reply after {max_attempts} attempts: {problems}")</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">receipts.py: a receipt extractor with checks</span></div>
+      <div class="widget-body">
+        <p>Build a command-line tool that reads a folder of plain-text receipts (one per file) and writes one JSON
+          record per receipt to <code>receipts.jsonl</code>. It uses the real API when available and falls back to a
+          <code>MockClient</code> with scripted replies for offline development and tests.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir receipts &amp;&amp; cd receipts
+pixi init
+pixi add python=3.14 anthropic structlog pytest
+mkdir samples   # put three to five receipt .txt files here, including one with no date
+pixi run python receipts.py samples/ --out receipts.jsonl</code></pre>
+        <p><strong>Spec</strong></p>
+        <ul>
+          <li><code>RECEIPT_SCHEMA</code>: <code>merchant</code> (string), <code>date</code> (ISO date string or null),
+            <code>currency</code> (enum of a few codes plus <code>"other"</code>), <code>lines</code> (array of
+            objects with <code>description</code>, <code>quantity</code>, <code>unit_price</code>), and
+            <code>stated_total</code> (number or null). All required, no extra properties.</li>
+          <li>Frozen dataclasses <code>Receipt</code> and <code>Line</code>, with a computed <code>total</code>.</li>
+          <li><code>check_receipt(receipt, source_text)</code>: business rules. The merchant appears in the source; if
+            <code>stated_total</code> is not null it matches the computed total within 0.01; quantities are positive.</li>
+          <li><code>extract(client, text)</code>: request with <code>output_config.format</code>, check
+            <code>stop_reason</code>, parse, validate, build, check. On business-rule problems, re-ask at most twice with
+            the problems listed.</li>
+          <li>Log one structlog event per file (<code>file</code>, <code>attempts</code>, <code>ok</code>,
+            <code>problems</code>, <code>input_tokens</code>, <code>output_tokens</code>) so a batch run can be audited
+            afterwards.</li>
+        </ul>
+        <ul class="checklist" data-id="m05-mini">
+          <li>Every request uses <code>model</code>, an explicit <code>max_tokens</code>, and <code>output_config.format</code></li>
+          <li>Truncated or refused replies are reported, never parsed</li>
+          <li>A receipt with no date produces <code>"date": null</code>, not an invented date</li>
+          <li>A stated total that disagrees with the lines triggers a re-ask, and gives up after two retries</li>
+          <li>Records in <code>receipts.jsonl</code> are built from the dataclasses (<code>dataclasses.asdict</code>)</li>
+          <li>pytest tests cover the happy path, a business-rule re-ask, and a refusal, all with <code>MockClient</code></li>
+          <li>No API key in the code; the tool runs offline with the mock fallback</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> rewrite the schema and dataclasses as one Pydantic model; add a
+          <code>--effort</code> flag and compare re-ask rates; write a summary line at the end with records processed,
+          re-asks, failures, and total tokens.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m05-quiz">
+      <script type="application/json">
+      {"title": "Structured output quiz", "passScore": 0.7, "questions": [
+        {"type": "single", "prompt": "Which request field asks the Claude API to return JSON matching a schema?", "options": ["<code>output_format={\"schema\": ...}</code>", "<code>output_config={\"format\": {\"type\": \"json_schema\", \"schema\": ...}}</code>", "<code>response_format=\"json\"</code>", "<code>tools=[...]</code> with <code>tool_choice</code> forced"], "answer": 1,
+         "explanation": "<p>Structured output lives in <code>output_config.format</code> with type <code>json_schema</code>. The top-level <code>output_format</code> parameter is deprecated, and forcing <code>tool_choice</code> is rejected on Opus 5.5.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\nschema = {\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\"}}, \"required\": [\"n\"]}\nprint(al.validate({\"n\": 3}, schema))", "answer": "[]",
+         "explanation": "<p><code>al.validate</code> returns a list of problems; an empty list means valid.</p>"},
+        {"type": "multi", "prompt": "Which values fail <code>{\"type\": [\"string\", \"null\"]}</code>?", "options": ["<code>\"hello\"</code>", "<code>None</code>", "<code>0</code>", "<code>[\"a\"]</code>"], "answer": [2, 3],
+         "explanation": "<p>A list of types accepts any one of them: a string or null. An integer and an array are neither.</p>"},
+        {"type": "single", "prompt": "What does <code>\"additionalProperties\": false</code> protect you from?", "options": ["Missing required fields", "Fields not listed in <code>properties</code>, such as a misspelled key", "Wrong types inside arrays", "Null values"], "answer": 1,
+         "explanation": "<p>Without it, an object can carry any extra keys, so <code>\"emial\"</code> would pass validation while your code reads nothing. <code>required</code> handles missing fields.</p>"},
+        {"type": "single", "prompt": "A structured-output request returns <code>stop_reason == \"max_tokens\"</code>. What should your code do?", "options": ["Parse the text; the API guarantees valid JSON", "Treat the reply as incomplete: do not parse it; raise the limit or shrink the task", "Re-ask with the validation error", "Strip the last character and parse"], "answer": 1,
+         "explanation": "<p>The JSON guarantee applies to completed replies. A truncated reply is cut off mid-JSON. Re-asking with the same limit tends to hit the same wall.</p>"},
+        {"type": "single", "prompt": "Why make a field required and nullable instead of optional?", "options": ["It uses fewer tokens", "The model must state <code>null</code> explicitly, so 'unknown' and 'forgot' are not confused", "Optional fields are rejected by the API", "Nullable fields are faster to validate"], "answer": 1,
+         "explanation": "<p>A required nullable field forces an explicit answer, and every reader can rely on the key being present.</p>"},
+        {"type": "multi", "prompt": "Which checks need business-rule code rather than a JSON Schema?", "options": ["<code>end_date</code> is after <code>start_date</code>", "<code>priority</code> is one of three words", "The extracted email appears in the source text", "The stated total equals the sum of the line amounts"], "answer": [0, 2, 3],
+         "explanation": "<p>Schemas describe each value's shape; relationships between fields and checks against outside data need code. An enum is a schema feature.</p>"},
+        {"type": "single", "prompt": "In a re-ask loop, what do you append before resending?", "options": ["Only a new user message saying 'try again'", "The bad reply as an assistant turn, then a user turn listing the specific problems", "A system message with the error", "Nothing; resend the original request"], "answer": 1,
+         "explanation": "<p>The API is stateless. The model sees its previous attempt and the exact complaint, so it can fix that specific problem. Resending unchanged would likely reproduce the same answer.</p>"},
+        {"type": "single", "prompt": "With <code>output_config.format</code> set, when is a re-ask loop still useful?", "options": ["Never", "When the reply has a JSON syntax error", "When a business rule fails, such as dates in the wrong order", "When the stop reason is <code>refusal</code>"], "answer": 2,
+         "explanation": "<p>The API guarantees schema-valid JSON on completed replies, so syntax and shape are covered. Rules about meaning are not, and a refusal needs handling, not repetition.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import json\ntry:\n    json.loads('Sure! {\"a\": 1}')\n    print(\"parsed\")\nexcept json.JSONDecodeError:\n    print(\"error\")", "answer": "error",
+         "explanation": "<p><code>json.loads</code> needs the whole string to be JSON. Leading prose makes it fail, which is why you ask for structured output instead of scraping.</p>"},
+        {"type": "single", "prompt": "Why validate a dict before calling <code>Line(**data)</code>?", "options": ["Dataclasses are slow", "Dataclasses do not check types at run time, and missing or extra keys produce confusing TypeErrors", "Validation converts strings to numbers", "It is required by <code>json.loads</code>"], "answer": 1,
+         "explanation": "<p>Validation gives one clear message before construction. A dataclass will happily store a string in an <code>int</code> field.</p>"},
+        {"type": "text", "prompt": "Which SDK method takes a Pydantic model and validates the reply into it? (write <code>client.messages.???</code>)", "answer": ["parse", "messages.parse", "client.messages.parse"],
+         "explanation": "<p><code>client.messages.parse(...)</code> sends the model's schema and returns a validated instance: the production version of this module's pipeline.</p>"},
+        {"type": "single", "prompt": "An extraction prompt should say what about missing information?", "options": ["Nothing; the model will figure it out", "Use null (or an 'other' category) and never guess", "Fill in the most likely value", "Return an empty string"], "answer": 1,
+         "explanation": "<p>The characteristic failure of extraction is a plausible invented value. Telling the model to use null, and giving it a schema that allows null, makes 'unknown' a legal answer.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Scraping data out of prose is fragile. Treat output as a contract written in JSON Schema.</li>
+      <li>Schemas: <code>type</code>, <code>properties</code>, <code>required</code> (all fields), nullable types for unknowns, <code>additionalProperties: false</code>, <code>enum</code> for categories, <code>items</code> for arrays.</li>
+      <li>Request it with <code>output_config={"format": {"type": "json_schema", "schema": ...}}</code>; the reply is JSON text you <code>json.loads</code>. The old <code>output_format</code> parameter is deprecated.</li>
+      <li>Three gates: <code>stop_reason == "end_turn"</code>, parse, validate. Truncated and refused replies are never parsed.</li>
+      <li>Validate first, then build frozen dataclasses; compute derived values in code.</li>
+      <li>Business rules check meaning (date order, totals, values present in the source) in plain Python.</li>
+      <li>Re-ask by appending the bad reply and a user message listing the problems; bound the attempts. With <code>output_config</code>, re-ask only for business rules.</li>
+      <li>In production, a Pydantic model with <code>client.messages.parse</code> replaces the schema dict, validator, and dataclass.</li>
+    </ul>
+    <div class="flashcards" data-title="Structured output">
+      <script type="application/json">
+      [{"front": "Request field for schema-shaped output", "back": "<code>output_config={\"format\": {\"type\": \"json_schema\", \"schema\": SCHEMA}}</code>"},
+       {"front": "What does <code>al.validate</code> return?", "back": "A list of problem strings such as <code>$.email: expected string, got int</code>; empty when valid."},
+       {"front": "How to say 'may be unknown' in a schema", "back": "Make the field required with <code>\"type\": [\"string\", \"null\"]</code>."},
+       {"front": "<code>additionalProperties: false</code>", "back": "Rejects keys not listed in <code>properties</code>, catching typos and surprise fields."},
+       {"front": "The three gates, in order", "back": "Stop reason is <code>end_turn</code>, <code>json.loads</code> succeeds, the schema validates."},
+       {"front": "Does <code>output_config.format</code> protect against truncation?", "back": "No. A <code>max_tokens</code> stop cuts the JSON off. Check <code>stop_reason</code> first."},
+       {"front": "Business rule", "back": "A check about meaning or relationships (date order, totals, value in source) that a schema cannot express."},
+       {"front": "The re-ask pattern", "back": "Append the bad reply as an assistant turn and a user turn listing the problems; retry at most two or three times."},
+       {"front": "When not to re-ask", "back": "On <code>max_tokens</code> (raise the limit) or <code>refusal</code> (handle it), and not for shape when <code>output_config.format</code> is set."},
+       {"front": "Validate before building a dataclass. Why?", "back": "Dataclasses do not check types, and bad keys give confusing errors. Validation gives one clear message."},
+       {"front": "The production path", "back": "A Pydantic model with <code>client.messages.parse(...)</code>."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Claude docs: Structured outputs</a> (supported schema features, <code>messages.parse</code>)</li>
+      <li><a href="https://json-schema.org/understanding-json-schema/">Understanding JSON Schema</a>, a readable guide to every keyword</li>
+      <li><a href="https://docs.python.org/3.14/library/json.html">Python docs: <code>json</code></a> and <a href="https://docs.python.org/3.14/library/dataclasses.html"><code>dataclasses</code></a></li>
+      <li><a href="https://docs.pydantic.dev/latest/">Pydantic documentation</a></li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> (<code>al.validate</code>) and <a href="../reference/glossary.html">glossary</a></li>
+      <li>Next: <a href="m06-prompting.html">M06 Prompting That Holds Up</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

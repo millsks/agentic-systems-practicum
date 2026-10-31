@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M00 · How This Practicum Works · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m00">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Orientation · Start here · Module 00</p>
+    <h1>How This Practicum Works</h1>
+    <p class="lede">An agent is a language model running in a loop, with tools it can ask your program to use. This
+      module shows you that loop, the path the course takes through it, and the two clients you will use: an offline
+      mock that runs in this page, and the real Claude API on your own machine.</p>
+    <div class="lesson-meta"><span>⏱ ~45 minutes</span><span>Prerequisites: Python basics (functions, dicts, exceptions)</span></div>
+    <ul class="objectives">
+      <li>Describe an agent as a model in a loop with tools, and say who does what in that loop</li>
+      <li>Find your way along the eight-stage path and know what Level 1 covers</li>
+      <li>Make a first request with <code>agentlab.MockClient</code> and read the response object</li>
+      <li>Explain what changes, and what does not, when you switch to the real <code>anthropic</code> client</li>
+      <li>Set up the course locally with Pixi and keep an API key out of code and commits</li>
+      <li>Read a transcript printed by <code>al.format_transcript</code></li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="what-is-an-agent">
+    <h2>What an agent is</h2>
+    <p>A <strong>large language model</strong> (LLM) is a program that reads text and writes more text. On its own it
+      can only answer: you send a request, it sends back a response, and that is the end of it. Nothing happens in the
+      world.</p>
+    <p>An <strong>agent</strong> adds two things around the model:</p>
+    <ul>
+      <li><strong>Tools.</strong> A tool is a function in <em>your</em> program (search the web, read a file, query a
+        database) that you describe to the model by name, purpose, and input format. The model never runs code. It can
+        only <em>ask</em> for a tool call by writing a structured request.</li>
+      <li><strong>A loop.</strong> Your program sends the conversation to the model. If the model asks for a tool,
+        your program runs it, appends the result to the conversation, and asks again. When the model answers without
+        asking for anything, the loop ends.</li>
+    </ul>
+    <pre class="mermaid">
+flowchart LR
+  U([Task from a user]) --> P[Your program]
+  P -- "conversation so far" --> M[Model]
+  M -- "answer: done" --> P
+  M -- "please call search(...)" --> P
+  P -- "runs the function" --> T[(Tool)]
+  T -- "result" --> P
+  P --> O([Final answer])
+    </pre>
+    <p>That is the whole idea. Frameworks add conveniences, but under every one of them is a loop like this, usually
+      fifty lines or fewer. By <a href="m09-agent-loop.html">M09</a> you will write it yourself from a blank file.</p>
+    <aside class="callout think"><p><strong>Think:</strong> in the diagram, which box decides <em>which</em> tool to
+      call, and which box actually <em>executes</em> it? Hold on to the answer; it explains most agent bugs you will
+      ever debug. (The model decides; your program executes. If a tool does something wrong, the bug is in your code
+      or your tool description, not "in the AI".)</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> agent = model + tools + loop. The model proposes, your
+      program disposes.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="the-path">
+    <h2>The eight-stage path</h2>
+    <p>The practicum is organized into four levels and eight stages. Each stage is a group of modules; each level
+      ends with a graded capstone project. <strong>Level 1 (Novice) is available now</strong>: this orientation, Stage 1,
+      Stage 2, and Capstone 1. Levels 2-4 are on the <a href="../reference/roadmap.html">roadmap</a>.</p>
+    <pre class="mermaid">
+flowchart TB
+  O[M00 · Orientation] --> S1
+  subgraph L1 [Level 1 · Novice: available now]
+    S1["Stage 1 · Talking to a model (M01-M06)"] --> S2["Stage 2 · Tool use and the agent loop (M07-M12)"] --> C1[Capstone 1 · Research agent]
+  end
+  subgraph L2 [Level 2 · Practitioner: roadmap]
+    S3[Stage 3 · Context and memory] --> S4[Stage 4 · Workflows vs agents] --> S5[Stage 5 · Evaluation] --> C2[Capstone 2 · Retrieval agent]
+  end
+  subgraph L3 [Level 3 · Production: roadmap]
+    S6[Stage 6 · Reliability and safety] --> S7[Stage 7 · Shipping agents] --> C3[Capstone 3 · MCP server + hardened agent]
+  end
+  subgraph L4 [Level 4 · Professional: roadmap]
+    S8[Stage 8 · Advanced agent systems] --> C4[Capstone 4 · Coding agent]
+  end
+  C1 -.-> S3
+  C2 -.-> S6
+  C3 -.-> S8
+    </pre>
+    <div class="two-col">
+      <div>
+        <h4>Stage 1 · Talking to a model</h4>
+        <p>One request, one response. Tokens and cost (<a href="m01-llm-calls.html">M01</a>), the Messages API
+          (<a href="m02-messages-api.html">M02</a>), limits and stop reasons (<a href="m03-limits-stop-reasons.html">M03</a>),
+          streaming (<a href="m04-streaming.html">M04</a>), structured output (<a href="m05-structured-output.html">M05</a>),
+          and prompts that hold up (<a href="m06-prompting.html">M06</a>).</p>
+      </div>
+      <div>
+        <h4>Stage 2 · Tool use and the agent loop</h4>
+        <p>Tools as contracts (<a href="m07-tools-as-contracts.html">M07</a>), one tool call by hand
+          (<a href="m08-one-tool-call.html">M08</a>), the loop itself (<a href="m09-agent-loop.html">M09</a>), errors
+          (<a href="m10-errors-as-data.html">M10</a>), budgets (<a href="m11-stop-conditions.html">M11</a>), and tool
+          design (<a href="m12-tool-design.html">M12</a>). Then you build a research agent in
+          <a href="../projects/c1-research-agent.html">Capstone 1</a>.</p>
+      </div>
+    </div>
+    <p>The order matters. Stage 1 teaches the single request so thoroughly that, in Stage 2, the agent loop is just
+      "do that again, carefully". Skipping ahead works poorly: almost every agent bug is a single-request bug repeated
+      in a loop.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> Level 1 takes you from your first call to a working,
+      budgeted, tool-using agent you can explain line by line. Budget about 25-30 hours including the capstone.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="how-lessons-work">
+    <h2>How a lesson works</h2>
+    <p>Every module follows the same rhythm, so you always know where you are:</p>
+    <div class="card-grid">
+      <div class="card"><h4>Read and run</h4><p>Teaching sections mix explanation with <strong>runnable cells</strong>:
+        real CPython running in your browser through Pyodide. Edit the code and press Run, or
+        <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd>.</p></div>
+      <div class="card"><h4>Predict first</h4><p>Some cells ask you to <strong>type a prediction</strong> before they
+        run. Guessing wrong and seeing why is the fastest way to learn.</p></div>
+      <div class="card"><h4>Practice</h4><p><strong>Exercises</strong> are graded in the page by tests. Each has a hint
+        and a full solution. Try for a few minutes before you open either.</p></div>
+      <div class="card"><h4>Check yourself</h4><p>A <strong>quiz</strong>, a recap, and <strong>flashcards</strong>
+        close each module. Use "Mark complete" at the bottom to track progress.</p></div>
+      <div class="card"><h4>Build locally</h4><p>A <strong>mini-project</strong> you build on your own machine with
+        Pixi, often against the real API.</p></div>
+      <div class="card"><h4>Capstones</h4><p>Each level ends with a project graded by a test suite:
+        <code>pixi run start c1</code>, then <code>pixi run grade c1</code>.</p></div>
+    </div>
+    <p>Try a prediction cell now. Type what you think it prints, then run it.</p>
+    <div class="runnable" data-title="Warm-up: a predict cell" data-predict>
+<textarea>
+stages = {1: "Talking to a model", 2: "Tool use and the agent loop"}
+print(len(stages), stages[2].split()[0])
+</textarea>
+    </div>
+    <aside class="callout note"><p>Your progress, notes, and exercise code are saved in your browser's local storage on
+      this device. Nothing is sent anywhere.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="mockclient">
+    <h2>Your first call, with the mock</h2>
+    <p>The browser cannot reach the Claude API, and you should not need an API key or a budget to learn. So every cell
+      and exercise in this course uses <strong><code>agentlab</code></strong>, the course's teaching library. Its
+      <code>MockClient</code> has the same shape as the real SDK client: you call
+      <code>client.messages.create(...)</code> with the same arguments and get back an object with the same
+      attributes. The difference is where the answer comes from. You give the mock a <strong>script</strong>: a list
+      of responses it returns in order, one per request.</p>
+    <div class="runnable" data-title="A first request">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Hello! I'm a scripted stand-in for Claude."])
+
+response = client.messages.create(
+    model=al.MODEL,          # "claude-opus-5-5"
+    max_tokens=256,          # an upper limit on the length of the answer
+    messages=[{"role": "user", "content": "Say hello."}],
+)
+
+print(response.content[0].text)
+print("stop_reason:", response.stop_reason)
+print("usage:", response.usage.input_tokens, "in,", response.usage.output_tokens, "out")
+</textarea>
+    </div>
+    <p>Three arguments are required on every request, here and against the real API:</p>
+    <ul>
+      <li><code>model</code>: which model answers. <code>al.MODEL</code> is the string <code>"claude-opus-5-5"</code>,
+        so the code ports unchanged.</li>
+      <li><code>max_tokens</code>: the most output the model may produce. A <strong>token</strong> is a chunk of text,
+        roughly four characters of English; <a href="m01-llm-calls.html">M01</a> covers tokens properly.</li>
+      <li><code>messages</code>: the conversation, a list of dicts with a <code>role</code> (<code>"user"</code> or
+        <code>"assistant"</code>) and <code>content</code>. <a href="m02-messages-api.html">M02</a> takes this apart.</li>
+    </ul>
+    <p>The response's <code>content</code> is a <em>list of blocks</em>, not a string, because a response can contain
+      text, tool calls, and more. <code>stop_reason</code> says why the model stopped (<code>"end_turn"</code> means it
+      finished its answer). <code>usage</code> counts tokens, which is how you are billed.</p>
+    <h3>The mock checks your requests</h3>
+    <p>The mock is not a rubber stamp. It validates each request the way the API does and raises the same exception
+      classes the real SDK raises. That makes it a safe place to make mistakes. Run this and read each error:</p>
+    <div class="runnable" data-title="Mistakes the mock catches">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["ok"])
+hello = [{"role": "user", "content": "Hi"}]
+
+attempts = {
+    "sampling knob": dict(model=al.MODEL, max_tokens=50, temperature=0.2, messages=hello),
+    "unknown model": dict(model="gpt-4", max_tokens=50, messages=hello),
+    "assistant first": dict(model=al.MODEL, max_tokens=50, messages=[{"role": "assistant", "content": "Hi"}]),
+}
+for label, kwargs in attempts.items():
+    try:
+        client.messages.create(**kwargs)
+    except al.APIError as exc:
+        print(f"{label}: {type(exc).__name__}: {exc}")
+
+print(client.messages.create(model=al.MODEL, max_tokens=50, messages=hello).content[0].text)
+
+try:
+    client.messages.create(model=al.MODEL, max_tokens=50, messages=hello)
+except al.MockScriptError as exc:
+    print("MockScriptError:", exc)
+</textarea>
+    </div>
+    <p>The first three are real API errors: <code>BadRequestError</code> (HTTP 400, the request itself is wrong) and
+      <code>NotFoundError</code> (404, no such model). The last one is different. <code>MockScriptError</code> means
+      the <em>script</em> ran out: the code made a second request but the script held only one response. It is never
+      something the real API raises. When you see it in your own work, count your <code>create</code> calls against
+      your script steps.</p>
+    <aside class="callout warn"><p><strong>Common mistake:</strong> reading <code>response.text</code> in code meant for
+      the real API. The mock offers <code>.text</code> as a shortcut that joins all text blocks; the real SDK's response
+      has no such attribute. Use <code>response.content[0].text</code> (or loop over the blocks) so your code ports.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> one script step per <code>create</code> call. API errors
+      (<code>BadRequestError</code>, <code>NotFoundError</code>) mean fix your request; <code>MockScriptError</code>
+      means fix your script. The full API is in the <a href="../reference/agentlab.html">agentlab reference</a>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="real-client">
+    <h2>The real client</h2>
+    <p>On your own machine, with the <code>anthropic</code> package installed and an API key in your environment, the
+      same request looks like this:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from the environment
+
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Say hello."}],
+)
+print(response.content[0].text)</code></pre>
+    <p>The only change from the mock is the line that creates <code>client</code>. Everything after it (the
+      arguments, <code>response.content</code>, <code>stop_reason</code>, <code>usage</code>, the exception names) is
+      the same. That is the point of the mock: you learn the real interface, offline and for free, and every answer is
+      predictable so the exercises can grade you.</p>
+    <p><code>agentlab</code> also has a helper, <code>al.get_client()</code>, that returns a real
+      <code>anthropic.Anthropic()</code> when the package is installed and raises
+      <code>al.LiveModelUnavailableError</code> when it is not. In this browser it is never installed:</p>
+    <div class="runnable" data-title="get_client in the browser">
+<textarea>
+import agentlab as al
+
+try:
+    client = al.get_client()
+    print("live client ready")
+except al.LiveModelUnavailableError as exc:
+    print("No live model here:", exc)
+    client = al.MockClient(["(mock) Hello!"])
+
+response = client.messages.create(model=al.MODEL, max_tokens=100,
+                                  messages=[{"role": "user", "content": "Say hello."}])
+print(response.content[0].text)
+</textarea>
+    </div>
+    <div class="two-col">
+      <div>
+        <h4><code>MockClient</code></h4>
+        <ul>
+          <li>Runs anywhere, including this page</li>
+          <li>Returns exactly what you scripted</li>
+          <li>Validates requests like the API</li>
+          <li>Free, instant, deterministic</li>
+          <li>Used by every cell, exercise, and capstone test</li>
+        </ul>
+      </div>
+      <div>
+        <h4><code>anthropic.Anthropic()</code></h4>
+        <ul>
+          <li>Runs locally, needs an API key and network</li>
+          <li>Returns what the model actually writes</li>
+          <li>Costs money per token</li>
+          <li>Output varies run to run</li>
+          <li>Used in mini-projects, optionally</li>
+        </ul>
+      </div>
+    </div>
+    <aside class="callout tip"><p><strong>Remember:</strong> write code against the interface, not the client. If a
+      function takes <code>client</code> as a parameter, you can pass a <code>MockClient</code> in tests and a real
+      client in production. Every exercise in this course is shaped that way.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="local-setup">
+    <h2>Local setup with Pixi</h2>
+    <p><a href="https://pixi.sh">Pixi</a> is the one tool this course uses to install Python, install packages, and run
+      code. A Pixi <strong>workspace</strong> is a folder with a <code>pixi.toml</code> file that lists its
+      dependencies and tasks; Pixi builds a private environment for it in <code>.pixi/</code> and records exact
+      versions in <code>pixi.lock</code>. Two people with the same lock file get the same environment.</p>
+    <p>To run the course itself locally:</p>
+    <pre data-label="Terminal"><code class="language-bash">git clone https://github.com/millsks/agentic-systems-practicum.git
+cd agentic-systems-practicum
+pixi install          # builds the environment: Python 3.14, agentlab, test tools
+pixi run serve        # opens the course at http://127.0.0.1:8000/
+pixi run projects     # lists the capstones</code></pre>
+    <p>For your own experiments, start a separate workspace and add the real SDK. The <code>anthropic</code> package is
+      on conda-forge, which is where Pixi looks first:</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi init first-call
+cd first-call
+pixi add python=3.14 anthropic
+pixi run python first_call.py</code></pre>
+    <aside class="callout pixi"><p>Always run code with <code>pixi run python file.py</code>, not bare
+      <code>python</code>. <code>pixi run</code> executes inside the workspace's environment, so the packages you
+      added are the ones you get. Use <code>pixi add</code> to install, never <code>pip install</code>, so the
+      dependency is recorded in <code>pixi.toml</code> and the lock file. <code>pixi shell</code> opens a shell with
+      the environment active if you want to stay in it.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>pixi init</code> creates a workspace,
+      <code>pixi add</code> installs into it, <code>pixi run</code> runs inside it.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="api-keys">
+    <h2>API key hygiene</h2>
+    <p>An <strong>API key</strong> is a secret string that identifies you to the API and is billed to your account.
+      Anyone who has it can spend your money. Treat it like a password, with one extra danger: keys leak through code,
+      and code gets shared, pasted, and committed.</p>
+    <p>The SDK finds credentials in the environment: the <code>ANTHROPIC_API_KEY</code> environment variable, or a
+      profile created with <code>ant auth login</code>. So the key never needs to appear in your code at all.</p>
+    <pre data-label="Terminal"><code class="language-bash"># set it for the current shell session only
+export ANTHROPIC_API_KEY="paste-your-key-here"
+pixi run python first_call.py</code></pre>
+    <div class="two-col">
+      <div>
+        <h4>Do</h4>
+        <ul>
+          <li>Keep the key in an environment variable or an <code>ant auth login</code> profile</li>
+          <li>If you use a <code>.env</code> file, add <code>.env</code> to <code>.gitignore</code> before you create it</li>
+          <li>Use a separate key per project so you can revoke one without breaking the rest</li>
+          <li>Revoke and replace a key the moment you suspect it leaked</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Never</h4>
+        <ul>
+          <li>Write a key in a <code>.py</code> file, even "just for a test"</li>
+          <li>Paste a key into a notebook, a lesson cell, a chat, or a screenshot</li>
+          <li>Commit a key; deleting it in a later commit leaves it in history</li>
+          <li>Print or log the key, or a request object that contains it</li>
+        </ul>
+      </div>
+    </div>
+    <aside class="callout danger"><p>If a key reaches a commit, assume it is compromised. Revoke it first, then clean up.
+      Removing it from the repository does not remove it from clones, forks, or caches.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the key lives in the environment, never in code. The
+      line <code>anthropic.Anthropic()</code> with no arguments is the correct, safe form.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="reading-transcripts">
+    <h2>Reading a transcript</h2>
+    <p>Professionals debug agents by reading what was said, in order. A <strong>transcript</strong> is the conversation
+      printed one block per line. <code>al.format_transcript(messages, response)</code> renders one for you:
+      <code>messages</code> is the history you sent, and the optional <code>response</code> is a reply you have not
+      appended yet.</p>
+    <p>Below is a complete two-request tool run. You are not expected to write this yet (that is
+      <a href="m08-one-tool-call.html">M08</a>); just run it and read the output.</p>
+    <div class="runnable" data-title="A transcript of one tool call">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}]
+client = al.MockClient([
+    al.tool_call("get_weather", {"city": "Paris"}),   # request 1: the model asks for a tool
+    "It's 18°C and sunny in Paris.",                   # request 2: the model answers
+])
+
+messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=512, tools=TOOLS, messages=messages)
+print(al.format_transcript(messages, response))
+print("---")
+
+call = response.content[0]
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": call.id, "content": "18°C, sunny"},
+]})
+response = client.messages.create(model=al.MODEL, max_tokens=512, tools=TOOLS, messages=messages)
+print(al.format_transcript(messages, response))
+</textarea>
+    </div>
+    <p>Read the second transcript line by line:</p>
+    <ol>
+      <li><code>user: What's the weather in Paris?</code> The task.</li>
+      <li><code>assistant: tool_use get_weather {"city": "Paris"} [toolu_mock_0001]</code> The model asks for a tool,
+        with its input and an id. It did not run anything.</li>
+      <li><code>user: tool_result [toolu_mock_0001] 18°C, sunny</code> Your program ran the tool and sent the result
+        back as a <em>user</em> turn, tagged with the same id.</li>
+      <li><code>assistant: It's 18°C and sunny in Paris.</code> The model answers using the result.</li>
+      <li><code>(stop_reason=end_turn)</code> It is done, so the loop would stop.</li>
+    </ol>
+    <aside class="callout think"><p><strong>Think:</strong> the first printout ends with
+      <code>(stop_reason=tool_use)</code>. What would happen if the program ignored that and treated the response as
+      the final answer? (It would show the user nothing: the response has no text, only a request to call a tool.)</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> when an agent misbehaves, print the transcript first.
+      Ask of every line: who said it, what did they ask for, and did the next line answer it?</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Three short exercises to get comfortable with the mock. They are graded by tests in the page.</p>
+
+    <div class="exercise" data-id="m00-e1" data-title="Your first call">
+      <div class="exercise-prompt">
+        <p>Write <code>ask(client, question)</code> that sends <code>question</code> as a single user message with
+          <code>model=al.MODEL</code> and a <code>max_tokens</code> of your choice, and <em>returns</em> the text of the
+          first content block. Use <code>response.content[0].text</code>, not the mock-only <code>.text</code>.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def ask(client, question):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_returns_text():
+    client = al.MockClient(["Forty-two."])
+    assert ask(client, "What is six times seven?") == "Forty-two.", "ask should return the text of the first block"
+
+def test_request_shape():
+    client = al.MockClient(["ok"])
+    ask(client, "Hi there")
+    assert len(client.requests) == 1, "ask should make exactly one request"
+    request = client.requests[0]
+    assert request.model == al.MODEL, "use model=al.MODEL"
+    assert request.messages == [{"role": "user", "content": "Hi there"}], "send the question as one user message with string content"
+
+def test_returns_not_prints():
+    client = al.MockClient(["quiet"])
+    result, printed = capture_output(ask, client, "q")
+    assert printed == "", "ask should return the text, not print it"
+    assert result == "quiet", "ask should return the response text"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Call <code>client.messages.create(model=..., max_tokens=...,
+        messages=[{"role": "user", "content": question}])</code> and return <code>response.content[0].text</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def ask(client, question):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=256,
+        messages=[{"role": "user", "content": question}],
+    )
+    return response.content[0].text</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m00-e2" data-title="Fix the rejected request">
+      <div class="exercise-prompt">
+        <p>This request has four problems, and the mock reports them one at a time. Run it, read the error, fix that
+          one thing, and run again until it prints <code>Bonjour</code>. Keep the variable name <code>client</code>.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+client = al.MockClient(["Bonjour"])
+response = client.messages.create(
+    model="gpt-4o",
+    temperature=0,
+    messages=[{"role": "assistant", "content": "Translate 'hello' to French."}],
+)
+print(response.content[0].text)
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_prints_bonjour():
+    assert program_output.strip() == "Bonjour", "the program should print exactly Bonjour"
+
+def test_request_is_valid():
+    assert len(client.requests) == 1, "make exactly one request"
+    request = client.requests[0]
+    assert request.model == al.MODEL, "use model=al.MODEL"
+    assert request.messages[0]["role"] == "user", "the first message must have the user role"
+    assert request.max_tokens >= 1, "set max_tokens"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>The four problems: <code>max_tokens</code> is missing,
+        <code>temperature</code> is rejected, the model id is not a Claude model, and the first message must come from
+        the <code>user</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+client = al.MockClient(["Bonjour"])
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=100,
+    messages=[{"role": "user", "content": "Translate 'hello' to French."}],
+)
+print(response.content[0].text)</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m00-e3" data-title="Script the mock">
+      <div class="exercise-prompt">
+        <p>The program below is finished; only the script is missing. Replace <code>...</code> with a two-step script
+          so that the program runs without error and its last line of output is <code>2 + 3 = 5</code>. Step one must
+          be a call to the <code>add</code> tool with <code>a=2</code> and <code>b=3</code>; step two is the final
+          answer. Do not change anything below the script.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+client = al.MockClient([
+    ...
+])
+
+TOOLS = [{
+    "name": "add",
+    "description": "Add two integers.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    },
+}]
+
+messages = [{"role": "user", "content": "What is 2 + 3?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=200, tools=TOOLS, messages=messages)
+call = response.content[0]
+result = call.input["a"] + call.input["b"]
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": call.id, "content": str(result)},
+]})
+response = client.messages.create(model=al.MODEL, max_tokens=200, tools=TOOLS, messages=messages)
+print(al.format_transcript(messages, response))
+print(response.content[0].text)
+</textarea>
+      <script type="text/x-python" class="tests">
+def test_script_fully_used():
+    assert len(client.requests) == 2, "the program makes two requests"
+    assert client.remaining == 0, "the script should have exactly two steps, one per request"
+
+def test_tool_call_step():
+    results = client.requests[1].tool_results
+    assert results and results[0]["content"] == "5", "step one should call add with a=2 and b=3, so the tool returns 5"
+    assert "tool_use add" in program_output, "step one should be al.tool_call('add', {...})"
+
+def test_final_answer():
+    lines = program_output.strip().splitlines()
+    assert lines and lines[-1] == "2 + 3 = 5", "step two should be the reply '2 + 3 = 5'"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Use <code>al.tool_call("add", {"a": 2, "b": 3})</code> for step one
+        and a plain string for step two.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+client = al.MockClient([
+    al.tool_call("add", {"a": 2, "b": 3}),
+    "2 + 3 = 5",
+])
+
+TOOLS = [{
+    "name": "add",
+    "description": "Add two integers.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    },
+}]
+
+messages = [{"role": "user", "content": "What is 2 + 3?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=200, tools=TOOLS, messages=messages)
+call = response.content[0]
+result = call.input["a"] + call.input["b"]
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": call.id, "content": str(result)},
+]})
+response = client.messages.create(model=al.MODEL, max_tokens=200, tools=TOOLS, messages=messages)
+print(al.format_transcript(messages, response))
+print(response.content[0].text)</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: your local workbench</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">Set up the course and make one real call</span></div>
+      <div class="widget-body">
+        <p>Get the practicum running on your machine, then (optionally) create a small workspace of your own that talks
+          to the real API with the key safely in the environment. The second part costs a fraction of a cent; skip it
+          if you do not have an API key yet. Every later module works without one.</p>
+        <p><strong>Part 1: the course.</strong></p>
+        <pre data-label="Terminal"><code class="language-bash">git clone https://github.com/millsks/agentic-systems-practicum.git
+cd agentic-systems-practicum
+pixi install
+pixi run serve      # open the URL it prints, find this module
+pixi run projects   # see the Capstone 1 listing</code></pre>
+        <p><strong>Part 2 (optional): one real call.</strong> In a different folder:</p>
+        <pre data-label="Terminal"><code class="language-bash">pixi init first-call
+cd first-call
+pixi add python=3.14 anthropic
+printf '.env\n' &gt;&gt; .gitignore
+export ANTHROPIC_API_KEY="..."     # or: ant auth login
+pixi run python first_call.py</code></pre>
+        <pre data-label="first_call.py"><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=200,
+    messages=[{"role": "user", "content": "In one sentence, what is an AI agent?"}],
+)
+print(response.content[0].text)
+print("stop_reason:", response.stop_reason)
+print("tokens:", response.usage.input_tokens, "in,", response.usage.output_tokens, "out")</code></pre>
+        <ul class="checklist" data-id="m00-mini">
+          <li><code>pixi install</code> completes and <code>pixi run serve</code> shows the course in your browser</li>
+          <li><code>pixi run projects</code> lists Capstone 1</li>
+          <li>(Optional) <code>first-call/</code> is its own Pixi workspace with <code>anthropic</code> added through <code>pixi add</code></li>
+          <li>(Optional) <code>first_call.py</code> prints a real answer, its <code>stop_reason</code>, and its token usage</li>
+          <li>The API key appears in no file you wrote: not in <code>first_call.py</code>, not in <code>pixi.toml</code>, not in any commit</li>
+          <li><code>.env</code> is listed in <code>.gitignore</code> before any <code>.env</code> file exists</li>
+          <li>You can explain why <code>anthropic.Anthropic()</code> takes no key argument</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> run <code>first_call.py</code> twice and compare the answers (they will
+          differ; <a href="m01-llm-calls.html">M01</a> explains why); rewrite it as a function <code>ask(client,
+          question)</code> like exercise 1 so the same code works with <code>al.MockClient</code>; print
+          <code>al.format_transcript</code>-style output by hand for the real response.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m00-quiz">
+      <script type="application/json">
+      {"title": "Orientation quiz", "passScore": 0.7, "questions": [
+        {"type": "single", "prompt": "Which description of an agent does this course use?", "options": ["A model fine-tuned to act autonomously", "A language model running in a loop, with tools your program executes on its behalf", "Any chatbot with a system prompt", "A model that can run Python code directly"], "answer": 1,
+         "explanation": "<p>Agent = model + tools + loop. The model proposes tool calls; your program runs them and sends the results back until the model answers.</p>"},
+        {"type": "single", "prompt": "In an agent, who executes a tool's code?", "options": ["The model, on Anthropic's servers", "Your program, after the model asks for the call", "The SDK, automatically, whenever a tool is defined", "Nobody; tools are only descriptions"], "answer": 1,
+         "explanation": "<p>The model only writes a structured request naming the tool and its input. Your program decides to run it and sends back the result. That is why tool bugs live in your code.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\nclient = al.MockClient([\"Hi!\"])\nr = client.messages.create(model=al.MODEL, max_tokens=50,\n    messages=[{\"role\": \"user\", \"content\": \"Hello\"}])\nprint(r.content[0].text)", "answer": "Hi!",
+         "explanation": "<p>The mock returns its scripted steps in order. A plain string step is a text reply, which appears as the first content block.</p>"},
+        {"type": "single", "prompt": "A script holds one step, and your code calls <code>messages.create</code> twice. What happens on the second call?", "options": ["It repeats the first answer", "It returns an empty response", "It raises <code>al.MockScriptError</code>", "It raises <code>al.BadRequestError</code>"], "answer": 2,
+         "explanation": "<p><code>MockScriptError</code> means the script ran out: one step per request. It is a mock-only error, never raised by the real API.</p>"},
+        {"type": "multi", "prompt": "Which requests does the mock (like the API) reject?", "options": ["One that passes <code>temperature=0.2</code>", "One whose first message has role <code>assistant</code>", "One that sets <code>max_tokens=256</code>", "One with <code>model=\"gpt-4\"</code>"], "answer": [0, 1, 3],
+         "explanation": "<p>Sampling parameters are rejected with a 400, the first message must be from the user, and a non-Claude model id is a 404. <code>max_tokens</code> is required, so setting it is correct.</p>"},
+        {"type": "single", "prompt": "You have working code built on <code>al.MockClient</code>. What do you change to use the real API?", "options": ["Rewrite the calls with a different method name", "Only the line that creates <code>client</code>: <code>client = anthropic.Anthropic()</code>", "Convert every response to a dict first", "Add the API key as an argument to every call"], "answer": 1,
+         "explanation": "<p>The mock mirrors the SDK's surface: same arguments, same response attributes, same exception names. Only the client construction changes (avoid the mock-only <code>.text</code> shortcut).</p>"},
+        {"type": "multi", "prompt": "Which are good API key practices?", "options": ["Keep the key in the <code>ANTHROPIC_API_KEY</code> environment variable", "Paste the key into a lesson cell to test quickly", "Add <code>.env</code> to <code>.gitignore</code> before creating the file", "Commit the key, then delete it in the next commit", "Revoke a key as soon as you suspect it leaked"], "answer": [0, 2, 4],
+         "explanation": "<p>Keys live in the environment, never in code or cells. A deleted line stays in git history, so a committed key must be revoked.</p>"},
+        {"type": "text", "prompt": "Which environment variable does <code>anthropic.Anthropic()</code> read the API key from?", "answer": ["ANTHROPIC_API_KEY"],
+         "explanation": "<p><code>ANTHROPIC_API_KEY</code>. A profile created with <code>ant auth login</code> also works. Either way, the key never appears in your code.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\nprint(al.format_transcript([{\"role\": \"user\", \"content\": \"Hi\"}]))", "answer": "user: Hi",
+         "explanation": "<p><code>format_transcript</code> prints one line per block as <code>role: content</code>. String content becomes a single line.</p>"},
+        {"type": "text", "prompt": "Which Pixi command installs the <code>anthropic</code> package into the current workspace?", "answer": ["pixi add anthropic"],
+         "explanation": "<p><code>pixi add anthropic</code> installs it from conda-forge and records it in <code>pixi.toml</code> and <code>pixi.lock</code>. Then run code with <code>pixi run python file.py</code>.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>An agent is a model in a loop with tools. The model asks; your program runs tools and reports back.</li>
+      <li>The course has eight stages in four levels. Level 1 (orientation, Stages 1-2, Capstone 1) is available now.</li>
+      <li>Every module: teaching sections with runnable cells, graded exercises, a mini-project, a quiz, and flashcards.</li>
+      <li><code>al.MockClient(script)</code> mirrors <code>anthropic.Anthropic()</code>; each request consumes one script step.</li>
+      <li>The mock raises the SDK's error classes for bad requests; <code>MockScriptError</code> means the script is wrong.</li>
+      <li>Switching to the real API changes one line. Keep the key in the environment, never in code or commits.</li>
+      <li>Pixi installs and runs everything: <code>pixi init</code>, <code>pixi add</code>, <code>pixi run</code>.</li>
+      <li><code>al.format_transcript(messages, response)</code> shows a run one block per line. Read it first when debugging.</li>
+    </ul>
+    <div class="flashcards" data-title="Orientation">
+      <script type="application/json">
+      [{"front": "What is an agent?", "back": "A language model running in a loop, with tools your program executes when the model asks."},
+       {"front": "Who executes a tool call?", "back": "Your program. The model only writes a structured request for it."},
+       {"front": "The three required arguments of <code>messages.create</code>", "back": "<code>model</code>, <code>max_tokens</code>, <code>messages</code>."},
+       {"front": "What does a <code>MockClient</code> script hold?", "back": "Responses returned in order, one per <code>messages.create</code> call."},
+       {"front": "<code>MockScriptError</code> means…", "back": "The script is used up or wrong: an exercise bug, not an API error."},
+       {"front": "Mock to real: what changes?", "back": "Only <code>client = anthropic.Anthropic()</code>. Avoid the mock-only <code>response.text</code>."},
+       {"front": "Where does the API key live?", "back": "In the environment (<code>ANTHROPIC_API_KEY</code>) or an <code>ant auth login</code> profile. Never in code."},
+       {"front": "A key reached a commit. First step?", "back": "Revoke it. History, clones, and forks keep the old commit."},
+       {"front": "Install a package / run a script with Pixi", "back": "<code>pixi add anthropic</code> / <code>pixi run python file.py</code>"},
+       {"front": "First debugging step for an agent", "back": "Print the transcript with <code>al.format_transcript</code> and read it line by line."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/get-started">Claude API: Get started</a></li>
+      <li><a href="https://platform.claude.com/docs/en/api/client-sdks">Claude API: Client SDKs</a></li>
+      <li><a href="https://pixi.sh">Pixi documentation</a></li>
+      <li><a href="https://docs.python.org/3.14/library/os.html#os.environ">Python: <code>os.environ</code> and environment variables</a></li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> and <a href="../reference/glossary.html">glossary</a></li>
+      <li>Next: <a href="m01-llm-calls.html">M01 What an LLM Call Is</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

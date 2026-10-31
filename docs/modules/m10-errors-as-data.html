@@ -1,0 +1,1384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M10 · Errors as Data · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m10">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Module 10</p>
+    <h1>Errors as Data</h1>
+    <p class="lede">The loop you wrote in M09 works when nothing goes wrong. Real tools fail, the model sometimes
+      sends bad arguments, and the API itself returns errors. This module shows how to turn each failure into
+      something the agent can read and recover from, and how to tell the errors you retry from the errors you fix.</p>
+    <div class="lesson-meta"><span>⏱ ~1.5 hours</span><span>Prerequisites: <a href="m09-agent-loop.html">M09 The Agent Loop</a></span></div>
+    <ul class="objectives">
+      <li>Wrap tool execution so any exception becomes a <code>tool_result</code> with <code>"is_error": True</code> instead of a crash</li>
+      <li>Write error messages that tell the model what went wrong and what to do next</li>
+      <li>Validate tool input against its schema with <code>al.validate</code> before running the tool</li>
+      <li>Handle unknown tool names and slow tools without breaking the tool_use/tool_result pairing</li>
+      <li>Classify API errors into "fix the request" (400, 401, 404) and "retry later" (429, 5xx, connection)</li>
+      <li>Write a retry helper with exponential backoff that only retries retryable errors and is testable without sleeping</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="where-things-fail">
+    <h2>Three places an agent fails</h2>
+    <p>In M09 you built <code>run_agent(client, task, tools, registry, max_steps)</code>: call
+      <code>client.messages.create</code>, append <code>response.content</code> as the assistant turn, run each
+      <code>tool_use</code> block with <code>registry[name](**input)</code>, send every <code>tool_result</code> back
+      in one user message, and repeat until <code>stop_reason</code> is not <code>"tool_use"</code>. That loop has
+      three places where something can go wrong, and each needs a different response.</p>
+    <ol>
+      <li><strong>The tool fails.</strong> Your Python function raises: a file is missing, a city is unknown, an
+        HTTP call times out, a bug divides by zero. This is <em>your</em> code failing.</li>
+      <li><strong>The model asks for something invalid.</strong> It calls a tool that does not exist, or passes
+        arguments that break the schema (a string where you wanted an integer, a missing required field, a value
+        out of range). Your code has not run yet; the <em>request</em> for it is bad.</li>
+      <li><strong>The API call fails.</strong> <code>messages.create</code> itself raises: your request was
+        malformed, your key is wrong, you hit a rate limit, or the service had a transient problem. No model output
+        exists at all.</li>
+    </ol>
+    <p>The first two have the same answer: <strong>report the failure back to the model as data</strong>. The model
+      is good at reading an error and trying something else, but only if it sees the error. The third has two
+      answers depending on the kind of error: some you <em>retry</em>, some you must <em>fix</em>, because sending
+      the same request again can only fail the same way.</p>
+    <pre class="mermaid">flowchart TD
+  F[Something failed] --> Q{Where?}
+  Q -->|tool raised| T[Catch it. Send tool_result with is_error true and a helpful message]
+  Q -->|bad tool name or input| V[Do not run anything. Send tool_result with is_error true listing the problems]
+  Q -->|messages.create raised| A{Which error?}
+  A -->|400 / 401 / 404| X[Fix the request or config. Do not retry]
+  A -->|429 / 5xx / connection| R[Wait and retry with backoff]
+  T --> M[The model reads the error and adapts]
+  V --> M</pre>
+    <p>Here is what happens without any of this. The model asks to divide by zero, the tool raises, and the whole
+      program stops. The conversation is gone, and the model never learns what happened.</p>
+    <div class="runnable" data-title="An unguarded loop crashes">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "divide",
+    "description": "Divide a by b and return the quotient.",
+    "input_schema": {"type": "object",
+                     "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                     "required": ["a", "b"]},
+}]
+
+def divide(a, b):
+    return a / b
+
+registry = {"divide": divide}
+client = al.MockClient([al.tool_call("divide", {"a": 10, "b": 0})])
+
+messages = [{"role": "user", "content": "What is 10 divided by 0?"}]
+try:
+    while True:
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            print(response.text)
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = registry[block.name](**block.input)      # raises ZeroDivisionError
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        messages.append({"role": "user", "content": results})
+except ZeroDivisionError as exc:
+    print("The whole agent crashed:", type(exc).__name__, "-", exc)
+    print("Requests made:", len(client.requests))
+    print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <p>Notice the last line of the transcript: an assistant <code>tool_use</code> with no answer. If you tried to
+      continue this conversation, the API would reject it, because every <code>tool_use</code> must be answered by
+      a <code>tool_result</code> in the next message (M08 showed that exact <code>BadRequestError</code>).</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> tool failures and bad tool requests go back to the model
+      as data. API failures are either retried or fixed. A loop that lets any of them escape as an exception ends
+      the run and loses the conversation.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="is-error">
+    <h2>The <code>is_error</code> tool result</h2>
+    <p>A <code>tool_result</code> block has an optional field, <code>"is_error"</code>. Setting it to
+      <code>True</code> tells the model that the call failed and that <code>content</code> describes the failure,
+      not a result. Everything else is the same as a normal result: the same <code>tool_use_id</code>, sent in the
+      same user message as the other results, before any text.</p>
+    <pre><code class="language-python">{
+    "type": "tool_result",
+    "tool_use_id": "toolu_01A...",      # must echo the tool_use block's id
+    "content": "ZeroDivisionError: division by zero",
+    "is_error": True,
+}</code></pre>
+    <p>The pattern is small. Put the call in a <code>try</code> block, and in the <code>except</code> branch build an
+      error result instead of a normal one. Catching the broad <code>Exception</code> is correct here, and rare
+      elsewhere: this is a <strong>boundary</strong>, the line between your tools and the loop, and the loop's job is
+      to keep going no matter what a tool does. You are not hiding the error; you are routing it to the one reader
+      that can act on it.</p>
+    <p>Step through the visualizer to see the shape of a recovery: the tool fails, the error result goes into the
+      message list in red, and the model's next request corrects itself.</p>
+    <div class="viz" data-viz="agent-loop" data-config='{"scenario": "error"}'></div>
+    <p>Now the same divide-by-zero task with the boundary in place. The scripted model is a function step: it reads
+      <code>request.tool_results</code> and answers differently when it sees <code>is_error</code>, which is how a
+      real model behaves too.</p>
+    <div class="runnable" data-title="Errors become results">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "divide",
+    "description": "Divide a by b and return the quotient.",
+    "input_schema": {"type": "object",
+                     "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                     "required": ["a", "b"]},
+}]
+
+def divide(a, b):
+    return a / b
+
+registry = {"divide": divide}
+
+def model_reads_result(request):
+    result = request.tool_results[0]
+    if result.get("is_error"):
+        return "10 divided by 0 is undefined: you cannot divide by zero. Did you mean a different divisor?"
+    return f"The answer is {result['content']}."
+
+client = al.MockClient([al.tool_call("divide", {"a": 10, "b": 0}), model_reads_result])
+
+def execute(block):
+    try:
+        output = registry[block.name](**block.input)
+    except Exception as exc:
+        return {"type": "tool_result", "tool_use_id": block.id,
+                "content": f"{type(exc).__name__}: {exc}", "is_error": True}
+    return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}
+
+messages = [{"role": "user", "content": "What is 10 divided by 0?"}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    results = [execute(b) for b in response.content if b.type == "tool_use"]
+    messages.append({"role": "user", "content": results})
+
+print(al.format_transcript(messages))
+print("Requests made:", len(client.requests))
+</textarea>
+    </div>
+    <p>Change <code>"b": 0</code> to <code>"b": 4</code> in the script and run again: the same function now takes
+      the success branch. The loop did not change at all; only the data did.</p>
+    <aside class="callout warn" data-title="Common mistakes">
+      <ul>
+        <li><strong>Dropping the failed call.</strong> Skipping a <code>tool_use</code> because its tool raised leaves
+          it unanswered, and the next request fails with <code>BadRequestError</code>. Every call gets a result.</li>
+        <li><strong>Sending the error as plain text.</strong> A user text block saying "the tool failed" does not
+          answer the <code>tool_use</code> id. Use a <code>tool_result</code> with <code>is_error</code>.</li>
+        <li><strong>Catching <code>BaseException</code> or using bare <code>except:</code>.</strong> That also swallows
+          <code>KeyboardInterrupt</code> and <code>SystemExit</code>. Catch <code>Exception</code>.</li>
+        <li><strong>Hiding it from yourself.</strong> The model sees the error; you should too. In real code, log every
+          error result (the mini-project uses structlog for this).</li>
+      </ul>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> wrap each tool call in <code>try</code>/<code>except
+      Exception</code>, and on failure return a <code>tool_result</code> with the same <code>tool_use_id</code>,
+      <code>"is_error": True</code>, and a message as its <code>content</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="actionable-messages">
+    <h2>Error messages the model can act on</h2>
+    <p>The model only knows what the error message says. <code>"error"</code> tells it nothing.
+      <code>"KeyError: 'pariss'"</code> tells it a little. A good message answers three questions:</p>
+    <ol>
+      <li><strong>What failed?</strong> Name the tool and the input that caused it.</li>
+      <li><strong>Why?</strong> In words, not a stack trace.</li>
+      <li><strong>What next?</strong> Valid values, a suggestion, or "do not retry this".</li>
+    </ol>
+    <table>
+      <thead><tr><th>Weak message</th><th>Actionable message</th></tr></thead>
+      <tbody>
+        <tr><td><code>KeyError: 'pariss'</code></td><td><code>Unknown city 'Pariss'. Did you mean 'Paris'? Known cities: Paris, Lisbon, Oslo.</code></td></tr>
+        <tr><td><code>FileNotFoundError</code></td><td><code>No file 'notes/2024.md'. Use list_files to see what exists in notes/.</code></td></tr>
+        <tr><td><code>Traceback (most recent call last): ...</code> (40 lines)</td><td><code>search failed unexpectedly (TimeoutError: upstream took too long). Try a shorter query.</code></td></tr>
+        <tr><td><code>invalid</code></td><td><code>Invalid input for get_forecast: $.days: value 14 is above maximum 7.</code></td></tr>
+      </tbody>
+    </table>
+    <p>A useful way to organize this is to separate <strong>expected</strong> failures from <strong>unexpected</strong>
+      ones. Expected failures are part of the tool's contract: an unknown city, a missing file, an empty search.
+      Raise a dedicated exception class for them, and write the message for the model. Unexpected failures are bugs
+      or outages; you did not write a message for them, so report the exception type and text, and say not to repeat
+      the same call.</p>
+    <div class="runnable" data-title="Expected versus unexpected failures">
+<textarea>
+class ToolError(Exception):
+    """An expected failure whose message is written for the model."""
+
+CITIES = {"paris": "18°C, light rain", "lisbon": "21°C, sunny", "oslo": "4°C, cloudy"}
+
+def get_weather(city):
+    key = city.strip().lower()
+    if key not in CITIES:
+        close = [c.title() for c in CITIES if c[:3] == key[:3]]
+        hint = f" Did you mean {close[0]!r}?" if close else ""
+        raise ToolError(f"Unknown city {city!r}.{hint} Known cities: {', '.join(c.title() for c in CITIES)}.")
+    return CITIES[key]
+
+def error_text(name, exc):
+    if isinstance(exc, ToolError):
+        return str(exc)                                   # written for the model: pass it through
+    return f"{name} failed unexpectedly ({type(exc).__name__}: {exc}). Do not retry with the same input."
+
+for call in [lambda: get_weather("Pariss"), lambda: get_weather("Tokyo"), lambda: get_weather(None)]:
+    try:
+        print("ok:", call())
+    except Exception as exc:
+        print("error:", error_text("get_weather", exc))
+</textarea>
+    </div>
+    <p>The third call is a bug (the tool should have rejected <code>None</code> earlier; the next section shows how).
+      Even so, the model gets one readable line instead of a traceback.</p>
+    <aside class="callout danger" data-title="What not to put in an error message">
+      <p>Tool results go to the model and are stored in the conversation, which may be logged or shown to users.
+        Never include secrets, API keys, connection strings, full file system paths you would not show a user, or raw
+        stack traces. Log those details on your side, and give the model a short summary.</p>
+    </aside>
+    <aside class="callout think"><p>A tool returns an empty list for a search with no matches. Is that an error?
+      Usually not: "0 results for 'atlantis census'" is a valid answer, and marking it <code>is_error</code> would
+      suggest the tool is broken. Reserve <code>is_error</code> for calls that could not do their job.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> say what failed, why, and what to do next. Raise a
+      <code>ToolError</code> with a model-ready message for expected failures; summarize unexpected ones by type and
+      text. Keep secrets and stack traces out.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="validate-input">
+    <h2>Validate tool input before you run it</h2>
+    <p>In M07 you wrote an <code>input_schema</code> for each tool. Without <code>"strict": True</code>, the schema is
+      guidance: the model usually follows it, but nothing guarantees that the input matches. With
+      <code>strict</code>, the API guarantees schema-valid input, but your registry may also be called from tests,
+      other code, or a future tool definition that forgot the flag. Checking input at the boundary costs one function
+      call and turns a confusing crash deep inside a tool into a precise message.</p>
+    <p><code>al.validate(value, schema)</code> is a small JSON Schema validator. It returns a list of problems, one
+      string per problem, and an empty list when the value is valid. Each problem names its location with a path:
+      <code>$</code> is the whole input, <code>$.days</code> is its <code>days</code> field. Predict the output before
+      running.</p>
+    <div class="runnable" data-title="Predict: what does al.validate report?" data-predict>
+<textarea>
+import agentlab as al
+
+schema = {
+    "type": "object",
+    "properties": {
+        "city": {"type": "string", "minLength": 1},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7},
+    },
+    "required": ["city"],
+    "additionalProperties": False,
+}
+
+print(al.validate({"city": "Paris", "days": 3}, schema))
+print(al.validate({"city": 42}, schema))
+print(al.validate({"days": 10, "units": "F"}, schema))
+</textarea>
+    </div>
+    <p>Those problem strings are already good error messages. Join them, add the tool name and a short instruction,
+      and send them back as an error result. Crucially, <strong>do not run the tool</strong> when validation fails.
+      A tool that receives bad input might do something partial or wrong before it raises.</p>
+    <div class="runnable" data-title="Reject bad input, let the model correct it">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "get_forecast",
+    "description": "Daily forecast for a city, 1 to 7 days ahead.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string", "minLength": 1},
+                       "days": {"type": "integer", "minimum": 1, "maximum": 7}},
+        "required": ["city", "days"],
+        "additionalProperties": False,
+    },
+}]
+SCHEMAS = {t["name"]: t["input_schema"] for t in TOOLS}
+
+def get_forecast(city, days):
+    return f"{city}: sunny for the next {days} days"
+
+registry = {"get_forecast": get_forecast}
+
+def execute(block):
+    problems = al.validate(block.input, SCHEMAS[block.name])
+    if problems:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"Invalid input for {block.name}: " + "; ".join(problems)
+                           + ". Fix these fields and call again."}
+    return {"type": "tool_result", "tool_use_id": block.id, "content": registry[block.name](**block.input)}
+
+client = al.MockClient([
+    al.tool_call("get_forecast", {"city": "Rome", "days": 14}),
+    al.tool_call("get_forecast", {"city": "Rome", "days": 7}),
+    "Rome looks sunny all week (I can only see 7 days ahead).",
+])
+messages = [{"role": "user", "content": "Two-week forecast for Rome?"}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    messages.append({"role": "user", "content": [execute(b) for b in response.content if b.type == "tool_use"]})
+print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <p>Build the schema lookup once from the same <code>TOOLS</code> list you send to the API, as
+      <code>SCHEMAS</code> does here. Then the schema the model sees and the schema you enforce can never drift
+      apart.</p>
+    <aside class="callout note" data-title="Validation is not the whole story">
+      <p>A schema checks shape: types, required fields, ranges. It cannot check meaning, such as whether a file path
+        stays inside the folder you allow, or whether a customer id belongs to the current user. Those checks live in
+        the tool itself and raise <code>ToolError</code> with a clear message. Later stages return to this when they
+        cover permissions and safety.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> call <code>al.validate(block.input, schema)</code> before
+      the tool. If the list is not empty, return an error result built from the problems and skip the call. Derive
+      the schemas from the same tool list you send.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="unknown-tools">
+    <h2>Unknown tools and the pairing rule</h2>
+    <p>The model only calls tools you offered, so an unknown name should be rare. It still happens in practice:
+      your registry and your tool list drift apart after a rename, a tool is offered but its function was never
+      registered, or a test script calls a name you removed. <code>registry[block.name]</code> then raises
+      <code>KeyError</code> outside any <code>try</code> block you wrote for the tool body. Look the name up with
+      <code>registry.get(...)</code> first and answer a missing one with an error result that lists what does exist.</p>
+    <div class="runnable" data-title="One good call, one unknown tool, in parallel">
+<textarea>
+import agentlab as al
+
+TOOLS = [
+    {"name": "get_weather", "description": "Current weather for a city.",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+    {"name": "get_time", "description": "Local time in a city.",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+]
+registry = {"get_weather": lambda city: "18°C, light rain", "get_time": lambda city: "14:05"}
+
+def execute(block):
+    func = registry.get(block.name)
+    if func is None:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"Unknown tool {block.name!r}. Available tools: {', '.join(sorted(registry))}."}
+    return {"type": "tool_result", "tool_use_id": block.id, "content": func(**block.input)}
+
+client = al.MockClient([
+    al.tool_calls([("get_weather", {"city": "Paris"}), ("get_forecast", {"city": "Paris"})]),
+    "Right now it's 18°C with light rain in Paris. I don't have a forecast tool, so I can't say what tomorrow brings.",
+])
+messages = [{"role": "user", "content": "Weather in Paris now and tomorrow?"}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    messages.append({"role": "user", "content": [execute(b) for b in response.content if b.type == "tool_use"]})
+print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <p>Both calls got a result in the same user message: one success, one error. That is the <strong>pairing
+      rule</strong> from M08 and M09, and failures do not change it. Here is what happens when code skips the failed
+      call instead:</p>
+    <div class="runnable" data-title="Skipping a failed call breaks the next request">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+client = al.MockClient([al.tool_calls([("get_weather", {"city": "Paris"}), ("get_weather", {"city": "Rome"})])])
+
+messages = [{"role": "user", "content": "Weather in Paris and Rome?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+messages.append({"role": "assistant", "content": response.content})
+
+# Paris worked; Rome raised, and this code quietly skipped it.
+paris = response.content[0]
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": paris.id, "content": "18°C, light rain"},
+]})
+try:
+    client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+except al.BadRequestError as exc:
+    print("BadRequestError", exc.status_code)
+    print(exc.message)
+</textarea>
+    </div>
+    <p>The order of checks inside one <code>execute_tool</code> function is worth fixing in your head, because each
+      check protects the next:</p>
+    <ol>
+      <li><strong>Known tool?</strong> If not, error result listing available tools.</li>
+      <li><strong>Valid input?</strong> If not, error result listing the problems.</li>
+      <li><strong>Run it</strong> inside <code>try</code>. <code>ToolError</code> passes its message through; any other
+        exception becomes "failed unexpectedly".</li>
+      <li><strong>Success:</strong> a normal result with <code>str(output)</code> (or JSON) as content.</li>
+    </ol>
+    <aside class="callout tip"><p><strong>Remember:</strong> look tools up with <code>registry.get</code>, answer
+      unknown names with the list of real ones, and give every <code>tool_use</code> exactly one result, success or
+      failure, in the same user message.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="slow-tools">
+    <h2>Slow tools and timeouts</h2>
+    <p>A tool that never returns is worse than one that fails: the loop waits forever and the user sees nothing. A
+      <strong>timeout</strong> is a limit on how long an operation may take before you give up on it. Your agent
+      needs one wherever a tool waits on something outside your process: a network call, a database query, a
+      subprocess, a long scan.</p>
+    <p>Most of the time you do not need threads for this. You set limits where the waiting happens:</p>
+    <ul>
+      <li><strong>Pass a timeout to the library that does I/O.</strong> HTTP clients, database drivers and
+        <code>subprocess.run</code> all accept a timeout argument. When it expires they raise, and your boundary
+        turns that into an error result.</li>
+      <li><strong>Check a deadline inside long loops.</strong> If a tool pages through results, compute
+        <code>deadline = time.monotonic() + limit</code> before the loop and stop when you pass it.
+        <code>time.monotonic()</code> is a clock that only moves forward, which makes it right for measuring
+        durations (wall-clock time can jump when the system clock is adjusted).</li>
+      <li><strong>Return what you have.</strong> A timeout message that includes partial results and a suggestion
+        ("narrow the query") lets the model make progress instead of starting over.</li>
+    </ul>
+    <p>The cell below uses a fake clock, a callable that returns a number you control, so the example runs instantly
+      and gives the same answer every time. Injecting the clock as a parameter (<code>now=</code>) is the same trick
+      you will use for <code>sleep</code> in the retry helper.</p>
+    <div class="runnable" data-title="A deadline inside a paging tool">
+<textarea>
+class ToolError(Exception):
+    """An expected failure whose message is written for the model."""
+
+class FakeClock:
+    """Stands in for time.monotonic so the cell runs instantly."""
+    def __init__(self):
+        self.now = 0.0
+    def __call__(self):
+        return self.now
+
+clock = FakeClock()
+PAGES = [["a.txt", "b.txt"], ["c.txt"], ["d.txt", "e.txt"], ["f.txt"]]
+
+def fetch_page(number):
+    clock.now += 4.0                     # pretend each page takes 4 seconds to fetch
+    return PAGES[number]
+
+def list_files(query, *, time_limit=10.0, now=clock):
+    deadline = now() + time_limit
+    found = []
+    for number in range(len(PAGES)):
+        if now() >= deadline:
+            raise ToolError(
+                f"list_files timed out after {time_limit:.0f}s with {len(found)} partial results "
+                f"({', '.join(found)}). Narrow the query or ask for fewer files."
+            )
+        found.extend(fetch_page(number))
+    return found
+
+try:
+    print(list_files("*.txt"))
+except ToolError as exc:
+    print("error:", exc)
+</textarea>
+    </div>
+    <p>Change <code>time_limit=10.0</code> to <code>20.0</code> and the tool finishes all four pages. In real code
+      the default for <code>now</code> would be <code>time.monotonic</code>.</p>
+    <aside class="callout note" data-title="Timeouts on the API call itself">
+      <p>The model call can also be slow. A request that never gets an answer surfaces as a connection error
+        (<code>APIConnectionError</code>), which is retryable; the next sections cover it. Long generations are a
+        separate topic: M04 explained why streaming keeps long outputs from timing out.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> every tool that waits on the outside world needs a limit.
+      Use the library's timeout argument or a <code>time.monotonic()</code> deadline, and report a timeout as an
+      error result with partial results and a next step.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="api-errors">
+    <h2>API errors: fix or retry</h2>
+    <p>So far every failure happened <em>after</em> the model answered. Now look at the call to
+      <code>messages.create</code> itself. When it fails there is no response, no content, and nothing to send back
+      to the model. Your code has to decide what to do, and the decision depends on the HTTP status code the API
+      returned. The SDK raises a different exception class for each, and <code>agentlab</code> uses the same names.</p>
+    <table>
+      <thead><tr><th>Exception</th><th>Status</th><th>Meaning</th><th>What to do</th></tr></thead>
+      <tbody>
+        <tr><td><code>BadRequestError</code></td><td>400</td><td>The request is malformed: bad message order, unanswered <code>tool_use</code>, a rejected parameter like <code>temperature</code></td><td><strong>Fix the code.</strong> Never retry.</td></tr>
+        <tr><td><code>AuthenticationError</code></td><td>401</td><td>Missing or invalid API key</td><td><strong>Fix the configuration.</strong> Never retry.</td></tr>
+        <tr><td><code>NotFoundError</code></td><td>404</td><td>Unknown model id or endpoint</td><td><strong>Fix the model id.</strong> Never retry.</td></tr>
+        <tr><td><code>RateLimitError</code></td><td>429</td><td>Too many requests or tokens per minute</td><td><strong>Wait, then retry.</strong> Honor the server's wait hint.</td></tr>
+        <tr><td><code>InternalServerError</code></td><td>500+</td><td>A transient failure on the server</td><td><strong>Retry with backoff.</strong></td></tr>
+        <tr><td><code>OverloadedError</code></td><td>529</td><td>The API is temporarily overloaded</td><td><strong>Retry with backoff.</strong></td></tr>
+        <tr><td><code>APIConnectionError</code></td><td>none</td><td>The request never got an answer: network failure or timeout</td><td><strong>Retry with backoff.</strong></td></tr>
+      </tbody>
+    </table>
+    <p>The rule underneath the table: <strong>retry when the same request could succeed later; fix when it
+      cannot</strong>. A 429 or 500 is about the moment, not the request. A 400 is about the request: the mock (like
+      the API) checked it and found it wrong, and it will find it wrong again on every attempt. Retrying a 400 only
+      wastes time and hides the bug.</p>
+    <p>In the mock, script an API failure with <code>al.fail(error)</code>. The step raises that exception instead
+      of answering, and is consumed like any other step. The cell prints each error class with its status code, then
+      shows a scripted rate limit followed by a success.</p>
+    <div class="runnable" data-title="API errors in agentlab">
+<textarea>
+import agentlab as al
+
+errors = [
+    al.BadRequestError("messages.0.role: the first message must use the 'user' role"),
+    al.AuthenticationError("invalid x-api-key"),
+    al.NotFoundError("model: gpt-claude"),
+    al.RateLimitError(retry_after=2.0),
+    al.InternalServerError("internal server error"),
+    al.OverloadedError("overloaded"),
+    al.APIConnectionError("connection reset by peer"),
+]
+for exc in errors:
+    status = getattr(exc, "status_code", "-")
+    print(f"{type(exc).__name__:22} status={status!s:4} {exc.message}")
+
+client = al.MockClient([al.fail(al.RateLimitError(retry_after=2.0)), "Hello again."])
+messages = [{"role": "user", "content": "Hi"}]
+try:
+    client.messages.create(model=al.MODEL, max_tokens=256, messages=messages)
+except al.RateLimitError as exc:
+    print("first call failed; server asks us to wait", exc.retry_after, "seconds")
+response = client.messages.create(model=al.MODEL, max_tokens=256, messages=messages)
+print("second call:", response.text)
+</textarea>
+    </div>
+    <p>The class hierarchy helps you write the check. Every error derives from <code>APIError</code>. Errors with a
+      status code derive from <code>APIStatusError</code> and carry <code>status_code</code>.
+      <code>APIConnectionError</code> has no status code because no response arrived. So "is this retryable?" becomes:
+      a connection error, or a status error whose code is 408 (request timeout), 409 (conflict), 429, or 500 and above.
+      That is the same set the real SDK retries automatically.</p>
+    <aside class="callout note" data-title="The real SDK already retries">
+      <p>The <code>anthropic</code> client retries 408, 409, 429 and 5xx errors twice by default, with backoff, before
+        raising. You can change that with <code>max_retries</code>:</p>
+      <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic(max_retries=5)       # more patience for a batch job
+client = anthropic.Anthropic(max_retries=0)       # you handle retries yourself
+
+try:
+    response = client.messages.create(model="claude-opus-5-5", max_tokens=1024, messages=messages)
+except anthropic.RateLimitError:
+    ...                                           # still limited after the SDK's own retries
+except anthropic.BadRequestError as exc:
+    raise                                         # a bug in the request: fix it</code></pre>
+      <p>Pick one layer to own retries. If the SDK retries twice and your helper retries four times around it, one
+        logical call can become twelve HTTP requests. Writing the helper yourself is still worth it: it is how you
+        learn what the SDK hides, it works with the mock, and it lets you add policies the SDK does not know about,
+        such as logging each retry or giving up when a run's budget (M11) is spent.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> 400, 401 and 404 mean fix something; never retry them.
+      429, 5xx, 529 and connection errors are transient; retry them after a delay. <code>al.fail(...)</code> scripts
+      any of them in the mock.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="retry-backoff">
+    <h2>Retry with exponential backoff</h2>
+    <p>"Retry after a delay" leaves two questions: how long, and how many times. <strong>Exponential
+      backoff</strong> answers the first: wait a base delay after the first failure, then double it after each
+      further failure (1 s, 2 s, 4 s, 8 s...), up to a cap. Doubling backs off quickly from a service that is
+      struggling, so thousands of clients do not hammer it at once, while still retrying fast after a one-off blip. A
+      <strong>maximum attempt count</strong> answers the second: after that many tries, give up and raise the last
+      error so the caller knows.</p>
+    <p>A rate limit adds one detail. The server may say how long to wait (in the mock,
+      <code>RateLimitError.retry_after</code>, in seconds). Waiting less than that is pointless, so use the larger of
+      the backoff delay and the server's hint.</p>
+    <p>The last design decision makes the helper testable: <strong>inject the sleep function</strong>. The helper takes
+      <code>sleep=time.sleep</code> as a keyword argument. Production code uses the default. Tests pass
+      <code>waits.append</code>, which records each requested delay and returns immediately, so a test of four retries
+      takes microseconds and can assert the exact delays.</p>
+    <div class="runnable" data-title="call_with_retry with an injected sleep">
+<textarea>
+import time
+import agentlab as al
+
+def is_retryable(exc):
+    if isinstance(exc, al.APIConnectionError):
+        return True
+    if isinstance(exc, al.APIStatusError):
+        return exc.status_code in (408, 409, 429) or exc.status_code >= 500
+    return False
+
+def call_with_retry(make_request, *, max_attempts=4, base_delay=1.0, max_delay=30.0, sleep=time.sleep):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return make_request()
+        except al.APIError as exc:
+            if not is_retryable(exc) or attempt == max_attempts:
+                raise
+            delay = min(base_delay * 2 ** (attempt - 1), max_delay)
+            if isinstance(exc, al.RateLimitError):
+                delay = max(delay, exc.retry_after)
+            print(f"attempt {attempt} failed with {type(exc).__name__}; waiting {delay}s")
+            sleep(delay)
+
+waits = []
+client = al.MockClient([
+    al.fail(al.OverloadedError("overloaded")),
+    al.fail(al.InternalServerError("internal server error")),
+    al.fail(al.RateLimitError(retry_after=5.0)),
+    "Finally, an answer.",
+])
+messages = [{"role": "user", "content": "Hi"}]
+response = call_with_retry(
+    lambda: client.messages.create(model=al.MODEL, max_tokens=256, messages=messages),
+    sleep=waits.append,
+)
+print(response.text)
+print("waited:", waits, "requests:", len(client.requests))
+</textarea>
+    </div>
+    <p>Read the delays: 1 s and 2 s from doubling, then 5 s because the rate limit's hint (5) beat the backoff (4).
+      Four scripted steps, four requests. The helper takes a <em>function</em> (<code>make_request</code>), not a
+      response, because it has to be able to make the call again. A <code>lambda</code> with no arguments is the
+      usual way to package "this exact call".</p>
+    <p>Now the error that must not be retried. The request below passes <code>temperature</code>, which the API (and
+      the mock) rejects with a 400. The helper raises on the first attempt.</p>
+    <div class="runnable" data-title="BadRequestError is raised at once">
+<textarea>
+import time
+import agentlab as al
+
+def is_retryable(exc):
+    if isinstance(exc, al.APIConnectionError):
+        return True
+    if isinstance(exc, al.APIStatusError):
+        return exc.status_code in (408, 409, 429) or exc.status_code >= 500
+    return False
+
+def call_with_retry(make_request, *, max_attempts=4, base_delay=1.0, max_delay=30.0, sleep=time.sleep):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return make_request()
+        except al.APIError as exc:
+            if not is_retryable(exc) or attempt == max_attempts:
+                raise
+            delay = min(base_delay * 2 ** (attempt - 1), max_delay)
+            if isinstance(exc, al.RateLimitError):
+                delay = max(delay, exc.retry_after)
+            sleep(delay)
+
+attempts = []
+client = al.MockClient(["never reached"])
+
+def bad_request():
+    attempts.append(1)
+    return client.messages.create(model=al.MODEL, max_tokens=256, temperature=0.2,
+                                  messages=[{"role": "user", "content": "Hi"}])
+
+try:
+    call_with_retry(bad_request, sleep=lambda s: None)
+except al.BadRequestError as exc:
+    print("BadRequestError after", len(attempts), "attempt:", exc.message)
+</textarea>
+    </div>
+    <aside class="callout pro" data-title="Jitter">
+      <p>Production retry code usually adds <strong>jitter</strong>: a random amount added to or taken from each delay,
+        such as <code>delay * random.uniform(0.5, 1.0)</code>. If a thousand clients all failed at the same instant,
+        pure doubling makes them all retry at the same instants too; jitter spreads them out. The lesson code leaves it
+        out so the delays are exact and testable. If you add it, inject the random source as well.</p>
+    </aside>
+    <aside class="callout warn" data-title="Retry the request, not the turn">
+      <p>Wrap only the <code>messages.create</code> call. Do not append anything to <code>messages</code> until the call
+        succeeds. Then a retry sends exactly the same request, and a failure leaves the history valid. Never wrap tool
+        execution in the API retry helper: a tool that sends an email should not run four times because the model call
+        after it hit a 529.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> backoff = base × 2<sup>attempt−1</sup>, capped; take the
+      larger of that and a rate limit's hint; stop after <code>max_attempts</code> and re-raise; raise non-retryable
+      errors immediately; inject <code>sleep</code> so tests never wait.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="putting-it-together">
+    <h2>Putting it together: a loop that survives</h2>
+    <p>Here is the M09 loop with both layers added. <code>execute_tool</code> is the boundary around tools: unknown
+      name, invalid input, expected failure, unexpected failure, success. <code>call_with_retry</code> is the boundary
+      around the API. The scripted run reproduces the visualizer's scenario and adds a rate limit in the middle: the
+      model misspells a city, gets an error result, the next API call hits a 429 and is retried, and the model
+      corrects itself.</p>
+    <div class="runnable" data-title="A robust run_agent">
+<textarea>
+import time
+import agentlab as al
+
+class ToolError(Exception):
+    """An expected failure whose message is written for the model."""
+
+CITIES = {"paris": "18°C, light rain", "lisbon": "21°C, sunny"}
+
+def get_weather(city):
+    if city.lower() not in CITIES:
+        raise ToolError(f"Unknown city {city!r}. Known cities: Paris, Lisbon. Check the spelling and call again.")
+    return CITIES[city.lower()]
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string", "minLength": 1}},
+                           "required": ["city"], "additionalProperties": False}}]
+
+def is_retryable(exc):
+    if isinstance(exc, al.APIConnectionError):
+        return True
+    if isinstance(exc, al.APIStatusError):
+        return exc.status_code in (408, 409, 429) or exc.status_code >= 500
+    return False
+
+def call_with_retry(make_request, *, max_attempts=4, base_delay=1.0, max_delay=30.0, sleep=time.sleep):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return make_request()
+        except al.APIError as exc:
+            if not is_retryable(exc) or attempt == max_attempts:
+                raise
+            delay = min(base_delay * 2 ** (attempt - 1), max_delay)
+            if isinstance(exc, al.RateLimitError):
+                delay = max(delay, exc.retry_after)
+            sleep(delay)
+
+def result(block, content, is_error=False):
+    out = {"type": "tool_result", "tool_use_id": block.id, "content": content}
+    if is_error:
+        out["is_error"] = True
+    return out
+
+def execute_tool(block, registry, schemas):
+    func = registry.get(block.name)
+    if func is None:
+        return result(block, f"Unknown tool {block.name!r}. Available tools: {', '.join(sorted(registry))}.", True)
+    problems = al.validate(block.input, schemas[block.name])
+    if problems:
+        return result(block, f"Invalid input for {block.name}: {'; '.join(problems)}.", True)
+    try:
+        return result(block, str(func(**block.input)))
+    except ToolError as exc:
+        return result(block, str(exc), True)
+    except Exception as exc:
+        return result(block, f"{block.name} failed unexpectedly ({type(exc).__name__}: {exc}).", True)
+
+def run_agent(client, task, tools, registry, max_steps=10, sleep=time.sleep):
+    schemas = {t["name"]: t["input_schema"] for t in tools}
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        response = call_with_retry(
+            lambda: client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages),
+            sleep=sleep,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text, messages
+        results = [execute_tool(b, registry, schemas) for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return None, messages
+
+waits = []
+client = al.MockClient([
+    al.tool_call("get_weather", {"city": "Pariss"}),
+    al.fail(al.RateLimitError(retry_after=2.0)),
+    al.tool_call("get_weather", {"city": "Paris"}),
+    "I assumed you meant Paris: 18°C with light rain.",
+])
+answer, messages = run_agent(client, "Weather in Pariss?", TOOLS, {"get_weather": get_weather}, sleep=waits.append)
+print(al.format_transcript(messages))
+print("answer:", answer)
+print("requests:", len(client.requests), "waits:", waits)
+</textarea>
+    </div>
+    <p>Count the script: four steps for four requests. The failed request is recorded in <code>client.requests</code>
+      too, because the mock validated it before the scripted failure fired. The transcript shows no trace of the 429:
+      retries are invisible to the conversation, which is exactly what you want. Error <em>results</em>, on the other
+      hand, are part of the conversation forever, which is why their wording matters.</p>
+    <aside class="callout think"><p>This loop still returns <code>None</code> when it runs out of steps, and it ignores
+      <code>max_tokens</code> and <code>refusal</code> stop reasons. It also has no idea how much it has spent. Those
+      are stop conditions, and they are the whole of <a href="m11-stop-conditions.html">M11</a>.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> two boundaries make a loop robust:
+      <code>execute_tool</code> around every tool call and <code>call_with_retry</code> around every model call. Errors
+      from the first become conversation; errors from the second are retried or raised.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser against the mock and are graded instantly. Work from top to bottom; later
+      exercises build on earlier ones.</p>
+
+    <div class="exercise" data-id="m10-e1" data-title="Turn exceptions into results">
+      <div class="exercise-prompt">
+        <p>Write <code>execute_tool(block, registry)</code>. <code>block</code> is a tool_use block (with
+          <code>.id</code>, <code>.name</code>, <code>.input</code>); <code>registry</code> maps names to functions. It
+          must <strong>never raise</strong>, and always return a <code>tool_result</code> dict with
+          <code>"type": "tool_result"</code> and <code>"tool_use_id": block.id</code>:</p>
+        <ul>
+          <li>Success: <code>"content"</code> is <code>str(output)</code>, and there is no <code>"is_error"</code> key.</li>
+          <li>The function raises: <code>"is_error": True</code>, and the content contains the exception's class name
+            and its message (for example <code>"ZeroDivisionError: division by zero"</code>).</li>
+          <li>Unknown tool: <code>"is_error": True</code>, and the content contains the unknown name and every
+            available tool name.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def execute_tool(block, registry):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def _reg():
+    return {"divide": lambda a, b: a / b, "echo": lambda text: text}
+
+def test_success():
+    block = al.ToolUseBlock(id="toolu_1", name="divide", input={"a": 9, "b": 3})
+    res = execute_tool(block, _reg())
+    assert isinstance(res, dict), "execute_tool should return a dict"
+    assert res.get("type") == "tool_result", "the dict needs 'type': 'tool_result'"
+    assert res.get("tool_use_id") == "toolu_1", "tool_use_id must echo block.id"
+    assert res.get("content") == "3.0", f"content should be str(output), got {res.get('content')!r}"
+    assert not res.get("is_error", False), "a successful call must not set is_error"
+
+def test_exception_becomes_error():
+    block = al.ToolUseBlock(id="toolu_2", name="divide", input={"a": 1, "b": 0})
+    try:
+        res = execute_tool(block, _reg())
+    except Exception as exc:
+        raise AssertionError(f"execute_tool must not raise, but it raised {type(exc).__name__}") from None
+    assert res.get("is_error") is True, "a failed call needs 'is_error': True"
+    assert res.get("tool_use_id") == "toolu_2", "error results still echo block.id"
+    assert "ZeroDivisionError" in res.get("content", ""), "content should name the exception class"
+    assert "division by zero" in res.get("content", ""), "content should include the exception message"
+
+def test_bad_arguments_become_error():
+    block = al.ToolUseBlock(id="toolu_3", name="echo", input={"txt": "hi"})
+    res = execute_tool(block, _reg())
+    assert res.get("is_error") is True, "a TypeError from wrong argument names is also an error result"
+
+def test_unknown_tool():
+    block = al.ToolUseBlock(id="toolu_4", name="multiply", input={"a": 2, "b": 3})
+    try:
+        res = execute_tool(block, _reg())
+    except Exception as exc:
+        raise AssertionError(f"unknown tools must not raise, got {type(exc).__name__}") from None
+    content = res.get("content", "")
+    assert res.get("is_error") is True, "an unknown tool needs 'is_error': True"
+    assert "multiply" in content, "name the unknown tool in the message"
+    assert "divide" in content and "echo" in content, "list the available tools so the model can pick one"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Use <code>registry.get(block.name)</code> and check for
+        <code>None</code> first. Then wrap <code>func(**block.input)</code> in <code>try</code> /
+        <code>except Exception as exc</code> and build the content with
+        <code>f"{type(exc).__name__}: {exc}"</code>. Unpacking the wrong keyword names raises <code>TypeError</code>
+        inside the <code>try</code>, so it is handled for free.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def execute_tool(block, registry):
+    func = registry.get(block.name)
+    if func is None:
+        available = ", ".join(sorted(registry))
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"Unknown tool {block.name!r}. Available tools: {available}."}
+    try:
+        output = func(**block.input)
+    except Exception as exc:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"{type(exc).__name__}: {exc}"}
+    return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m10-e2" data-title="Validate before you run">
+      <div class="exercise-prompt">
+        <p>Extend <code>execute_tool</code> to <code>execute_tool(block, registry, schemas)</code>, where
+          <code>schemas</code> maps tool names to their <code>input_schema</code>. After the unknown-tool check and
+          before running the tool, validate <code>block.input</code> with <code>al.validate</code>. If there are
+          problems, return an error result whose content starts with <code>"Invalid input for &lt;name&gt;: "</code>
+          and contains every problem string, and <strong>do not call the tool</strong>. Everything from exercise 1
+          still applies.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def execute_tool(block, registry, schemas):
+    func = registry.get(block.name)
+    if func is None:
+        available = ", ".join(sorted(registry))
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"Unknown tool {block.name!r}. Available tools: {available}."}
+    # validate here
+    try:
+        output = func(**block.input)
+    except Exception as exc:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"{type(exc).__name__}: {exc}"}
+    return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+SCHEMA = {"type": "object",
+          "properties": {"city": {"type": "string", "minLength": 1},
+                         "days": {"type": "integer", "minimum": 1, "maximum": 7}},
+          "required": ["city", "days"], "additionalProperties": False}
+
+def _setup():
+    calls = []
+    def get_forecast(city, days):
+        calls.append((city, days))
+        return f"{city}: sunny for {days} days"
+    return calls, {"get_forecast": get_forecast}, {"get_forecast": SCHEMA}
+
+def test_valid_input_runs():
+    calls, reg, schemas = _setup()
+    block = al.ToolUseBlock(id="toolu_1", name="get_forecast", input={"city": "Rome", "days": 3})
+    res = execute_tool(block, reg, schemas)
+    assert calls == [("Rome", 3)], "valid input should run the tool exactly once"
+    assert res.get("content") == "Rome: sunny for 3 days", f"unexpected content {res.get('content')!r}"
+    assert not res.get("is_error", False), "valid input must not produce an error result"
+
+def test_invalid_input_not_run():
+    calls, reg, schemas = _setup()
+    block = al.ToolUseBlock(id="toolu_2", name="get_forecast", input={"city": "Rome", "days": 14})
+    res = execute_tool(block, reg, schemas)
+    assert calls == [], "the tool must NOT be called when validation fails"
+    assert res.get("is_error") is True, "invalid input needs 'is_error': True"
+    assert res.get("tool_use_id") == "toolu_2", "echo block.id"
+    assert res.get("content", "").startswith("Invalid input for get_forecast: "), \
+        "content should start with 'Invalid input for get_forecast: '"
+
+def test_every_problem_listed():
+    calls, reg, schemas = _setup()
+    bad = {"days": 0, "units": "F"}
+    block = al.ToolUseBlock(id="toolu_3", name="get_forecast", input=bad)
+    res = execute_tool(block, reg, schemas)
+    for problem in al.validate(bad, SCHEMA):
+        assert problem in res.get("content", ""), f"content should include the problem {problem!r}"
+
+def test_unknown_still_handled():
+    calls, reg, schemas = _setup()
+    block = al.ToolUseBlock(id="toolu_4", name="get_weather", input={"city": "Rome"})
+    res = execute_tool(block, reg, schemas)
+    assert res.get("is_error") is True and "get_forecast" in res.get("content", ""), \
+        "unknown tools still return an error listing available tools"
+      </script>
+      <details class="hint"><summary>Hint</summary><p><code>problems = al.validate(block.input, schemas[block.name])</code>.
+        If <code>problems</code> is not empty, return an error result with
+        <code>f"Invalid input for {block.name}: " + "; ".join(problems)</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def execute_tool(block, registry, schemas):
+    func = registry.get(block.name)
+    if func is None:
+        available = ", ".join(sorted(registry))
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"Unknown tool {block.name!r}. Available tools: {available}."}
+    problems = al.validate(block.input, schemas[block.name])
+    if problems:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"Invalid input for {block.name}: " + "; ".join(problems)}
+    try:
+        output = func(**block.input)
+    except Exception as exc:
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                "content": f"{type(exc).__name__}: {exc}"}
+    return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m10-e3" data-title="Fix this broken agent">
+      <div class="exercise-prompt">
+        <p>A teammate "handled" tool errors by skipping them. Their run fails on the second request with this:</p>
+        <pre><code>BadRequestError: messages.2: tool_use ids were found without tool_result blocks immediately after:
+toolu_mock_0002. Each tool_use block must have a corresponding tool_result block in the next message.</code></pre>
+        <p>and this transcript just before it:</p>
+        <pre><code>user: Look up keys a and missing
+assistant: tool_use lookup {"key": "a"} [toolu_mock_0001]
+assistant: tool_use lookup {"key": "missing"} [toolu_mock_0002]
+user: tool_result [toolu_mock_0001] apple</code></pre>
+        <p>Fix <code>run_agent</code> so that every <code>tool_use</code> gets a result: failures (including unknown
+          tool names) become <code>is_error</code> results whose content includes the exception text, all in the same
+          user message. Keep the signature and return value (the final text).</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def run_agent(client, task, tools, registry, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            try:
+                output = registry[block.name](**block.input)
+            except Exception:
+                continue          # skip the broken one
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        messages.append({"role": "user", "content": results})
+    return None
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+TOOLS = [{"name": "lookup", "description": "Look up a key.",
+          "input_schema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}}]
+DATA = {"a": "apple", "b": "banana"}
+
+def lookup(key):
+    return DATA[key]
+
+def test_failed_call_answered():
+    client = al.MockClient([al.tool_calls([("lookup", {"key": "a"}), ("lookup", {"key": "missing"})]), "done"])
+    try:
+        answer = run_agent(client, "Look up keys a and missing", TOOLS, {"lookup": lookup})
+    except al.BadRequestError as exc:
+        raise AssertionError(f"the run still fails: {exc.message}") from None
+    assert answer == "done", f"run_agent should return the final text, got {answer!r}"
+    results = client.requests[1].tool_results
+    assert len(results) == 2, f"both tool_use blocks need a result in one message, got {len(results)}"
+    good, bad = results
+    assert good.get("content") == "apple" and not good.get("is_error", False), "the successful call is a normal result"
+    assert bad.get("is_error") is True, "the failed call needs 'is_error': True"
+    assert "missing" in str(bad.get("content")), "the error content should include the exception text (KeyError: 'missing')"
+
+def test_all_calls_fail():
+    client = al.MockClient([al.tool_call("lookup", {"key": "zzz"}), "nothing found"])
+    try:
+        answer = run_agent(client, "Look up zzz", TOOLS, {"lookup": lookup})
+    except al.BadRequestError as exc:
+        raise AssertionError(f"when every call fails the user message must still hold results: {exc.message}") from None
+    assert answer == "nothing found", "the model should get to answer after an error result"
+
+def test_unknown_tool():
+    client = al.MockClient([al.tool_call("lookup", {"key": "b"}), al.tool_call("fetch", {"url": "x"}), "ok"])
+    try:
+        answer = run_agent(client, "go", TOOLS + [{"name": "fetch", "description": "Fetch.",
+                           "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}}}],
+                           {"lookup": lookup})
+    except Exception as exc:
+        raise AssertionError(f"an unknown tool must not crash the loop, got {type(exc).__name__}: {exc}") from None
+    results = client.requests[2].tool_results
+    assert results and results[0].get("is_error") is True, "an unregistered tool becomes an error result"
+    assert answer == "ok", "the run should continue to the final answer"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Replace <code>continue</code> with appending an error result:
+        <code>{"type": "tool_result", "tool_use_id": block.id, "content": f"{type(exc).__name__}: {exc}", "is_error": True}</code>.
+        <code>registry[block.name]</code> is inside the <code>try</code>, so a missing name (a <code>KeyError</code>)
+        is caught too, though <code>registry.get</code> would give a clearer message.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def run_agent(client, task, tools, registry, max_steps=10):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            func = registry.get(block.name)
+            if func is None:
+                results.append({"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                                "content": f"Unknown tool {block.name!r}. Available: {', '.join(sorted(registry))}."})
+                continue
+            try:
+                output = func(**block.input)
+            except Exception as exc:
+                results.append({"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                                "content": f"{type(exc).__name__}: {exc}"})
+                continue
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        messages.append({"role": "user", "content": results})
+    return None</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m10-e4" data-title="Retry or fix?">
+      <div class="exercise-prompt">
+        <p>Write <code>is_retryable(exc)</code> that returns <code>True</code> only for errors where the same request
+          could succeed later: any <code>al.APIConnectionError</code>, and any <code>al.APIStatusError</code> whose
+          <code>status_code</code> is 408, 409, 429, or 500 and above. Everything else, including exceptions that are
+          not API errors at all, returns <code>False</code>.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def is_retryable(exc):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_retryable():
+    for exc in [al.RateLimitError(), al.InternalServerError("boom"), al.OverloadedError("busy"),
+                al.APIConnectionError("reset"), al.InternalServerError("bad gateway", status_code=502)]:
+        assert is_retryable(exc) is True, f"{type(exc).__name__} ({getattr(exc, 'status_code', '-')}) should be retryable"
+
+def test_timeout_and_conflict():
+    assert is_retryable(al.APIStatusError("timeout", status_code=408)) is True, "408 request timeout is retryable"
+    assert is_retryable(al.APIStatusError("conflict", status_code=409)) is True, "409 conflict is retryable"
+
+def test_not_retryable():
+    for exc in [al.BadRequestError("bad"), al.AuthenticationError("key"), al.NotFoundError("model"),
+                al.APIStatusError("forbidden", status_code=403)]:
+        assert is_retryable(exc) is False, f"{type(exc).__name__} ({exc.status_code}) means fix the request, not retry"
+
+def test_other_exceptions():
+    assert is_retryable(ValueError("x")) is False, "non-API exceptions are never retried"
+    assert is_retryable(KeyError("k")) is False, "non-API exceptions are never retried"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Check <code>isinstance(exc, al.APIConnectionError)</code> first.
+        Then, for <code>isinstance(exc, al.APIStatusError)</code>, test
+        <code>exc.status_code in (408, 409, 429) or exc.status_code &gt;= 500</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def is_retryable(exc):
+    if isinstance(exc, al.APIConnectionError):
+        return True
+    if isinstance(exc, al.APIStatusError):
+        return exc.status_code in (408, 409, 429) or exc.status_code &gt;= 500
+    return False</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m10-e5" data-title="Exponential backoff">
+      <div class="exercise-prompt">
+        <p>Write <code>call_with_retry(make_request, *, max_attempts=4, base_delay=1.0, max_delay=30.0, sleep=time.sleep)</code>.
+          It calls <code>make_request()</code> and returns its result. When the call raises:</p>
+        <ul>
+          <li>a non-retryable error (use <code>is_retryable</code>, provided in the starter): re-raise at once, without sleeping;</li>
+          <li>a retryable error on the last allowed attempt: re-raise it;</li>
+          <li>otherwise: call <code>sleep(delay)</code> and try again, where <code>delay</code> is
+            <code>base_delay * 2 ** (attempt - 1)</code> for attempt 1, 2, 3..., capped at <code>max_delay</code>.
+            For an <code>al.RateLimitError</code>, use <code>max(delay, exc.retry_after)</code>.</li>
+        </ul>
+        <p>Never call <code>time.sleep</code> directly; always the <code>sleep</code> argument. The tests pass a list's
+          <code>append</code> and check the delays.</p>
+      </div>
+<textarea class="starter">
+import time
+import agentlab as al
+
+def is_retryable(exc):
+    if isinstance(exc, al.APIConnectionError):
+        return True
+    if isinstance(exc, al.APIStatusError):
+        return exc.status_code in (408, 409, 429) or exc.status_code >= 500
+    return False
+
+def call_with_retry(make_request, *, max_attempts=4, base_delay=1.0, max_delay=30.0, sleep=time.sleep):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+MSGS = [{"role": "user", "content": "Hi"}]
+
+def _caller(client):
+    return lambda: client.messages.create(model=al.MODEL, max_tokens=64, messages=MSGS)
+
+def test_recovers_with_doubling():
+    waits = []
+    client = al.MockClient([al.fail(al.InternalServerError("x")), al.fail(al.OverloadedError("y")), "ok"])
+    response = call_with_retry(_caller(client), sleep=waits.append)
+    assert response is not None and response.text == "ok", "return the successful response"
+    assert waits == [1.0, 2.0], f"expected waits [1.0, 2.0], got {waits}"
+    assert len(client.requests) == 3, f"expected 3 requests, got {len(client.requests)}"
+
+def test_cap():
+    waits = []
+    client = al.MockClient([al.fail(al.APIConnectionError("a"))] * 3 + ["ok"])
+    call_with_retry(_caller(client), base_delay=10.0, max_delay=15.0, sleep=waits.append)
+    assert waits == [10.0, 15.0, 15.0], f"delays must be capped at max_delay; got {waits}"
+
+def test_retry_after():
+    waits = []
+    client = al.MockClient([al.fail(al.RateLimitError(retry_after=7.0)), "ok"])
+    call_with_retry(_caller(client), sleep=waits.append)
+    assert waits == [7.0], f"a RateLimitError's retry_after (7.0) beats the 1.0 backoff; got {waits}"
+
+def test_no_retry_on_bad_request():
+    waits = []
+    client = al.MockClient([al.fail(al.BadRequestError("bad")), "never"])
+    try:
+        call_with_retry(_caller(client), sleep=waits.append)
+    except al.BadRequestError:
+        pass
+    else:
+        raise AssertionError("BadRequestError must be re-raised")
+    assert waits == [] and len(client.requests) == 1, "a 400 must not be retried or slept on"
+
+def test_gives_up():
+    waits = []
+    client = al.MockClient([al.fail(al.InternalServerError(f"fail {i}")) for i in range(1, 5)] + ["late"])
+    try:
+        call_with_retry(_caller(client), max_attempts=4, sleep=waits.append)
+    except al.InternalServerError as exc:
+        assert exc.message == "fail 4", f"re-raise the LAST error, got {exc.message!r}"
+    else:
+        raise AssertionError("after max_attempts failures, raise the last error")
+    assert len(client.requests) == 4, f"max_attempts=4 means 4 requests, got {len(client.requests)}"
+    assert waits == [1.0, 2.0, 4.0], f"three waits between four attempts, got {waits}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Loop with <code>for attempt in range(1, max_attempts + 1):</code>.
+        Inside, <code>try: return make_request()</code>. In <code>except al.APIError as exc:</code>, re-raise with a
+        bare <code>raise</code> when <code>not is_retryable(exc) or attempt == max_attempts</code>; otherwise compute
+        the delay and call <code>sleep(delay)</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import time
+import agentlab as al
+
+def is_retryable(exc):
+    if isinstance(exc, al.APIConnectionError):
+        return True
+    if isinstance(exc, al.APIStatusError):
+        return exc.status_code in (408, 409, 429) or exc.status_code &gt;= 500
+    return False
+
+def call_with_retry(make_request, *, max_attempts=4, base_delay=1.0, max_delay=30.0, sleep=time.sleep):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return make_request()
+        except al.APIError as exc:
+            if not is_retryable(exc) or attempt == max_attempts:
+                raise
+            delay = min(base_delay * 2 ** (attempt - 1), max_delay)
+            if isinstance(exc, al.RateLimitError):
+                delay = max(delay, exc.retry_after)
+            sleep(delay)</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a hardened agent runner</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">robust_agent.py: an agent that survives its tools and the network</span></div>
+      <div class="widget-body">
+        <p>Turn your M09 agent into a small module that handles every failure in this lesson, logs each one, and
+          runs against the mock in tests and against the real API when it is available.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir robust-agent &amp;&amp; cd robust-agent
+pixi init
+pixi add python=3.14 anthropic structlog pytest
+# copy agentlab into the workspace or add it as described in M00, then:
+pixi run python robust_agent.py
+pixi run pytest</code></pre>
+        <p><strong>What to build:</strong></p>
+        <ul>
+          <li><code>ToolError</code>, <code>execute_tool(block, registry, schemas)</code>, <code>is_retryable(exc)</code>
+            and <code>call_with_retry(...)</code> as in this lesson, each with a Google-style docstring and type hints.</li>
+          <li>Three tools with real failure modes: <code>read_note(name)</code> over a local <code>notes/</code> folder
+            (missing file, name outside the folder), <code>word_count(text)</code>, and <code>slow_search(query)</code>
+            that pages through notes with a <code>time.monotonic()</code> deadline.</li>
+          <li><code>run_agent(client, task, tools, registry, max_steps=10, sleep=time.sleep)</code>. Get the client with
+            <code>al.get_client(max_retries=0)</code> (your helper owns retries) and fall back to an
+            <code>al.MockClient</code> script when it raises <code>al.LiveModelUnavailableError</code>.</li>
+          <li>structlog logging: one event per tool error (tool name, tool_use id, message) and one per retry (error
+            class, attempt, delay). Logs are structured key=value or JSON so you can search them later; the model's
+            error results and your logs are two views of the same failures.</li>
+        </ul>
+        <ul class="checklist" data-id="m10-mini">
+          <li>No exception from a tool, an unknown tool name, or invalid input escapes <code>run_agent</code></li>
+          <li>Every <code>tool_use</code> in a run is answered by exactly one <code>tool_result</code> in the next message</li>
+          <li>Error messages name the tool, the problem, and a next step, and contain no paths outside <code>notes/</code> or stack traces</li>
+          <li>pytest tests use <code>al.MockClient</code> with <code>al.fail(...)</code> steps and an injected <code>sleep</code>; no test sleeps for real</li>
+          <li>A test proves <code>BadRequestError</code> is raised after exactly one request</li>
+          <li>A test proves a 429 then 529 then success yields waits of <code>[max(1, retry_after), 2]</code></li>
+          <li>The real client is created with <code>max_retries=0</code> so retries happen in one layer only</li>
+          <li>No API key appears anywhere in the code or the repository</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> add jitter with an injectable random source; give
+          <code>call_with_retry</code> a total time budget (stop retrying when the next wait would exceed it); return
+          tool results as JSON strings with an <code>"error"</code> field and compare how the model reacts.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m10-quiz">
+      <script type="application/json">
+      {"title": "Errors as Data quiz", "passScore": 0.7, "questions": [
+        {"type": "single", "prompt": "A tool raises <code>FileNotFoundError</code> during an agent run. What should the loop do?", "options": ["Let the exception propagate so the user sees a traceback", "Skip that tool_use and send the other results", "Send a tool_result with the same tool_use_id, <code>is_error: true</code>, and a message saying which file is missing and what to try", "Retry the tool call until it succeeds"], "answer": 2, "explanation": "<p>Tool failures go back to the model as data. The result must echo the <code>tool_use_id</code> so the pairing rule holds, and a specific message lets the model adapt (for example by listing files first). Skipping breaks the next request; retrying a missing file cannot help.</p>"},
+        {"type": "multi", "prompt": "Which of these API errors should you retry with backoff?", "options": ["<code>RateLimitError</code> (429)", "<code>BadRequestError</code> (400)", "<code>InternalServerError</code> (500)", "<code>AuthenticationError</code> (401)", "<code>APIConnectionError</code>", "<code>OverloadedError</code> (529)"], "answer": [0, 2, 4, 5], "explanation": "<p>429, 5xx, 529 and connection errors are about the moment, so the same request may succeed later. 400 and 401 are about the request or configuration and will fail identically every time: fix them.</p>"},
+        {"type": "single", "prompt": "Why must <code>BadRequestError</code> never be retried?", "options": ["The SDK forbids catching it", "The request itself is invalid, so sending it again unchanged fails the same way and only hides the bug", "It always means the API is down", "Retrying it costs double"], "answer": 1, "explanation": "<p>A 400 means the API checked your request and found it wrong: an unanswered tool_use, a first message that is not <code>user</code>, a rejected parameter. Nothing about time changes that. Raise it and fix the code.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\nschema = {\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\"}}, \"required\": [\"n\"]}\nprint(al.validate({\"n\": \"5\"}, schema))", "answer": "['$.n: expected integer, got str']", "explanation": "<p><code>al.validate</code> returns a list of problem strings with a path to the field. The string <code>\"5\"</code> is not an integer, so there is one problem at <code>$.n</code>. That string is ready to send back to the model as an error result.</p>"},
+        {"type": "output", "prompt": "With <code>base_delay=1.0</code> and <code>max_delay=30.0</code>, the request fails with 500, 500, then <code>RateLimitError(retry_after=3.0)</code>, then succeeds. What list do the waits form? (Use the format <code>[1.0, 2.0, 3.0]</code>.)", "code": "delay = min(base_delay * 2 ** (attempt - 1), max_delay)\nif isinstance(exc, al.RateLimitError):\n    delay = max(delay, exc.retry_after)", "answer": "[1.0, 2.0, 4.0]", "explanation": "<p>Attempt 1 waits 1.0, attempt 2 waits 2.0. Attempt 3's backoff is 4.0, which is larger than the hint of 3.0, so the wait is 4.0. The hint is a minimum, not a replacement.</p>"},
+        {"type": "single", "prompt": "Why does <code>call_with_retry</code> take a <code>sleep</code> parameter instead of calling <code>time.sleep</code>?", "options": ["<code>time.sleep</code> does not work with the mock", "So tests can pass a recording function, run instantly, and assert the exact delays", "Because sleeping is forbidden in agents", "To make the retries run in parallel"], "answer": 1, "explanation": "<p>This is dependency injection: the behavior that is slow or nondeterministic (waiting, clocks, randomness) is passed in. Production passes <code>time.sleep</code>; tests pass <code>waits.append</code>.</p>"},
+        {"type": "single", "prompt": "The model calls <code>get_forecast</code>, but your registry has only <code>get_weather</code>. What is the best response?", "options": ["Raise <code>KeyError</code>", "Return an error tool_result: unknown tool, plus the list of available tools", "Call <code>get_weather</code> instead", "Remove the tool_use block from the assistant message"], "answer": 1, "explanation": "<p>An error result keeps the pairing valid and tells the model what it can actually use. Silently calling a different tool would return data for a question it did not ask, and editing the assistant message rewrites history.</p>"},
+        {"type": "multi", "prompt": "Which belong in an error message sent back to the model?", "options": ["The tool name and the input that failed", "A suggestion such as valid values or another tool to try", "The full Python traceback", "The database connection string, for context", "Whether retrying the same call could help"], "answer": [0, 1, 4], "explanation": "<p>Say what failed, why, and what to do next. Tracebacks waste tokens and leak internals; secrets must never enter a conversation, which may be logged or shown to users. Log details on your side instead.</p>"},
+        {"type": "single", "prompt": "Where should the retry wrapper go in the agent loop?", "options": ["Around the whole loop, restarting the run on any error", "Around <code>messages.create</code> only, before anything is appended to <code>messages</code>", "Around each tool call", "Around <code>messages.append</code>"], "answer": 1, "explanation": "<p>Wrap only the model call. Because nothing is appended until it succeeds, a retry re-sends the identical request and the history stays valid. Wrapping tools could run side effects (sending an email) several times; restarting the run repeats all prior work.</p>"},
+        {"type": "text", "prompt": "Which field do you set to <code>True</code> on a tool_result block to mark it as a failure?", "answer": ["is_error"], "explanation": "<p><code>\"is_error\": True</code> tells the model that <code>content</code> describes a failure. It is optional and omitted (or false) for successful calls.</p>"},
+        {"type": "single", "prompt": "A tool searches with no matches and returns <code>\"0 results for 'atlantis census'\"</code>. Should it set <code>is_error</code>?", "options": ["Yes, no results is always an error", "No: the tool did its job and the answer is empty; reserve is_error for calls that could not run or complete", "Only if the model asked twice", "Yes, so the model retries"], "answer": 1, "explanation": "<p>An empty answer is still an answer. Marking it as an error suggests the tool is broken and can push the model to retry pointlessly. Use <code>is_error</code> when the call itself failed.</p>"},
+        {"type": "single", "prompt": "You use the real SDK with its default retries and wrap calls in your own helper with <code>max_attempts=4</code>. What is the risk?", "options": ["None, retries are free", "Retries multiply: one logical call can become many HTTP requests and long waits", "The SDK disables your helper", "BadRequestError will be retried"], "answer": 1, "explanation": "<p>The SDK retries 408/409/429/5xx twice by default. Stacked under four attempts of your own, that is up to twelve requests. Pick one layer, for example <code>anthropic.Anthropic(max_retries=0)</code> when your helper owns retries.</p>"},
+        {"type": "single", "prompt": "Which is the right way to put a time limit on a tool that pages through results, without threads?", "options": ["Compute a deadline with <code>time.monotonic()</code> before the loop and stop with a ToolError when it passes", "Call <code>time.sleep(10)</code> first", "Use <code>datetime.now()</code> and hope the clock is not adjusted", "Ask the model to be quick"], "answer": 0, "explanation": "<p><code>time.monotonic()</code> only moves forward, so it is the right clock for durations. Check it between pages, and report a timeout with partial results and a next step. For network calls, pass the library's own timeout argument.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Agents fail in three places: the tool, the model's request for a tool, and the API call. The first two become
+        conversation; the third is retried or fixed.</li>
+      <li>A failed tool call returns a <code>tool_result</code> with the same <code>tool_use_id</code>,
+        <code>"is_error": True</code>, and a message. Every <code>tool_use</code> gets exactly one result.</li>
+      <li>Good error messages say what failed, why, and what to do next. Use a <code>ToolError</code> for expected
+        failures; summarize unexpected ones; never include secrets or tracebacks.</li>
+      <li>Validate input with <code>al.validate</code> before running a tool, and look tools up with
+        <code>registry.get</code>.</li>
+      <li>Tools that wait on the outside world need a timeout or a <code>time.monotonic()</code> deadline.</li>
+      <li>400, 401, 404: fix. 408, 409, 429, 5xx, 529, connection errors: retry with exponential backoff, honoring a
+        rate limit's wait hint, up to a maximum number of attempts.</li>
+      <li>Inject <code>sleep</code> (and clocks, and randomness) so failure handling is testable in milliseconds.</li>
+      <li>Retry only the model call, and only one layer should own retries.</li>
+    </ul>
+    <div class="flashcards" data-title="Errors as Data">
+      <script type="application/json">
+      [{"front": "How does a tool failure reach the model?", "back": "As a <code>tool_result</code> with the matching <code>tool_use_id</code>, <code>\"is_error\": True</code>, and a message as <code>content</code>."},
+       {"front": "What happens if you skip the result for a failed tool call?", "back": "The next request fails with <code>BadRequestError</code>: every <code>tool_use</code> needs a <code>tool_result</code> in the next message."},
+       {"front": "Three parts of an actionable error message", "back": "What failed (tool and input), why (in words), and what to do next."},
+       {"front": "What does <code>al.validate(value, schema)</code> return?", "back": "A list of problem strings like <code>$.days: value 14 is above maximum 7</code>; empty when valid."},
+       {"front": "Order of checks in <code>execute_tool</code>", "back": "Known tool, valid input, run in <code>try</code>, then build the success result."},
+       {"front": "Which API errors do you fix, not retry?", "back": "400 <code>BadRequestError</code>, 401 <code>AuthenticationError</code>, 404 <code>NotFoundError</code>."},
+       {"front": "Which API errors do you retry?", "back": "408, 409, 429 <code>RateLimitError</code>, 5xx <code>InternalServerError</code>, 529 <code>OverloadedError</code>, and <code>APIConnectionError</code>."},
+       {"front": "Exponential backoff formula used here", "back": "<code>min(base_delay * 2 ** (attempt - 1), max_delay)</code>, and for a rate limit <code>max(delay, retry_after)</code>."},
+       {"front": "Why inject <code>sleep</code>?", "back": "Tests pass a recorder such as <code>waits.append</code>: they run instantly and can assert exact delays."},
+       {"front": "How do you script an API failure in the mock?", "back": "<code>al.fail(al.RateLimitError(retry_after=2.0))</code> as a script step; it raises instead of answering."},
+       {"front": "How many times does the real SDK retry by default?", "back": "Twice, for 408/409/429/5xx. Set <code>max_retries=0</code> if your own helper owns retries."},
+       {"front": "Which clock measures a tool's timeout?", "back": "<code>time.monotonic()</code>: it only moves forward."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Claude docs: Tool use</a> (handling tool errors and <code>is_error</code>)</li>
+      <li><a href="https://platform.claude.com/docs/en/api/errors">Claude docs: API errors</a></li>
+      <li><a href="https://docs.python.org/3.14/tutorial/errors.html">Python tutorial: Errors and exceptions</a></li>
+      <li><a href="https://docs.python.org/3.14/library/time.html#time.monotonic">Python docs: <code>time.monotonic</code></a></li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> and <a href="../reference/agent-loop-cheatsheet.html">agent loop cheatsheet</a></li>
+      <li>Next: <a href="m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

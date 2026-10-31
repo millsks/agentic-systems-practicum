@@ -1,0 +1,1387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M12 · Tool Design · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m12">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Module 12</p>
+    <h1>Tool Design</h1>
+    <p class="lede">Your agent loop is finished. From here on, most of an agent's quality comes from its tools: how
+      many there are, what they are called, what their descriptions promise, and what their results look like when
+      they come back. The model can only be as good as the interface you hand it. This module is about designing that
+      interface on purpose.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m07-tools-as-contracts.html">M07 Tools as Contracts</a>, <a href="m09-agent-loop.html">M09 The Agent Loop</a>, <a href="m10-errors-as-data.html">M10 Errors as Data</a></span></div>
+    <ul class="objectives">
+      <li>Explain why a toolset is a user interface for the model, and what it costs on every request</li>
+      <li>Consolidate overlapping tools into fewer, clearer ones with consistent names</li>
+      <li>Put usage guidance where it works best: in tool and parameter descriptions</li>
+      <li>Format tool results the model can read: concise, with stable ids, truncated with a note, and paginated</li>
+      <li>Separate read tools from write tools and enforce confirmation for writes in your own code</li>
+      <li>Recognize non-idempotent tools and redesign them so a repeated call is safe</li>
+      <li>Test tools in isolation, then review a toolset against a checklist</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="interface">
+    <h2>A toolset is an interface for the model</h2>
+    <p>In <a href="m07-tools-as-contracts.html">M07</a> you learned what a tool is to the model: a <strong>name</strong>,
+      a <strong>description</strong>, and an <strong>input schema</strong>. The model never sees your Python function.
+      It never reads your docstring, your variable names, or your database layout. Everything it knows about a tool
+      comes from those three fields, plus whatever the tool sends back as a <code>tool_result</code>.</p>
+    <p>That makes a toolset an interface in the same sense that a command-line program or a web form is an
+      interface. A human user who meets a confusing form fills it in wrong. A model that meets a confusing toolset
+      does the same: it picks the wrong tool, passes a malformed argument, calls a tool five times when once would do,
+      or gives up and guesses. When an agent misbehaves, the first place to look is usually not the system prompt. It
+      is the tools.</p>
+    <p>There is also a plain cost. Tool definitions are part of the request. Because the API is stateless
+      (<a href="m02-messages-api.html">M02</a>), they are sent again on <em>every</em> request in the loop, and so are
+      all the tool results already in the history. A bloated toolset and chatty results make every step slower and
+      more expensive.</p>
+    <div class="runnable" data-title="What tool definitions cost per request">
+<textarea>
+import json
+import agentlab as al
+
+def tool(name, description, **props):
+    return {
+        "name": name,
+        "description": description,
+        "input_schema": {"type": "object", "properties": props, "required": list(props)},
+    }
+
+query = {"type": "string", "description": "Words to look for."}
+note_id = {"type": "string", "description": "A note id such as n12, from search results."}
+
+lean = [
+    tool("search_notes", "Search the user's notes by keyword. Returns up to 5 matches with ids.", query=query),
+    tool("read_note", "Return the full text of one note, by id from search_notes.", note_id=note_id),
+]
+
+messages = [{"role": "user", "content": "What did I write about Pixi tasks?"}]
+per_request = al.estimate_request_tokens(messages, tools=lean)
+print("tokens per request with 2 tools:", per_request)
+print("tools alone:", al.estimate_tokens(json.dumps(lean, sort_keys=True)))
+print("over a 10-step run, tool definitions are sent 10 times:", 10 * al.estimate_tokens(json.dumps(lean, sort_keys=True)))
+</textarea>
+    </div>
+    <p>The numbers are estimates (<code>al.estimate_tokens</code> assumes about four characters per token; real counts
+      come from <code>messages.count_tokens</code>, see <a href="m01-llm-calls.html">M01</a>). The shape is what
+      matters: tool definitions are a fixed tax on every step, and the tax grows with every tool you add. Paste a
+      larger toolset into the meter below and change the number of calls to see how fast it adds up.</p>
+    <div class="viz" data-viz="token-meter" data-config='{"title": "The cost of a toolset, sent on every step", "calls": 5000, "text": "[{\"name\": \"search_notes\", \"description\": \"Search the user&#39;s notes by keyword. Returns up to 5 matches with ids.\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}}}, {\"name\": \"read_note\", \"description\": \"Return the full text of one note, by id from search_notes.\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"note_id\": {\"type\": \"string\"}}}}]"}'></div>
+    <aside class="callout think"><p>Think of a new teammate who can only learn your system from a one-page reference
+      card. Every tool is a line on that card. Would a new teammate know which line to use, what to type, and what
+      the answer means? If not, the model will not either.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the model sees only names, descriptions, schemas, and
+      results. Tool definitions and results are re-sent on every step, so every word in them is paid for many
+      times.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="fewer-tools">
+    <h2>Fewer, clearer tools</h2>
+    <p>A common first design maps one tool to every function or API endpoint you happen to have. For a notes app
+      that might look like this:</p>
+    <pre><code class="language-python">get_note, fetch_note_by_id, find_notes_by_title, find_notes_by_tag, search_note_bodies,
+list_all_notes, list_recent_notes, create_note, add_note_tag, remove_note_tag, update_note_text</code></pre>
+    <p>Eleven tools, and three problems:</p>
+    <ol>
+      <li><strong>Overlap.</strong> <code>get_note</code> and <code>fetch_note_by_id</code> do the same thing. The
+        three <code>find_</code>/<code>search_</code> tools differ only in which field they look at. Every overlap is a
+        decision the model must make on every step, with nothing to decide it by.</li>
+      <li><strong>Fragmented workflows.</strong> To answer "what did I write about Pixi?", the model must guess
+        whether "Pixi" is a title, a tag, or something in a body, and may call all three tools to be safe. That is
+        three round trips where one would do.</li>
+      <li><strong>Dangerous neighbors.</strong> Listing every note (<code>list_all_notes</code>) can flood the context
+        with thousands of entries. It exists because an endpoint exists, not because the model needs it.</li>
+    </ol>
+    <p>The fix is to design tools around the <em>tasks</em> the agent performs, not around the functions you
+      already have. Merge tools that differ only by a parameter, drop tools that only make things worse, and let one
+      call do a whole unit of work:</p>
+    <div class="two-col">
+      <div>
+        <h4>Before: 11 tools</h4>
+        <pre><code class="language-python">get_note(id)
+fetch_note_by_id(id)
+find_notes_by_title(title)
+find_notes_by_tag(tag)
+search_note_bodies(text)
+list_all_notes()
+list_recent_notes()
+create_note(title, text)
+add_note_tag(id, tag)
+remove_note_tag(id, tag)
+update_note_text(id, text)</code></pre>
+      </div>
+      <div>
+        <h4>After: 4 tools</h4>
+        <pre><code class="language-python">notes_search(query, field="any",
+             sort="relevance", limit=5)
+notes_read(note_id)
+notes_create(title, text, tags=[])
+notes_update(note_id, text=None,
+             tags=None)</code></pre>
+      </div>
+    </div>
+    <p><code>notes_search</code> replaces five tools: a <code>field</code> enum covers title, tag, and body, and
+      <code>sort="recent"</code> covers "recent notes" without dumping everything. <code>notes_update</code> sets
+      text and tags in one call instead of three. The model now has one obvious choice at each step.</p>
+    <p>Consolidation has a limit. Do not build one giant <code>notes(action, ...)</code> tool whose schema accepts
+      every combination of fields; then the model must learn an internal mini-language from one description, and
+      the schema can no longer say which fields go with which action. A good rule: <strong>one tool per distinct
+      kind of action, with parameters for the variations of that action.</strong> Reading and writing are different
+      kinds of action (more on that <a href="#read-write">below</a>); searching by title and searching by tag are
+      not.</p>
+    <aside class="callout note" data-title="How many tools is too many?">
+      <p>There is no magic number. A focused agent usually needs a handful. Warning signs that you have too many:
+        two tools whose descriptions you cannot tell apart in one sentence, tools the model never calls in your test
+        transcripts, and transcripts where the model calls several tools to do what is really one task. Stage 3 of the
+        <a href="../reference/roadmap.html">roadmap</a> returns to this when context budgets get tight.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> design tools around tasks, not endpoints. Merge tools that
+      differ only by a parameter. Remove tools that invite floods. One tool per kind of action.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="naming">
+    <h2>Names and descriptions that steer</h2>
+    <h3>Names</h3>
+    <p>A tool name is the first thing the model reads, and it reads it in every transcript line. Good names follow
+      a few conventions:</p>
+    <ul>
+      <li><strong>Verb and object</strong>, in <code>snake_case</code>: <code>search_notes</code>,
+        <code>read_note</code>, <code>create_issue</code>. A name with no verb (<code>notes</code>) hides what the call
+        does.</li>
+      <li><strong>A shared prefix for related tools</strong> once you have more than one area:
+        <code>notes_search</code>, <code>notes_read</code>, <code>calendar_list_events</code>. Prefixes group tools
+        and make it obvious which system a call touches. Pick prefix-first or verb-first and use it everywhere.</li>
+      <li><strong>The same word for the same thing.</strong> If one tool takes <code>note_id</code>, every tool takes
+        <code>note_id</code>, not <code>id</code> in one place and <code>noteId</code> in another.</li>
+      <li><strong>Only letters, digits, underscores, and hyphens, up to 64 characters.</strong> agentlab rejects
+        anything else, and names must be unique within a request.</li>
+    </ul>
+    <div class="runnable" data-title="Names agentlab rejects">
+<textarea>
+import agentlab as al
+
+schema = {"type": "object", "properties": {}}
+client = al.MockClient(["ok"])
+attempts = {
+    "space in name": [{"name": "search notes", "description": "Search.", "input_schema": schema}],
+    "dot in name": [{"name": "notes.search", "description": "Search.", "input_schema": schema}],
+    "duplicate": [{"name": "read_note", "description": "A.", "input_schema": schema},
+                  {"name": "read_note", "description": "B.", "input_schema": schema}],
+    "fine": [{"name": "notes_search", "description": "Search.", "input_schema": schema}],
+}
+for label, tools in attempts.items():
+    try:
+        client.messages.create(model=al.MODEL, max_tokens=256, tools=tools,
+                               messages=[{"role": "user", "content": "hi"}])
+        print(f"{label:14} accepted")
+    except al.BadRequestError as e:
+        print(f"{label:14} BadRequestError: {e}")
+</textarea>
+    </div>
+    <p>Rejected requests never reach the script, so the single scripted <code>"ok"</code> answers only the request
+      that was valid.</p>
+
+    <h3>Descriptions beat clever prompts</h3>
+    <p>When a model misuses a tool, the tempting fix is a new line in the system prompt: "Always search before you
+      read a note." That works for a while, then the system prompt grows into a list of special cases far from the
+      tools they describe. Guidance about a tool belongs in that tool's description, because that is where the model
+      looks when it is deciding whether and how to call it.</p>
+    <p>A description that steers well answers four questions:</p>
+    <ol>
+      <li><strong>What does it do?</strong> One plain sentence.</li>
+      <li><strong>When should it be used, and when not?</strong> Name the neighbor tool if there is one.</li>
+      <li><strong>What does it return?</strong> The shape and size of the result, so the model knows what to expect
+        and what to do next.</li>
+      <li><strong>What are the limits?</strong> Caps, required formats, side effects.</li>
+    </ol>
+    <div class="two-col">
+      <div>
+        <h4>Vague</h4>
+        <pre><code class="language-python">{
+  "name": "notes_search",
+  "description": "Searches notes.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "q": {"type": "string"},
+      "n": {"type": "integer"}
+    },
+    "required": ["q"]
+  }
+}</code></pre>
+      </div>
+      <div>
+        <h4>Steering</h4>
+        <pre><code class="language-python">{
+  "name": "notes_search",
+  "description": (
+    "Find the user's notes by keyword. Use this first "
+    "whenever you need a note but do not have its id; "
+    "then call notes_read with an id from the results. "
+    "Returns at most `limit` lines of the form "
+    "'id | title | tags', newest first, plus a "
+    "next_cursor when more results exist. Read-only."
+  ),
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "query": {"type": "string",
+        "description": "One to five keywords, e.g. 'pixi tasks'."},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 10,
+        "description": "Max results; default 5."}
+    },
+    "required": ["query"]
+  }
+}</code></pre>
+      </div>
+    </div>
+    <p>Notice what the steering version does. It says when to use the tool and what to call next, so the
+      search-then-read workflow lives right where the model needs it. It says what comes back, so the model is not
+      surprised by a cursor. It names its parameters for what they mean (<code>query</code>, not <code>q</code>),
+      gives an example of a good value, and puts the cap in the schema (<code>maximum</code>) as well as the prose.
+      It also says "Read-only", which matters once writes enter the picture.</p>
+    <aside class="callout warn"><p>Descriptions are guidance, not enforcement. "Max 10" in a description does not stop a
+      model from passing 500. Enforce limits in the schema (<code>maximum</code>, <code>enum</code>, and
+      <code>strict</code> from <a href="m07-tools-as-contracts.html">M07</a>) <em>and</em> in your function. The
+      description explains the rule; the code keeps it.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> verb-and-object names, one prefix style, the same parameter
+      name everywhere. Put "when to use, what it returns, and what comes next" in the description, and keep the
+      system prompt for the task itself.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="results">
+    <h2>Results the model can read</h2>
+    <p>Designers spend hours on tool definitions and almost no time on tool results. Yet the result is what the
+      model actually reasons over, and it stays in the history for every remaining step of the run. A good result is:</p>
+    <ul>
+      <li><strong>Concise.</strong> Only the fields that help the model decide what to do next. Internal fields
+        such as <code>owner_acl</code>, <code>etag</code>, or <code>row_version</code> are noise.</li>
+      <li><strong>Identifiable.</strong> Every item carries a stable id the model can pass to the next tool. A
+        short readable id (<code>n12</code>) works better than a 36-character UUID, which costs tokens and is easy
+        to garble when copied. If your system uses UUIDs, map them to short ids at the tool boundary.</li>
+      <li><strong>Readable.</strong> Plain lines or compact JSON with meaningful keys. Dates as
+        <code>2026-10-02</code>, not epoch seconds.</li>
+      <li><strong>Bounded.</strong> A known maximum size, with a note when something was cut (next section).</li>
+      <li><strong>Self-explaining when empty.</strong> "No notes matched 'pixi'. Try fewer or different words." is
+        far more useful than <code>[]</code>, which the model may read as "the tool failed".</li>
+    </ul>
+    <p>Here is the same search result two ways. Predict which is smaller before you run it.</p>
+    <div class="runnable" data-title="Raw records versus a formatted result" data-predict>
+<textarea>
+import json
+import agentlab as al
+
+raw = [
+    {"uuid": "9f1c2e7a-4b1d-4c8e-9a52-1d3f5e7c9b20", "title": "Pixi tasks", "tags": ["pixi", "tooling"],
+     "created_at": 1790000000, "updated_at": 1790500000, "owner_acl": ["u_1", "u_7"], "etag": "W/\"8c1\"",
+     "body": "Tasks live in pixi.toml under [tasks]. depends-on chains them. " * 6},
+    {"uuid": "3b7e0d44-90aa-4f63-8f0e-6c2a1b9d4e11", "title": "Agent loop notes", "tags": ["agents"],
+     "created_at": 1790100000, "updated_at": 1790200000, "owner_acl": ["u_1"], "etag": "W/\"2f9\"",
+     "body": "Loop on stop_reason. Return every tool_result in one user message. " * 6},
+]
+SHORT_IDS = {"9f1c2e7a-4b1d-4c8e-9a52-1d3f5e7c9b20": "n1", "3b7e0d44-90aa-4f63-8f0e-6c2a1b9d4e11": "n2"}
+
+def format_hits(records):
+    lines = []
+    for r in records:
+        snippet = r["body"][:60].rstrip() + "..."
+        lines.append(f"{SHORT_IDS[r['uuid']]} | {r['title']} | tags: {', '.join(r['tags'])} | {snippet}")
+    return "\n".join(lines)
+
+print("raw tokens:      ", al.estimate_tokens(json.dumps(raw)))
+print("formatted tokens:", al.estimate_tokens(format_hits(raw)))
+print(format_hits(raw))
+</textarea>
+    </div>
+    <p>The formatted result keeps everything the model needs to pick a note (id, title, tags, a snippet) and drops
+      the rest. If the model wants the full body, it calls <code>notes_read("n1")</code>: the search tool points to
+      the next step instead of trying to be every step at once.</p>
+    <h3>Let the model ask for more detail</h3>
+    <p>Sometimes the model does need more. Rather than always returning everything, give the tool a small switch:
+      a <code>detail</code> parameter with an enum such as <code>["brief", "full"]</code>, defaulting to
+      <code>"brief"</code>. The description says when <code>"full"</code> is worth it. The model then pays for detail
+      only when it needs it.</p>
+    <h3>Errors are results too</h3>
+    <p><a href="m10-errors-as-data.html">M10</a> showed that a failed tool returns a <code>tool_result</code> with
+      <code>"is_error": True</code>. Design those messages as carefully as success results: say what went wrong and
+      what to do instead. Compare <code>KeyError: 'n99'</code> with
+      <code>"No note with id n99. Ids look like n12; get them from notes_search."</code> The second one teaches the
+      model how to recover on the very next step.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> return the fields that drive the next decision, short
+      stable ids, readable values, a helpful sentence when empty, and errors that say how to recover. Point to a
+      detail tool rather than inlining everything.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="truncation">
+    <h2>Truncation and pagination</h2>
+    <p>Any tool that returns data you do not control (search results, file contents, logs, web pages) can return
+      something enormous. One 200 KB log file in a tool result is roughly 50,000 tokens that ride along on every later
+      step of the run. Every such tool needs a size cap, and every cap needs a note so the model knows it saw only
+      part of the data.</p>
+    <div class="runnable" data-title="Truncate with a note, never silently">
+<textarea>
+def truncate(text, max_chars=300):
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    return (f"{cut}\n[truncated: showing {max_chars} of {len(text)} characters. "
+            f"Call read_file with offset={max_chars} to continue.]")
+
+log = "\n".join(f"2026-10-30 12:{i:02d} INFO request ok" for i in range(40))
+print(truncate("short text"))
+print("---")
+print(truncate(log))
+</textarea>
+    </div>
+    <p>A silent cut is worse than no cut: the model reasons as if it saw everything and may confidently report that
+      an error "does not appear in the log". The note turns a hidden limit into information the model can act on.</p>
+    <h3>Pagination with a cursor</h3>
+    <p>For lists, the standard design is <dfn>pagination</dfn>: return one page of results plus a
+      <code>next_cursor</code> value that the model passes back to get the next page. The cursor is opaque to the
+      model; it just copies it. When there are no more results, <code>next_cursor</code> is <code>None</code>
+      (<code>null</code> in JSON). Including the total count helps the model decide whether paging on is worth
+      it.</p>
+    <p>The cell below runs a small agent loop (the one from <a href="m09-agent-loop.html">M09</a>). The second scripted
+      step is a function: it reads the first <code>tool_result</code>, takes <code>next_cursor</code> out of it, and asks
+      for the next page, which is exactly what a real model does when the result is designed well. Three script
+      steps, three requests.</p>
+    <div class="runnable" data-title="An agent paging through results">
+<textarea>
+import json
+import agentlab as al
+
+NOTES = [{"id": f"n{i}", "title": title} for i, title in enumerate(
+    ["Agent loop basics", "Agent budgets", "Pixi tasks", "Agent errors", "Agent tool design", "Grocery list"], 1)]
+
+def search_notes(query, cursor=None, page_size=2):
+    hits = [n for n in NOTES if query.lower() in n["title"].lower()]
+    start = int(cursor or 0)
+    page = hits[start:start + page_size]
+    more = start + page_size < len(hits)
+    return json.dumps({"results": page, "total": len(hits),
+                       "next_cursor": str(start + page_size) if more else None})
+
+TOOLS = [{
+    "name": "search_notes",
+    "description": "Find notes whose title contains the query. Returns one page of results, the total, "
+                   "and next_cursor; pass next_cursor back to get the next page (null means no more pages).",
+    "input_schema": {"type": "object", "properties": {
+        "query": {"type": "string", "description": "Text to find in titles."},
+        "cursor": {"type": "string", "description": "next_cursor from the previous page; omit for page one."}},
+        "required": ["query"]},
+}]
+
+def next_page(request):
+    page = json.loads(request.tool_results[0]["content"])
+    return al.tool_call("search_notes", {"query": "agent", "cursor": page["next_cursor"]})
+
+client = al.MockClient([
+    al.tool_call("search_notes", {"query": "agent"}),
+    next_page,
+    "You have 4 notes about agents: n1, n2, n4, and n5.",
+])
+
+messages = [{"role": "user", "content": "Which of my notes are about agents?"}]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    results = [{"type": "tool_result", "tool_use_id": b.id, "content": search_notes(**b.input)}
+               for b in response.content if b.type == "tool_use"]
+    messages.append({"role": "user", "content": results})
+
+print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <aside class="callout note" data-title="Why a cursor and not page numbers?">
+      <p>An integer offset is fine for a toy. Real back ends often page by an opaque token because the data can
+        change between calls, and offsets then skip or repeat items. Calling the parameter <code>cursor</code> and
+        treating it as an opaque string from day one means you can change how it works without changing the tool's
+        contract.</p>
+    </aside>
+    <aside class="callout warn"><p>Cap <code>page_size</code> or <code>limit</code> in code, not just in the schema.
+      If a caller passes <code>limit=10000</code>, clamp it to your maximum and say so in the result.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> every tool that returns external data needs a size cap and
+      a visible truncation note. For lists, return a page, the total, and a <code>next_cursor</code> the model can pass
+      back.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="read-write">
+    <h2>Read tools, write tools, and confirmation</h2>
+    <p>A <dfn>read tool</dfn> only looks: search, read, list, get the weather. Calling it twice, or calling it by
+      mistake, wastes a little time and nothing else. A <dfn>write tool</dfn> changes something outside the
+      conversation: it creates, updates, deletes, sends, pays, deploys. A mistaken write can lose data or send an email
+      you cannot unsend. The two kinds deserve different treatment.</p>
+    <ul>
+      <li><strong>Keep them separate.</strong> Never hide a write inside a read (<code>search_notes</code> that also
+        "cleans up" duplicates). The tool name and description must make side effects obvious.</li>
+      <li><strong>Say it in the description.</strong> End read tools with "Read-only." and write tools with what
+        they change: "Permanently deletes the note. Cannot be undone."</li>
+      <li><strong>Gate risky writes in your code.</strong> Before your dispatcher runs a write tool, it asks for
+        confirmation: a human prompt in an interactive app, a policy check in an automated one. If confirmation is
+        refused, the tool does not run and the model gets an <code>is_error</code> result saying so.</li>
+    </ul>
+    <p>The last point is the important one. A system-prompt line such as "always ask before deleting" is a request
+      to the model. A check in your dispatcher is a guarantee. The model never runs code; your code does, so your code
+      is where the decision lives.</p>
+    <pre class="mermaid">
+flowchart LR
+  TU[tool_use block] --> K{known tool?}
+  K -- no --> E1[is_error: unknown tool, list valid names]
+  K -- yes --> W{write tool?}
+  W -- no --> RUN[run the function]
+  W -- yes --> C{confirm name, input}
+  C -- declined --> E2[is_error: declined, do not retry]
+  C -- approved --> RUN
+  RUN -- raises --> E3[is_error: what failed, how to recover]
+  RUN -- returns --> OK[tool_result with content]
+</pre>
+    <div class="runnable" data-title="A dispatcher that gates writes">
+<textarea>
+import agentlab as al
+
+NOTES = {"n1": "Buy milk", "n2": "Pixi cheatsheet draft"}
+
+def list_notes():
+    return "\n".join(f"{k} | {v}" for k, v in NOTES.items())
+
+def delete_note(note_id):
+    if note_id not in NOTES:
+        raise KeyError(f"No note with id {note_id}. Get ids from list_notes.")
+    del NOTES[note_id]
+    return f"Deleted {note_id}."
+
+REGISTRY = {  # name -> (function, writes?)
+    "list_notes": (list_notes, False),
+    "delete_note": (delete_note, True),
+}
+
+def run_tool(block, confirm):
+    def error(text):
+        return {"type": "tool_result", "tool_use_id": block.id, "content": text, "is_error": True}
+    if block.name not in REGISTRY:
+        return error(f"Unknown tool {block.name}. Available: {', '.join(REGISTRY)}.")
+    func, writes = REGISTRY[block.name]
+    if writes and not confirm(block.name, block.input):
+        return error(f"The user declined {block.name}. Do not retry; tell the user it was not done.")
+    try:
+        return {"type": "tool_result", "tool_use_id": block.id, "content": func(**block.input)}
+    except KeyError as exc:
+        return error(str(exc.args[0]))
+
+def say_no(name, args):
+    print(f"[confirm] {name}({args}) -> declined")
+    return False
+
+def answer(request):
+    declined = request.tool_results[0].get("is_error")
+    return "I did not delete n2 because you declined." if declined else "Deleted n2."
+
+client = al.MockClient([al.tool_call("delete_note", {"note_id": "n2"}), answer])
+messages = [{"role": "user", "content": "Delete my Pixi draft (n2)."}]
+
+TOOLS = [
+    {"name": "list_notes", "description": "List note ids and titles. Read-only.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "delete_note", "description": "Permanently delete one note by id. Cannot be undone.",
+     "input_schema": {"type": "object", "properties": {"note_id": {"type": "string"}}, "required": ["note_id"]}},
+]
+while True:
+    response = client.messages.create(model=al.MODEL, max_tokens=512, tools=TOOLS, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    if response.stop_reason != "tool_use":
+        break
+    results = [run_tool(b, say_no) for b in response.content if b.type == "tool_use"]
+    messages.append({"role": "user", "content": results})
+
+print(al.format_transcript(messages))
+print("notes left:", sorted(NOTES))
+</textarea>
+    </div>
+    <p>Change <code>say_no</code> to return <code>True</code> and run it again: the note is deleted and the scripted
+      model reports success. The model's request was identical both times. Only your dispatcher's decision
+      changed.</p>
+    <aside class="callout think"><p>Which tools in an agent you use daily would you gate? Reading a file: no.
+      Overwriting a file: probably. Sending a message to another person: always. A useful test: "If the model called
+      this by mistake, could I undo it in under a minute?" If not, gate it.</p></aside>
+    <aside class="callout note" data-title="Coming later">
+      <p>Confirmation is the first piece of a larger topic. Stage 6 of the <a href="../reference/roadmap.html">roadmap</a>
+        covers permissions, sandboxing, human-in-the-loop design, and prompt injection, where text inside a tool result
+        tries to talk the model into calling a write tool. Gating writes in code is also your first defense there.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> separate reads from writes and say which is which in the
+      description. Enforce confirmation in the dispatcher, not the prompt. A declined write returns an
+      <code>is_error</code> result that tells the model not to retry.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="idempotency">
+    <h2>Idempotency: safe to call twice</h2>
+    <p>An operation is <dfn>idempotent</dfn> if doing it twice has the same effect as doing it once. Setting a light
+      to "on" is idempotent; flipping the switch is not. In an agent, tools get called more than once more often than
+      you would expect: the model repeats a call it is unsure about, your loop retries after a timeout without knowing
+      whether the first attempt landed (<a href="m10-errors-as-data.html">M10</a>), or a run restarts from a saved
+      history.</p>
+    <p>Predict what each pair of calls leaves behind:</p>
+    <div class="runnable" data-title="Toggle versus set" data-predict>
+<textarea>
+done = {"n1": False}
+
+def toggle_done(note_id):          # not idempotent
+    done[note_id] = not done[note_id]
+
+def set_done(note_id, value):      # idempotent
+    done[note_id] = value
+
+toggle_done("n1"); toggle_done("n1")   # a retry repeats the call
+print("after two toggles:", done["n1"])
+
+set_done("n1", True); set_done("n1", True)
+print("after two sets:  ", done["n1"])
+</textarea>
+    </div>
+    <p>The toggle undid itself. Three design moves make write tools safe to repeat:</p>
+    <ol>
+      <li><strong>Set state, do not flip it.</strong> <code>set_done(note_id, true)</code> instead of
+        <code>toggle_done(note_id)</code>; <code>set_quantity(item, 3)</code> instead of <code>add_one(item)</code>.</li>
+      <li><strong>Accept a caller-chosen key for creates.</strong> <code>create_note(title, text, request_id)</code>
+        stores the <code>request_id</code>; a second call with the same key returns the existing note instead of
+        making a duplicate.</li>
+      <li><strong>Make deletes tolerant.</strong> Deleting something already gone can report "already deleted"
+        rather than failing, so a retry does not look like an error.</li>
+    </ol>
+    <pre><code class="language-python">CREATED: dict[str, str] = {}   # request_id -> note id
+
+def create_note(title: str, text: str, request_id: str) -&gt; str:
+    if request_id in CREATED:
+        return f"Already created as {CREATED[request_id]} (same request_id); nothing new was made."
+    note_id = store(title, text)
+    CREATED[request_id] = note_id
+    return f"Created {note_id}."</code></pre>
+    <aside class="callout note"><p>This is a preview. Idempotency keys, retries, and exactly-once side effects are a
+      Stage 6 topic. For now, notice non-idempotent tools when you design them and prefer the "set" form.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> assume every write tool may be called twice. Set state
+      instead of toggling, give creates a request key, and let deletes of missing items succeed quietly.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="testing">
+    <h2>Testing tools alone</h2>
+    <p>A tool is an ordinary Python function with a JSON-shaped interface. You can test almost everything about it
+      without any model, mock or real. That matters: when an agent misbehaves, you want to know immediately whether the
+      tool is wrong or the model's use of it is. Test in layers:</p>
+    <ol>
+      <li><strong>The function.</strong> Inputs to outputs, including empty results, caps, truncation, and the
+        error messages for bad input. These are fast, deterministic unit tests.</li>
+      <li><strong>The definition.</strong> The schema is valid, required fields exist in <code>properties</code>, every
+        parameter has a description, and an example input passes <code>al.validate</code>.</li>
+      <li><strong>The dispatcher.</strong> Unknown names, gated writes, and exceptions all become
+        <code>tool_result</code> blocks with the right <code>tool_use_id</code> and <code>is_error</code>.</li>
+      <li><strong>One scripted run.</strong> A <code>MockClient</code> script drives a full loop, and the test
+        inspects <code>client.requests</code> to check exactly what your code sent back to the model.</li>
+    </ol>
+    <div class="runnable" data-title="Four layers of tool tests">
+<textarea>
+import agentlab as al
+
+NOTES = {"n1": "Pixi tasks", "n2": "Agent loop", "n3": "Agent budgets"}
+
+def search_notes(query, limit=5):
+    limit = max(1, min(limit, 10))
+    hits = [f"{k} | {v}" for k, v in NOTES.items() if query.lower() in v.lower()]
+    if not hits:
+        return f"No notes matched {query!r}. Try fewer or different words."
+    return "\n".join(hits[:limit])
+
+TOOL = {"name": "search_notes", "description": "Find notes by title keyword. Read-only.",
+        "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
+            "query": {"type": "string", "description": "Keyword."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Max results."}}}}
+
+def test_function():
+    assert search_notes("agent") == "n2 | Agent loop\nn3 | Agent budgets"
+    assert search_notes("agent", limit=1) == "n2 | Agent loop"
+    assert search_notes("agent", limit=999).count("\n") == 1, "limit is clamped, not trusted"
+    assert search_notes("zebra").startswith("No notes matched")
+
+def test_definition():
+    schema = TOOL["input_schema"]
+    assert all(key in schema["properties"] for key in schema["required"])
+    assert all("description" in p for p in schema["properties"].values())
+    assert al.validate({"query": "pixi"}, schema) == []
+    assert al.validate({"query": "pixi", "limit": 50}, schema) != []
+
+def test_scripted_run():
+    client = al.MockClient([al.tool_call("search_notes", {"query": "pixi"}), "n1 is your Pixi note."])
+    messages = [{"role": "user", "content": "Find my pixi note"}]
+    r = client.messages.create(model=al.MODEL, max_tokens=256, tools=[TOOL], messages=messages)
+    call = r.content[0]
+    messages += [{"role": "assistant", "content": r.content},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call.id,
+                                               "content": search_notes(**call.input)}]}]
+    client.messages.create(model=al.MODEL, max_tokens=256, tools=[TOOL], messages=messages)
+    sent = client.requests[1].tool_results[0]
+    assert sent["tool_use_id"] == call.id and sent["content"] == "n1 | Pixi tasks"
+
+for test in (test_function, test_definition, test_scripted_run):
+    test()
+    print("passed:", test.__name__)
+</textarea>
+    </div>
+    <p>The dispatcher layer is the exercise "Fix the agent that deletes without asking" below. In a real project these
+      functions live in <code>tests/unit/test_tools.py</code> and run with <code>pixi run test</code>; the mini-project
+      sets that up.</p>
+    <aside class="callout pro"><p>Save transcripts of real runs that went wrong and turn them into scripted tests:
+      script the model's calls exactly as they happened and assert on what your tools returned. Each bug you fix
+      becomes a regression test. Stage 5 of the <a href="../reference/roadmap.html">roadmap</a> builds this into full
+      evaluation suites.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> test the function, the definition, the dispatcher, and one
+      scripted run, in that order. Most tool bugs are caught by the first two layers, with no model involved.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="review">
+    <h2>A tool design review</h2>
+    <p>Before you ship a toolset, review it the way you would review an API for other developers. This checklist
+      collects the module in one place.</p>
+    <table>
+      <thead><tr><th>Area</th><th>Check</th></tr></thead>
+      <tbody>
+        <tr><td>Scope</td><td>Each tool maps to a task the agent performs. No two tools overlap. No tool exists only because an endpoint does.</td></tr>
+        <tr><td>Names</td><td>Verb and object, <code>snake_case</code>, one prefix style, the same parameter names everywhere.</td></tr>
+        <tr><td>Descriptions</td><td>What it does, when to use it (and its neighbor), what it returns, its limits, and whether it writes.</td></tr>
+        <tr><td>Schema</td><td>Every parameter described, with an example. Enums for closed sets. <code>minimum</code>/<code>maximum</code> for numbers. <code>strict: true</code> with <code>additionalProperties: false</code> where valid input matters.</td></tr>
+        <tr><td>Results</td><td>Only useful fields, short stable ids, readable values, a helpful empty message.</td></tr>
+        <tr><td>Size</td><td>Capped, with a visible truncation note. Lists paginate with <code>next_cursor</code>.</td></tr>
+        <tr><td>Errors</td><td><code>is_error</code> results that say what failed and how to recover.</td></tr>
+        <tr><td>Writes</td><td>Separate from reads, gated in the dispatcher, safe to repeat.</td></tr>
+        <tr><td>Tests</td><td>Function, definition, dispatcher, and one scripted run.</td></tr>
+      </tbody>
+    </table>
+    <p>Try it on this toolset from a hypothetical support agent. Find at least five problems before opening the
+      review.</p>
+    <pre><code class="language-python">TOOLS = [
+    {"name": "tickets", "description": "Ticket stuff.",
+     "input_schema": {"type": "object", "properties": {
+         "action": {"type": "string"}, "id": {"type": "string"}, "data": {"type": "object"}}}},
+    {"name": "getCustomer", "description": "Gets a customer.",
+     "input_schema": {"type": "object", "properties": {"customerId": {"type": "string"}}}},
+    {"name": "get_customer_v2", "description": "Gets a customer (newer).",
+     "input_schema": {"type": "object", "properties": {"cust": {"type": "string"}}}},
+    {"name": "search_kb", "description": "Search the knowledge base. Returns all matching articles in full.",
+     "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+]</code></pre>
+    <details class="reveal"><summary>Reveal the review</summary>
+      <ol>
+        <li><code>tickets</code> is a do-everything tool: <code>action</code> is a free string, <code>data</code> an
+          untyped object. The model must guess valid actions, and reads and writes are mixed. Split into
+          <code>tickets_search</code>, <code>tickets_read</code>, and <code>tickets_update</code> (gated).</li>
+        <li><code>getCustomer</code> and <code>get_customer_v2</code> overlap. Keep one, named
+          <code>customers_read</code>.</li>
+        <li>Inconsistent names and parameters: camelCase next to snake_case; <code>id</code>, <code>customerId</code>,
+          <code>cust</code> for similar things. Use <code>ticket_id</code> and <code>customer_id</code>.</li>
+        <li>No descriptions say when to use a tool, what it returns, or whether it writes.</li>
+        <li>No parameter descriptions, no <code>required</code> lists, no enums.</li>
+        <li><code>search_kb</code> returns every matching article in full: unbounded results. Return titles, ids,
+          and snippets with a cap and a cursor; add <code>kb_read(article_id)</code>.</li>
+        <li><code>q</code> says nothing; call it <code>query</code> and give an example.</li>
+      </ol>
+    </details>
+    <aside class="callout tip"><p><strong>Remember:</strong> run the checklist on every new toolset. Most fixes are
+      small (rename, merge, add a cap) and pay off on every single step of every run.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser and are graded instantly. Start with the first and work down.</p>
+
+    <div class="exercise" data-id="m12-e1" data-title="Format search hits for the model">
+      <div class="exercise-prompt">
+        <p>Write <code>format_hits(hits, limit=3)</code>. Each hit is a dict with <code>id</code>, <code>title</code>,
+          <code>tags</code> (a list of strings), and <code>body</code>. Return a single string:</p>
+        <ul>
+          <li>One line per hit, for at most <code>limit</code> hits:
+            <code>"{id} | {title} | tags: {tags joined by ', '}"</code>. When a hit has no tags, write
+            <code>tags: -</code>. Do not include the body.</li>
+          <li>If hits were left out, add a final line:
+            <code>"... {n} more not shown. Narrow the query or call again with offset={limit}."</code></li>
+          <li>If <code>hits</code> is empty, return exactly
+            <code>"No notes matched. Try fewer or different words."</code></li>
+        </ul>
+        <p>Lines are joined with <code>"\n"</code>.</p>
+      </div>
+<textarea class="starter">
+def format_hits(hits, limit=3):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+HITS = [
+    {"id": "n1", "title": "Pixi tasks", "tags": ["pixi", "tooling"], "body": "long body " * 50},
+    {"id": "n2", "title": "Agent loop", "tags": [], "body": "x"},
+    {"id": "n3", "title": "Budgets", "tags": ["agents"], "body": "y"},
+    {"id": "n4", "title": "Errors", "tags": ["agents"], "body": "z"},
+    {"id": "n5", "title": "Design", "tags": ["agents"], "body": "w"},
+]
+
+def test_single_line_format():
+    assert format_hits(HITS[:1]) == "n1 | Pixi tasks | tags: pixi, tooling", "one hit: 'id | title | tags: a, b'"
+
+def test_no_tags_dash():
+    assert format_hits(HITS[1:2]) == "n2 | Agent loop | tags: -", "a hit with no tags shows 'tags: -'"
+
+def test_body_not_included():
+    assert "long body" not in format_hits(HITS), "leave the body out; the model can read the note by id"
+
+def test_truncation_note():
+    out = format_hits(HITS, limit=3).split("\n")
+    assert len(out) == 4, f"3 hit lines plus 1 note line expected, got {len(out)} lines"
+    assert out[2] == "n3 | Budgets | tags: agents", "the third line should be the third hit"
+    assert out[3] == "... 2 more not shown. Narrow the query or call again with offset=3.", f"note line was {out[3]!r}"
+
+def test_no_note_when_all_fit():
+    assert "more not shown" not in format_hits(HITS[:3], limit=3), "no note when nothing was cut"
+    assert len(format_hits(HITS, limit=10).split("\n")) == 5, "limit=10 shows all five hits"
+
+def test_empty():
+    assert format_hits([]) == "No notes matched. Try fewer or different words.", "empty results need a helpful sentence"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Build a list of lines from <code>hits[:limit]</code>, use
+        <code>", ".join(tags) or "-"</code>, then append the note when <code>len(hits) &gt; limit</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def format_hits(hits, limit=3):
+    if not hits:
+        return "No notes matched. Try fewer or different words."
+    lines = [f"{h['id']} | {h['title']} | tags: {', '.join(h['tags']) or '-'}" for h in hits[:limit]]
+    hidden = len(hits) - limit
+    if hidden &gt; 0:
+        lines.append(f"... {hidden} more not shown. Narrow the query or call again with offset={limit}.")
+    return "\n".join(lines)</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m12-e2" data-title="Paginate with a cursor">
+      <div class="exercise-prompt">
+        <p>Write <code>search_page(notes, query, cursor=None, page_size=2)</code>. <code>notes</code> is a list of
+          dicts with <code>id</code> and <code>title</code>. A note matches when <code>query</code> appears in its
+          title, ignoring case; keep the original order.</p>
+        <ul>
+          <li>The cursor is a string holding the start offset; <code>None</code> means the first page.</li>
+          <li>Return a dict: <code>{"results": [...], "total": n, "next_cursor": ...}</code>, where
+            <code>results</code> holds the matching notes for this page (as <code>{"id", "title"}</code> dicts),
+            <code>total</code> is the number of matches overall, and <code>next_cursor</code> is the next start offset
+            as a string, or <code>None</code> when this is the last page.</li>
+          <li>A cursor that is not a string of digits raises <code>ValueError</code> with a message that mentions
+            <code>next_cursor</code>, so the model learns where valid cursors come from.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+def search_page(notes, query, cursor=None, page_size=2):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import json
+
+NOTES = [{"id": f"n{i}", "title": t} for i, t in enumerate(
+    ["Agent loop", "Pixi", "agent budgets", "Groceries", "AGENT errors", "Agent design", "Misc"], 1)]
+
+def test_first_page():
+    page = search_page(NOTES, "agent")
+    assert page["results"] == [{"id": "n1", "title": "Agent loop"}, {"id": "n3", "title": "agent budgets"}], f"got {page['results']}"
+    assert page["total"] == 4, "total counts every match, not just this page"
+    assert page["next_cursor"] == "2", "next_cursor is the next offset as a string"
+
+def test_walk_all_pages():
+    seen, cursor, calls = [], None, 0
+    while True:
+        page = search_page(NOTES, "agent", cursor)
+        seen += [r["id"] for r in page["results"]]
+        cursor, calls = page["next_cursor"], calls + 1
+        if cursor is None:
+            break
+        assert calls < 10, "next_cursor never became None"
+    assert seen == ["n1", "n3", "n5", "n6"], f"following next_cursor should visit every match once, got {seen}"
+    assert calls == 2, "4 matches with page_size=2 is exactly 2 pages"
+
+def test_page_size():
+    page = search_page(NOTES, "agent", page_size=3)
+    assert len(page["results"]) == 3 and page["next_cursor"] == "3", "respect page_size"
+
+def test_no_matches():
+    page = search_page(NOTES, "zebra")
+    assert page == {"results": [], "total": 0, "next_cursor": None}, f"no matches: got {page}"
+
+def test_json_serializable():
+    json.dumps(search_page(NOTES, "agent"))
+
+def test_bad_cursor():
+    try:
+        search_page(NOTES, "agent", "page-two")
+    except ValueError as e:
+        assert "next_cursor" in str(e), "the error should tell the model to use a next_cursor value"
+    else:
+        assert False, "a non-numeric cursor should raise ValueError"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Filter with <code>query.lower() in n["title"].lower()</code>.
+        Validate with <code>cursor.isdigit()</code>, then slice <code>hits[start:start + page_size]</code>. There is a
+        next page when <code>start + page_size &lt; len(hits)</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def search_page(notes, query, cursor=None, page_size=2):
+    if cursor is None:
+        start = 0
+    elif isinstance(cursor, str) and cursor.isdigit():
+        start = int(cursor)
+    else:
+        raise ValueError(f"Invalid cursor {cursor!r}: pass the next_cursor value from the previous page, or omit it.")
+    hits = [{"id": n["id"], "title": n["title"]} for n in notes if query.lower() in n["title"].lower()]
+    end = start + page_size
+    return {
+        "results": hits[start:end],
+        "total": len(hits),
+        "next_cursor": str(end) if end &lt; len(hits) else None,
+    }</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m12-e3" data-title="A tool definition linter">
+      <div class="exercise-prompt">
+        <p>Automate part of the design review. Write <code>review_tool(tool)</code> that returns a list of problem
+          strings (empty when the tool passes). Each problem must start with the prefix shown:</p>
+        <ol>
+          <li><code>"name: ..."</code> when the name does not match <code>^[a-z][a-z0-9_]*$</code> or is longer than 64
+            characters (lowercase snake_case only).</li>
+          <li><code>"description: ..."</code> when the description is missing or shorter than 40 characters.</li>
+          <li><code>"property {key}: ..."</code> for each property in <code>input_schema["properties"]</code> that
+            has no <code>"description"</code>.</li>
+          <li><code>"required: ..."</code> for each name in <code>required</code> that is not a property.</li>
+          <li><code>"strict: ..."</code> when <code>tool["strict"]</code> is true but the schema does not set
+            <code>additionalProperties</code> to <code>False</code>, and another <code>"strict: ..."</code> problem
+            when it is strict but has no <code>required</code> list.</li>
+        </ol>
+      </div>
+<textarea class="starter">
+import re
+
+def review_tool(tool):
+    problems = []
+    ...
+    return problems
+</textarea>
+      <script type="text/x-python" class="tests">
+GOOD = {
+    "name": "notes_search",
+    "description": "Find notes by keyword. Use before notes_read. Returns up to 5 'id | title' lines. Read-only.",
+    "strict": True,
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"],
+                     "properties": {"query": {"type": "string", "description": "Keywords, e.g. 'pixi'."}}},
+}
+
+def variant(**changes):
+    import copy
+    tool = copy.deepcopy(GOOD)
+    for key, value in changes.items():
+        if key == "schema":
+            tool["input_schema"].update(value)
+        else:
+            tool[key] = value
+    return tool
+
+def starts(problems, prefix):
+    return [p for p in problems if p.startswith(prefix)]
+
+def test_good_tool_passes():
+    assert review_tool(GOOD) == [], f"a well-designed tool should have no problems, got {review_tool(GOOD)}"
+
+def test_bad_names():
+    for name in ["getCustomer", "search notes", "2fast", "notes-search", "a" * 65]:
+        assert starts(review_tool(variant(name=name)), "name:"), f"name {name!r} should be flagged with 'name: ...'"
+
+def test_short_or_missing_description():
+    assert starts(review_tool(variant(description="Searches notes.")), "description:"), "short description not flagged"
+    tool = variant()
+    del tool["description"]
+    assert starts(review_tool(tool), "description:"), "missing description not flagged"
+
+def test_property_descriptions():
+    tool = variant(schema={"properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                           "required": ["query"]})
+    found = starts(review_tool(tool), "property ")
+    assert len(found) == 2, f"both undescribed properties should be flagged, got {found}"
+    assert any("query" in p for p in found) and any("limit" in p for p in found), "name the property in the message"
+
+def test_required_not_a_property():
+    found = starts(review_tool(variant(schema={"required": ["query", "q"]})), "required:")
+    assert len(found) == 1 and "q" in found[0], f"'q' is required but not a property; got {found}"
+
+def test_strict_rules():
+    tool = variant()
+    del tool["input_schema"]["additionalProperties"]
+    del tool["input_schema"]["required"]
+    assert len(starts(review_tool(tool), "strict:")) == 2, "strict needs additionalProperties false AND a required list"
+    tool["strict"] = False
+    assert starts(review_tool(tool), "strict:") == [], "non-strict tools are not held to strict rules"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Use <code>re.fullmatch(r"[a-z][a-z0-9_]*", name)</code> and
+        <code>len(name) &lt;= 64</code>. Read the schema with <code>tool.get("input_schema", {})</code> and use
+        <code>.get</code> everywhere so missing keys do not crash the linter.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import re
+
+def review_tool(tool):
+    problems = []
+    name = tool.get("name", "")
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name) or len(name) &gt; 64:
+        problems.append(f"name: {name!r} should be lowercase snake_case, at most 64 characters")
+    description = tool.get("description", "")
+    if len(description) &lt; 40:
+        problems.append("description: say what the tool does, when to use it, and what it returns (40+ characters)")
+    schema = tool.get("input_schema", {})
+    properties = schema.get("properties", {})
+    for key, spec in properties.items():
+        if "description" not in spec:
+            problems.append(f"property {key}: missing description")
+    for key in schema.get("required", []):
+        if key not in properties:
+            problems.append(f"required: {key!r} is required but is not a property")
+    if tool.get("strict"):
+        if schema.get("additionalProperties") is not False:
+            problems.append("strict: set additionalProperties to False")
+        if "required" not in schema:
+            problems.append("strict: add a required list")
+    return problems</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m12-e4" data-title="Fix the agent that deletes without asking">
+      <div class="exercise-prompt">
+        <p>A teammate's notes agent produced this transcript. The user only asked to <em>see</em> their notes, but the
+          model also tried to tidy up, and the agent deleted a note with no confirmation. A second run crashed with a
+          <code>KeyError</code> when the model asked for a note that did not exist.</p>
+        <pre><code>user: Show me my notes and tidy up anything old.
+assistant: tool_use list_notes {} [toolu_mock_0001]
+user: tool_result [toolu_mock_0001] n1 | Buy milk n2 | Pixi cheatsheet
+assistant: tool_use delete_note {"note_id": "n1"} [toolu_mock_0002]
+user: tool_result [toolu_mock_0002] Deleted n1.
+assistant: Done. I removed your old note n1.</code></pre>
+        <p>Fix <code>run_tool(block, confirm)</code> so that:</p>
+        <ul>
+          <li>An unknown tool name returns an <code>is_error</code> result whose content contains
+            <code>"Unknown tool"</code> and lists the available names.</li>
+          <li>A write tool (in <code>WRITE_TOOLS</code>) first calls <code>confirm(name, input)</code>. If it returns
+            false, the tool does not run, and the result is an <code>is_error</code> result whose content contains
+            <code>"declined"</code>. Read tools never call <code>confirm</code>.</li>
+          <li>An exception raised by a tool becomes an <code>is_error</code> result whose content is the exception's
+            message, instead of crashing the loop.</li>
+          <li>Successful calls return a plain <code>tool_result</code> (no <code>is_error</code>, or
+            <code>is_error</code> false).</li>
+        </ul>
+        <p>Leave <code>run_agent</code> as it is.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+NOTES = {"n1": "Buy milk", "n2": "Pixi cheatsheet"}
+
+def list_notes():
+    return "\n".join(f"{k} | {v}" for k, v in NOTES.items())
+
+def delete_note(note_id):
+    if note_id not in NOTES:
+        raise KeyError(f"No note with id {note_id}. Get ids from list_notes.")
+    del NOTES[note_id]
+    return f"Deleted {note_id}."
+
+TOOLS = [
+    {"name": "list_notes", "description": "List note ids and titles. Read-only.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "delete_note", "description": "Permanently delete one note by id. Cannot be undone.",
+     "input_schema": {"type": "object", "properties": {"note_id": {"type": "string"}}, "required": ["note_id"]}},
+]
+IMPLS = {"list_notes": list_notes, "delete_note": delete_note}
+WRITE_TOOLS = {"delete_note"}
+
+def run_tool(block, confirm):
+    # BUG: runs every tool, even writes, without asking; crashes on unknown tools and exceptions
+    result = IMPLS[block.name](**block.input)
+    return {"type": "tool_result", "tool_use_id": block.id, "content": result}
+
+def run_agent(client, task, confirm):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(10):
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text
+        results = [run_tool(b, confirm) for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return "stopped: step limit"
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def reset():
+    NOTES.clear()
+    NOTES.update({"n1": "Buy milk", "n2": "Pixi cheatsheet"})
+
+def result_of(client, request_index=1):
+    return client.requests[request_index].tool_results[0]
+
+def test_declined_write_does_not_run():
+    reset()
+    client = al.MockClient([al.tool_call("delete_note", {"note_id": "n1"}), "I did not delete it."])
+    run_agent(client, "delete n1", confirm=lambda name, args: False)
+    assert "n1" in NOTES, "a declined delete must not run"
+    r = result_of(client)
+    assert r.get("is_error") is True, "a declined write should come back as is_error: True"
+    assert "declined" in str(r["content"]).lower(), "tell the model the user declined"
+
+def test_approved_write_runs():
+    reset()
+    client = al.MockClient([al.tool_call("delete_note", {"note_id": "n1"}), "Deleted."])
+    run_agent(client, "delete n1", confirm=lambda name, args: True)
+    assert "n1" not in NOTES, "an approved delete should run"
+    assert not result_of(client).get("is_error"), "a successful call is not an error"
+
+def test_reads_never_ask():
+    reset()
+    asked = []
+    client = al.MockClient([al.tool_call("list_notes", {}), "You have two notes."])
+    run_agent(client, "list", confirm=lambda name, args: asked.append(name) or True)
+    assert asked == [], f"read tools must not call confirm, but confirm was called for {asked}"
+    assert "n2 | Pixi cheatsheet" in result_of(client)["content"], "list_notes output should be the result"
+
+def test_confirm_receives_name_and_input():
+    reset()
+    seen = []
+    client = al.MockClient([al.tool_call("delete_note", {"note_id": "n2"}), "ok"])
+    run_agent(client, "delete n2", confirm=lambda name, args: seen.append((name, args)) or False)
+    assert seen == [("delete_note", {"note_id": "n2"})], f"confirm should get (name, input), got {seen}"
+
+def test_tool_exception_becomes_error_result():
+    reset()
+    client = al.MockClient([al.tool_call("delete_note", {"note_id": "n9"}), "No such note."])
+    run_agent(client, "delete n9", confirm=lambda name, args: True)
+    r = result_of(client)
+    assert r.get("is_error") is True, "an exception inside a tool should become is_error: True, not a crash"
+    assert "n9" in str(r["content"]), "pass the exception's message back so the model can recover"
+
+def test_unknown_tool():
+    reset()
+    client = al.MockClient([al.tool_call("rename_note", {"note_id": "n1"}), "Sorry."])
+    run_agent(client, "rename", confirm=lambda name, args: True)
+    r = result_of(client)
+    assert r.get("is_error") is True and "Unknown tool" in str(r["content"]), "unknown tools return an is_error result"
+    assert "list_notes" in str(r["content"]), "list the available tool names"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Write a small helper <code>error(text)</code> that builds the
+        result dict with <code>"is_error": True</code>. Check, in order: unknown name, write tool needing confirmation,
+        then run the function inside <code>try</code>/<code>except Exception as exc</code> and use
+        <code>str(exc.args[0]) if exc.args else str(exc)</code> for the message.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+NOTES = {"n1": "Buy milk", "n2": "Pixi cheatsheet"}
+
+def list_notes():
+    return "\n".join(f"{k} | {v}" for k, v in NOTES.items())
+
+def delete_note(note_id):
+    if note_id not in NOTES:
+        raise KeyError(f"No note with id {note_id}. Get ids from list_notes.")
+    del NOTES[note_id]
+    return f"Deleted {note_id}."
+
+TOOLS = [
+    {"name": "list_notes", "description": "List note ids and titles. Read-only.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "delete_note", "description": "Permanently delete one note by id. Cannot be undone.",
+     "input_schema": {"type": "object", "properties": {"note_id": {"type": "string"}}, "required": ["note_id"]}},
+]
+IMPLS = {"list_notes": list_notes, "delete_note": delete_note}
+WRITE_TOOLS = {"delete_note"}
+
+def run_tool(block, confirm):
+    def error(text):
+        return {"type": "tool_result", "tool_use_id": block.id, "content": text, "is_error": True}
+    if block.name not in IMPLS:
+        return error(f"Unknown tool {block.name}. Available: {', '.join(IMPLS)}.")
+    if block.name in WRITE_TOOLS and not confirm(block.name, block.input):
+        return error(f"The user declined {block.name}. Do not retry; tell the user it was not done.")
+    try:
+        result = IMPLS[block.name](**block.input)
+    except Exception as exc:
+        return error(str(exc.args[0]) if exc.args else str(exc))
+    return {"type": "tool_result", "tool_use_id": block.id, "content": result}
+
+def run_agent(client, task, confirm):
+    messages = [{"role": "user", "content": task}]
+    for _ in range(10):
+        response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return response.text
+        results = [run_tool(b, confirm) for b in response.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})
+    return "stopped: step limit"</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m12-e5" data-title="Consolidate three search tools into one">
+      <div class="exercise-prompt">
+        <p>An agent has three overlapping tools: <code>find_by_title(title)</code>, <code>find_by_tag(tag)</code>, and
+          <code>search_bodies(text)</code>. Replace them with one strict tool.</p>
+        <p><strong>1. The definition.</strong> Set <code>SEARCH_TOOL</code> to a tool dict with:</p>
+        <ul>
+          <li>name <code>"search_notes"</code>, <code>"strict": True</code>, and a description of at least 80
+            characters that mentions <code>read_note</code> (the tool to call next);</li>
+          <li>an object schema with <code>additionalProperties: False</code>, <code>required</code> equal to
+            <code>["query", "field"]</code>, and three described properties: <code>query</code> (string),
+            <code>field</code> (string, enum <code>["title", "tag", "body"]</code>), and <code>limit</code> (integer,
+            minimum 1, maximum 10).</li>
+        </ul>
+        <p><strong>2. The function.</strong> Write <code>search_notes(query, field, limit=5)</code> over the
+          <code>NOTES</code> list in the starter. Title and body match on a case-insensitive substring; tag matches when
+          the query equals one of the note's tags, ignoring case. Return one line per match, <code>"{id} | {title}"</code>,
+          joined with <code>"\n"</code>, at most <code>limit</code> lines, and never more than 10 even if a caller
+          passes more. With no matches return <code>"No notes matched {query!r} in {field}."</code></p>
+      </div>
+<textarea class="starter">
+NOTES = [
+    {"id": "n1", "title": "Pixi tasks", "tags": ["pixi", "tooling"], "body": "depends-on chains tasks"},
+    {"id": "n2", "title": "Agent loop", "tags": ["agents"], "body": "loop on stop_reason; pixi run it"},
+    {"id": "n3", "title": "Budgets", "tags": ["agents"], "body": "cap steps and tokens"},
+]
+
+SEARCH_TOOL = {}
+
+def search_notes(query, field, limit=5):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def schema():
+    return SEARCH_TOOL.get("input_schema", {})
+
+def test_definition_shape():
+    assert SEARCH_TOOL.get("name") == "search_notes", "name the tool search_notes"
+    assert SEARCH_TOOL.get("strict") is True, "make it a strict tool"
+    s = schema()
+    assert s.get("type") == "object" and s.get("additionalProperties") is False, "object schema with additionalProperties: False"
+    assert s.get("required") == ["query", "field"], "required should be ['query', 'field']"
+    props = s.get("properties", {})
+    assert set(props) == {"query", "field", "limit"}, f"properties should be query, field, limit; got {sorted(props)}"
+    assert props["field"].get("enum") == ["title", "tag", "body"], "field needs enum ['title', 'tag', 'body']"
+    assert props["limit"].get("type") == "integer" and props["limit"].get("minimum") == 1 and props["limit"].get("maximum") == 10, "limit: integer, minimum 1, maximum 10"
+    assert all(p.get("description") for p in props.values()), "describe every property"
+
+def test_description_steers():
+    d = SEARCH_TOOL.get("description", "")
+    assert len(d) >= 80, f"the description should be at least 80 characters, it is {len(d)}"
+    assert "read_note" in d, "mention read_note so the model knows the next step"
+
+def test_mock_accepts_and_strict_checks():
+    client = al.MockClient([al.tool_call("search_notes", {"query": "pixi", "field": "tag"}), "ok"])
+    r = client.messages.create(model=al.MODEL, max_tokens=256, tools=[SEARCH_TOOL],
+                               messages=[{"role": "user", "content": "find pixi"}])
+    assert r.stop_reason == "tool_use", "the mock should accept the definition"
+    bad = al.MockClient([al.tool_call("search_notes", {"query": "x", "field": "author"})])
+    try:
+        bad.messages.create(model=al.MODEL, max_tokens=256, tools=[SEARCH_TOOL],
+                            messages=[{"role": "user", "content": "find"}])
+    except al.MockScriptError:
+        pass
+    else:
+        assert False, "with strict and the enum, field='author' should be rejected"
+
+def test_search_fields():
+    assert search_notes("pixi", "title") == "n1 | Pixi tasks", "title search is a case-insensitive substring"
+    assert search_notes("AGENTS", "tag") == "n2 | Agent loop\nn3 | Budgets", "tag search matches whole tags, ignoring case"
+    assert search_notes("agent", "tag").startswith("No notes matched"), "'agent' is not a whole tag"
+    assert search_notes("PIXI", "body") == "n2 | Agent loop", "body search is a case-insensitive substring"
+
+def test_limit_and_cap():
+    assert search_notes("agents", "tag", limit=1) == "n2 | Agent loop", "respect limit"
+    NOTES.extend({"id": f"x{i}", "title": f"Extra {i}", "tags": [], "body": "zz"} for i in range(15))
+    try:
+        assert search_notes("zz", "body", limit=50).count("\n") == 9, "never return more than 10 lines"
+    finally:
+        del NOTES[3:]
+
+def test_empty_message():
+    assert search_notes("zebra", "title") == "No notes matched 'zebra' in title.", "use the exact empty message"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Clamp first: <code>limit = max(1, min(limit, 10))</code>. Pick a
+        match test per field: <code>q in note["title"].lower()</code>, <code>q in [t.lower() for t in note["tags"]]</code>,
+        or <code>q in note["body"].lower()</code>, where <code>q = query.lower()</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">NOTES = [
+    {"id": "n1", "title": "Pixi tasks", "tags": ["pixi", "tooling"], "body": "depends-on chains tasks"},
+    {"id": "n2", "title": "Agent loop", "tags": ["agents"], "body": "loop on stop_reason; pixi run it"},
+    {"id": "n3", "title": "Budgets", "tags": ["agents"], "body": "cap steps and tokens"},
+]
+
+SEARCH_TOOL = {
+    "name": "search_notes",
+    "description": (
+        "Find the user's notes. Choose the field: title or body for words in the text, tag for an exact tag. "
+        "Returns up to `limit` lines of 'id | title'; call read_note with an id to see a full note. Read-only."
+    ),
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["query", "field"],
+        "properties": {
+            "query": {"type": "string", "description": "Words or a tag to find, e.g. 'pixi'."},
+            "field": {"type": "string", "enum": ["title", "tag", "body"], "description": "Where to look."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Max results; default 5."},
+        },
+    },
+}
+
+def search_notes(query, field, limit=5):
+    limit = max(1, min(limit, 10))
+    q = query.lower()
+    def matches(note):
+        if field == "tag":
+            return q in [t.lower() for t in note["tags"]]
+        return q in note[field].lower()
+    hits = [f"{n['id']} | {n['title']}" for n in NOTES if matches(n)]
+    if not hits:
+        return f"No notes matched {query!r} in {field}."
+    return "\n".join(hits[:limit])</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a reviewed, tested notes toolkit</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">notes_tools: four tools, tested alone, then driven by a model</span></div>
+      <div class="widget-body">
+        <p>Build a small toolkit for a notes agent as a real Pixi project, with the tools in their own module, unit
+          tests that never touch a model, and a short agent script that runs against the real API when a key is
+          available and against <code>MockClient</code> otherwise.</p>
+        <pre data-label="Terminal"><code class="language-bash">pixi init notes-tools &amp;&amp; cd notes-tools
+pixi add python=3.14 pytest structlog anthropic
+# copy agentlab in, or add this practicum's repository as a path dependency
+mkdir -p src tests/unit
+pixi run pytest tests/unit
+pixi run python src/agent.py "Which notes mention pixi?"</code></pre>
+        <p><strong>What to build</strong></p>
+        <ul>
+          <li><code>src/notes_tools.py</code>: notes stored in a JSON file. Four tools:
+            <code>notes_search(query, field, limit, cursor)</code>, <code>notes_read(note_id)</code>,
+            <code>notes_create(title, text, request_id)</code>, and <code>notes_set_tags(note_id, tags)</code>. Each
+            has a tool definition next to its function, and a <code>REGISTRY</code> maps names to
+            <code>(function, writes)</code>.</li>
+          <li>A dispatcher <code>run_tool(block, confirm)</code> that handles unknown tools, gates write tools, and turns
+            exceptions into <code>is_error</code> results.</li>
+          <li><code>tests/unit/test_notes_tools.py</code>: the four layers from <a href="#testing">Testing tools
+            alone</a>.</li>
+          <li><code>src/agent.py</code>: the loop from <a href="m09-agent-loop.html">M09</a> with the budgets from
+            <a href="m11-stop-conditions.html">M11</a>. Use <code>al.get_client()</code> and fall back to a scripted
+            <code>al.MockClient</code> when it raises <code>al.LiveModelUnavailableError</code> or no key is set.
+            <code>confirm</code> asks on the terminal with <code>input()</code>.</li>
+          <li>Log every tool call with structlog (tool name, input, <code>is_error</code>, result size in characters)
+            as key=value or JSON lines. Structured logs let you search a week of runs for "which tool errors most"
+            without reading transcripts by hand.</li>
+        </ul>
+        <ul class="checklist" data-id="m12-mini">
+          <li>Every tool passes your <code>review_tool</code> linter from exercise 3</li>
+          <li><code>notes_search</code> returns <code>id | title | tags</code> lines, caps results at 10, and returns a
+            <code>next_cursor</code> when more exist</li>
+          <li>A search with no matches returns a sentence that suggests what to try</li>
+          <li><code>notes_create</code> called twice with the same <code>request_id</code> creates one note</li>
+          <li><code>notes_set_tags</code> sets the full tag list (no toggling) and is gated by <code>confirm</code></li>
+          <li>Declining a write returns an <code>is_error</code> result and leaves the file unchanged</li>
+          <li>Unit tests cover the function, definition, dispatcher, and one scripted run, and pass with
+            <code>pixi run pytest tests/unit</code></li>
+          <li>The API key comes only from the environment; it is not in any file in the project</li>
+        </ul>
+        <p><strong>Stretch goals</strong></p>
+        <ul>
+          <li>Add a <code>detail</code> enum (<code>"brief"</code>/<code>"full"</code>) to <code>notes_read</code> and
+            truncate brief results to 500 characters with a note.</li>
+          <li>Map internal UUIDs to short ids (<code>n1</code>, <code>n2</code>) at the tool boundary and back.</li>
+          <li>Run the real model on ten questions, save the transcripts, and count how often each tool is called. Remove
+            or merge any tool that is never used.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m12-quiz">
+<script type="application/json">
+{"title": "Tool design quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Why does a large, overlapping toolset hurt an agent even if every tool works?", "options": ["The API rejects requests with more than five tools", "Each overlap is a choice the model must make with nothing to decide it by, and every definition is re-sent on every step", "Tools are only sent on the first request, so later steps forget them", "The model reads your Python source to choose, and more code is slower to read"], "answer": 1, "explanation": "<p>The model chooses from names, descriptions, and schemas alone, so overlapping tools invite wrong or repeated calls. Because the API is stateless, every definition rides along on every request in the loop, so extra tools also cost tokens and latency on each step.</p>"},
+  {"type": "multi", "prompt": "Which belong in a good search tool result?", "options": ["A short stable id for each item", "Internal fields such as etag and owner_acl", "A note saying results were cut and how to get more", "A helpful sentence when nothing matched", "The full body of every match, always"], "answer": [0, 2, 3], "explanation": "<p>Ids let the model call the next tool; a truncation note and a helpful empty message turn limits into information. Internal fields are noise, and full bodies belong in a separate read tool so the model pays for them only when needed.</p>"},
+  {"type": "output", "prompt": "What does this print?", "code": "def fmt(hits, limit=2):\n    lines = [h for h in hits[:limit]]\n    if len(hits) > limit:\n        lines.append(f\"+{len(hits) - limit} more\")\n    return \" / \".join(lines)\n\nprint(fmt([\"n1\", \"n2\", \"n3\", \"n4\", \"n5\"]))", "answer": "n1 / n2 / +3 more", "explanation": "<p>Two hits fit under the limit, and the remaining three are summarized in a note instead of being dropped silently.</p>"},
+  {"type": "single", "prompt": "Your loop retried a call after a timeout, and the first attempt had actually succeeded. Which tool design is safe?", "options": ["toggle_done(note_id)", "add_one(item)", "set_done(note_id, value)", "append_line(file, text)"], "answer": 2, "explanation": "<p><code>set_done</code> is idempotent: two identical calls leave the same state as one. The others change state relative to what is already there, so a repeat doubles or undoes the effect.</p>"},
+  {"type": "text", "prompt": "In this module's pagination design, which result field does the model pass back to get the next page?", "answer": ["next_cursor"], "explanation": "<p>The tool returns <code>next_cursor</code> with each page; the model copies it into the <code>cursor</code> parameter. A <code>null</code> (<code>None</code>) value means there are no more pages.</p>"},
+  {"type": "single", "prompt": "The model keeps calling read_note with made-up ids instead of searching first. Where is the best place to fix that?", "options": ["Add 'ALWAYS SEARCH FIRST' in capitals to the system prompt", "In read_note's description: say the id must come from search_notes, and in its error message for unknown ids", "Force the call with tool_choice", "Raise the effort to max"], "answer": 1, "explanation": "<p>Guidance about a tool belongs where the model looks when deciding to call it: the description. A recovery hint in the <code>is_error</code> message fixes the next step too. Forcing a tool with <code>tool_choice</code> is rejected on Opus 5.5.</p>"},
+  {"type": "multi", "prompt": "Which tool names does agentlab accept?", "options": ["search_notes", "search notes", "notes.search", "get-weather"], "answer": [0, 3], "explanation": "<p>agentlab accepts letters, digits, underscores, and hyphens, up to 64 characters. Spaces and dots are rejected with <code>BadRequestError</code>. Within this course, prefer snake_case for consistency.</p>"},
+  {"type": "single", "prompt": "Where should 'ask before deleting' be enforced?", "options": ["In the system prompt", "In the tool description only", "In your dispatcher code, before the write tool runs", "Nowhere; the model will not delete things unprompted"], "answer": 2, "explanation": "<p>The model never runs code; your dispatcher does. A check there is a guarantee, while prompt text and descriptions are requests. Describe the side effect too, but enforce it in code.</p>"},
+  {"type": "output", "prompt": "What does this print?", "code": "def truncate(text, n=5):\n    if len(text) <= n:\n        return text\n    return text[:n] + f\" [{len(text) - n} more chars]\"\n\nprint(truncate(\"abcdefgh\"))", "answer": "abcde [3 more chars]", "explanation": "<p>The first five characters are kept and the note says how much was cut, so the model knows it saw only part of the text.</p>"},
+  {"type": "single", "prompt": "A file-reading tool returns a 200 KB log in full. What is the main problem?", "options": ["The API refuses tool results over 1 KB", "Tens of thousands of tokens are added to the history and re-sent on every later step", "The model cannot read logs", "tool_result content must be JSON"], "answer": 1, "explanation": "<p>Everything in the history is re-sent each step, so one huge result taxes the rest of the run in cost and latency and crowds out useful context. Cap it, and say that you did.</p>"},
+  {"type": "single", "prompt": "Which test needs no model, mock or real?", "options": ["Checking that search_notes clamps limit=999 to 10", "Checking that the model chooses search_notes for a question", "Checking how a real model words its final answer", "Checking how many steps a real run takes"], "answer": 0, "explanation": "<p>A tool is an ordinary function, so its caps, formatting, and errors are plain unit tests. Only questions about the model's choices need a model; scripted mock runs then check what your code sent back.</p>"},
+  {"type": "text", "prompt": "Which tool_result key, set to true, tells the model the call failed?", "answer": ["is_error"], "explanation": "<p><code>\"is_error\": True</code> marks a failed call. Pair it with content that says what went wrong and how to recover (see M10).</p>"},
+  {"type": "single", "prompt": "The user declines a write in your confirm step. What should the dispatcher send back?", "options": ["Nothing; skip the tool_result for that call", "A tool_result with is_error true that says the user declined and the model should not retry", "A plain text user message saying 'no'", "Raise an exception to stop the loop"], "answer": 1, "explanation": "<p>Every <code>tool_use</code> needs a matching <code>tool_result</code> in the next message, or the next request fails with <code>BadRequestError</code>. An <code>is_error</code> result that says what happened lets the model tell the user honestly.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>A toolset is the model's whole view of your system: names, descriptions, schemas, and results. Every word is re-sent on every step.</li>
+      <li>Design tools around tasks. Merge tools that differ only by a parameter; drop tools that invite floods; one tool per kind of action.</li>
+      <li>Verb-and-object snake_case names, one prefix style, one name per concept.</li>
+      <li>Descriptions say what the tool does, when to use it, what it returns, and what to call next. Enforce limits in the schema and code too.</li>
+      <li>Results: useful fields only, short stable ids, readable values, helpful empty and error messages.</li>
+      <li>Cap every result and say so when you cut. Paginate lists with <code>next_cursor</code>.</li>
+      <li>Separate reads from writes and gate writes in the dispatcher. Declined writes return <code>is_error</code>.</li>
+      <li>Assume writes can repeat: set rather than toggle, use request keys for creates.</li>
+      <li>Test tools alone first: function, definition, dispatcher, then one scripted run.</li>
+    </ul>
+    <div class="flashcards" data-title="Tool design">
+      <script type="application/json">
+      [{"front": "What does the model know about a tool?", "back": "Only its name, description, input schema, and the results it returns."},
+       {"front": "Why do extra tools cost tokens on every step?", "back": "The API is stateless, so tool definitions are sent with every request in the loop."},
+       {"front": "Rule of thumb for tool granularity", "back": "One tool per distinct kind of action, with parameters for variations of that action."},
+       {"front": "Four things a tool description should say", "back": "What it does, when to use it (and when not), what it returns, and its limits or side effects."},
+       {"front": "Why short ids instead of UUIDs in results?", "back": "They cost fewer tokens and are harder for the model to garble when it passes them to the next tool."},
+       {"front": "Silent truncation vs truncation with a note", "back": "A silent cut makes the model reason as if it saw everything; a note tells it what is missing and how to get more."},
+       {"front": "What is next_cursor?", "back": "An opaque value a paginated tool returns; the model passes it back to get the next page. None means no more pages."},
+       {"front": "Read tool vs write tool", "back": "A read only looks; a write changes something outside the conversation and should be gated."},
+       {"front": "Where is confirmation for writes enforced?", "back": "In your dispatcher, before the function runs. Prompts and descriptions only ask."},
+       {"front": "Idempotent", "back": "Doing it twice has the same effect as doing it once, like set_done(id, True) and unlike toggle_done(id)."},
+       {"front": "Four layers of tool tests", "back": "The function, the definition, the dispatcher, and one scripted MockClient run."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Claude docs: Tool use overview</a></li>
+      <li><a href="https://www.anthropic.com/engineering/writing-tools-for-agents">Anthropic engineering: Writing effective tools for agents</a></li>
+      <li><a href="https://json-schema.org/understanding-json-schema/">Understanding JSON Schema</a></li>
+      <li><a href="https://docs.pytest.org/en/stable/getting-started.html">pytest: Get started</a></li>
+      <li><a href="../reference/agent-loop-cheatsheet.html">Agent Loop Cheat Sheet</a> and <a href="../reference/agentlab.html">agentlab Reference</a></li>
+      <li>Next: <a href="../projects/c1-research-agent.html">Capstone 1: Research Agent</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>
