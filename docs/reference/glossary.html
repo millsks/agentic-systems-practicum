@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+<style>
+  .gl-tools { position: sticky; top: calc(var(--header-h, 56px) + 8px); z-index: 2; background: var(--bg); padding: 0.6em 0; border-bottom: 1px solid var(--border); margin-bottom: 1em; }
+  .gl-tools input { width: 100%; font: inherit; padding: 0.55em 0.8em; border: 1px solid var(--border-strong, var(--border)); border-radius: var(--radius, 8px); background: var(--bg-elev, var(--bg)); color: var(--fg); }
+  .gl-letters { display: flex; flex-wrap: wrap; gap: 4px 10px; font-weight: 600; margin: 0.5em 0 0; }
+  .gl-letters a { text-decoration: none; }
+  .gl-list { margin: 0 0 1em; }
+  .gl-entry { padding: 0.55em 0; border-bottom: 1px solid var(--border); }
+  .gl-entry dt { font-weight: 650; scroll-margin-top: calc(var(--header-h, 56px) + 140px); }
+  .gl-entry dd { margin: 0.2em 0 0; color: var(--fg); }
+  .gl-module { font-size: 0.85em; white-space: nowrap; }
+  .gl-entry[hidden], .gl-letter[hidden], .gl-list[hidden] { display: none; }
+</style>
+</head>
+<body data-root="../" data-page="ref-glossary">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Reference · Vocabulary</p>
+    <h1>Glossary</h1>
+    <p class="lede">85 terms used in Level 1, from tokens and the Messages API to the agent loop and tool
+      design. Each entry has a short definition and a link to the module that teaches it.</p>
+    <div class="lesson-meta"><span>⏱ Look things up as you go</span><span>85 terms</span></div>
+    <ul class="objectives">
+      <li>Look up any term used in Level 1 and jump to where it is taught</li>
+      <li>Filter by keyword</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="terms">
+    <h2>Terms A-Z</h2>
+    <div class="gl-tools" role="search">
+      <label class="visually-hidden" for="gl-filter">Filter the glossary</label>
+      <input id="gl-filter" type="search" placeholder="Filter terms and definitions, e.g. tool_result, budget, stream" autocomplete="off">
+      <nav class="gl-letters" aria-label="Jump to letter"><a href="#letter-a">A</a> <a href="#letter-b">B</a> <a href="#letter-c">C</a> <a href="#letter-d">D</a> <a href="#letter-e">E</a> <a href="#letter-f">F</a> <a href="#letter-g">G</a> <a href="#letter-i">I</a> <a href="#letter-j">J</a> <a href="#letter-l">L</a> <a href="#letter-m">M</a> <a href="#letter-n">N</a> <a href="#letter-o">O</a> <a href="#letter-p">P</a> <a href="#letter-r">R</a> <a href="#letter-s">S</a> <a href="#letter-t">T</a> <a href="#letter-u">U</a> <a href="#letter-w">W</a> <a href="#letter-x">X</a></nav>
+    </div>
+    <p id="gl-empty" class="status" hidden>No terms match. Try a shorter word.</p>
+    <h3 id="letter-a" class="gl-letter">A</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="adaptive thinking the model decides for itself how much to reason before answering. it is the only thinking mode on opus 5.5 ({&quot;type&quot;: &quot;adaptive&quot;} or omitted); depth is steered with effort.">
+        <dt id="term-adaptive-thinking">Adaptive thinking</dt>
+        <dd>The model decides for itself how much to reason before answering. It is the only thinking mode on Opus 5.5 (<code>{"type": "adaptive"}</code> or omitted); depth is steered with effort. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="additionalproperties a json schema keyword; set to false, it forbids keys not listed in properties. strict tools require it.">
+        <dt id="term-additionalproperties">additionalProperties</dt>
+        <dd>A JSON Schema keyword; set to <code>false</code>, it forbids keys not listed in <code>properties</code>. Strict tools require it. <a class="gl-module" href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a></dd>
+      </div>
+      <div class="gl-entry" data-search="agent a model running in a loop with tools: it decides which tool to call, your code runs it, and the result goes back until the model finishes the task.">
+        <dt id="term-agent">Agent</dt>
+        <dd>A model running in a loop with tools: it decides which tool to call, your code runs it, and the result goes back until the model finishes the task. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="agent loop the while loop that sends a request, runs any requested tools, appends the results, and repeats until stop_reason is not tool_use or a budget runs out.">
+        <dt id="term-agent-loop">Agent loop</dt>
+        <dd>The <code>while</code> loop that sends a request, runs any requested tools, appends the results, and repeats until <code>stop_reason</code> is not <code>tool_use</code> or a budget runs out. <a class="gl-module" href="../modules/m09-agent-loop.html">M09 The Agent Loop</a></dd>
+      </div>
+      <div class="gl-entry" data-search="agentlab the practicum&#x27;s teaching library: a scripted mock of the messages api plus helpers for transcripts, schema validation, and token estimates.">
+        <dt id="term-agentlab">agentlab</dt>
+        <dd>The practicum's teaching library: a scripted mock of the Messages API plus helpers for transcripts, schema validation, and token estimates. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="api key the secret that authenticates requests to the claude api. it comes from the environment (anthropic_api_key or an ant auth login profile), never from code, notebooks, or commits.">
+        <dt id="term-api-key">API key</dt>
+        <dd>The secret that authenticates requests to the Claude API. It comes from the environment (<code>ANTHROPIC_API_KEY</code> or an <code>ant auth login</code> profile), never from code, notebooks, or commits. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="apiconnectionerror the request never reached the api (network failure or timeout). retry with backoff.">
+        <dt id="term-apiconnectionerror">APIConnectionError</dt>
+        <dd>The request never reached the API (network failure or timeout). Retry with backoff. <a class="gl-module" href="../modules/m10-errors-as-data.html">M10 Errors as Data</a></dd>
+      </div>
+      <div class="gl-entry" data-search="assistant role the role of messages the model wrote. you append the model&#x27;s response.content as an assistant message to keep the history complete.">
+        <dt id="term-assistant-role">Assistant role</dt>
+        <dd>The role of messages the model wrote. You append the model's <code>response.content</code> as an assistant message to keep the history complete. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-b" class="gl-letter">B</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="backoff waiting longer between each retry of a failed call (for example 1 s, 2 s, 4 s) so a struggling service can recover.">
+        <dt id="term-backoff">Backoff</dt>
+        <dd>Waiting longer between each retry of a failed call (for example 1 s, 2 s, 4 s) so a struggling service can recover. <a class="gl-module" href="../modules/m10-errors-as-data.html">M10 Errors as Data</a></dd>
+      </div>
+      <div class="gl-entry" data-search="badrequesterror http 400: the request is malformed, for example an unanswered tool_use or a rejected parameter. fix the request; retrying it unchanged fails again.">
+        <dt id="term-badrequesterror">BadRequestError</dt>
+        <dd>HTTP 400: the request is malformed, for example an unanswered <code>tool_use</code> or a rejected parameter. Fix the request; retrying it unchanged fails again. <a class="gl-module" href="../modules/m10-errors-as-data.html">M10 Errors as Data</a></dd>
+      </div>
+      <div class="gl-entry" data-search="budget a limit that ends a run: steps, tokens, cost, or wall-clock time. every agent needs at least a step limit.">
+        <dt id="term-budget">Budget</dt>
+        <dd>A limit that ends a run: steps, tokens, cost, or wall-clock time. Every agent needs at least a step limit. <a class="gl-module" href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-c" class="gl-letter">C</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="claude agent sdk a separate anthropic product for building agents with a ready-made harness. level 1 teaches the manual loop first so you know what such tools do for you.">
+        <dt id="term-claude-agent-sdk">Claude Agent SDK</dt>
+        <dd>A separate Anthropic product for building agents with a ready-made harness. Level 1 teaches the manual loop first so you know what such tools do for you. <a class="gl-module" href="../modules/m09-agent-loop.html">M09 The Agent Loop</a></dd>
+      </div>
+      <div class="gl-entry" data-search="confirmation a check your dispatcher makes before running a write tool, by asking a human or a policy. a declined write returns an is_error result.">
+        <dt id="term-confirmation">Confirmation</dt>
+        <dd>A check your dispatcher makes before running a write tool, by asking a human or a policy. A declined write returns an <code>is_error</code> result. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+      <div class="gl-entry" data-search="content block one typed piece of a message&#x27;s content: text, tool_use, or tool_result. a message&#x27;s content is a string or a list of blocks.">
+        <dt id="term-content-block">Content block</dt>
+        <dd>One typed piece of a message's content: <code>text</code>, <code>tool_use</code>, or <code>tool_result</code>. A message's content is a string or a list of blocks. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+      <div class="gl-entry" data-search="context window the maximum number of tokens a model can read in one request, including the whole history and tool definitions. 1m tokens for current claude models.">
+        <dt id="term-context-window">Context window</dt>
+        <dd>The maximum number of tokens a model can read in one request, including the whole history and tool definitions. 1M tokens for current Claude models. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+      <div class="gl-entry" data-search="cost budget a dollar limit computed from usage and per-token prices; the run stops when it is exceeded.">
+        <dt id="term-cost-budget">Cost budget</dt>
+        <dd>A dollar limit computed from <code>usage</code> and per-token prices; the run stops when it is exceeded. <a class="gl-module" href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></dd>
+      </div>
+      <div class="gl-entry" data-search="count_tokens client.messages.count_tokens(...): returns how many input tokens a request would use, without generating anything.">
+        <dt id="term-count-tokens">count_tokens</dt>
+        <dd><code>client.messages.count_tokens(...)</code>: returns how many input tokens a request would use, without generating anything. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+      <div class="gl-entry" data-search="cursor an opaque value a paginated tool returns as next_cursor; the model passes it back to get the next page.">
+        <dt id="term-cursor">Cursor</dt>
+        <dd>An opaque value a paginated tool returns as <code>next_cursor</code>; the model passes it back to get the next page. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-d" class="gl-letter">D</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="dispatcher your code that maps a tool_use block&#x27;s name to a python function, runs it with the block&#x27;s input, and builds the tool_result.">
+        <dt id="term-dispatcher">Dispatcher</dt>
+        <dd>Your code that maps a <code>tool_use</code> block's name to a Python function, runs it with the block's input, and builds the <code>tool_result</code>. <a class="gl-module" href="../modules/m08-one-tool-call.html">M08 One Tool Call by Hand</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-e" class="gl-letter">E</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="effort output_config={&quot;effort&quot;: ...}: low, medium, high, xhigh, or max. trades depth of reasoning against speed and cost; opus 5.5 defaults to medium.">
+        <dt id="term-effort">Effort</dt>
+        <dd><code>output_config={"effort": ...}</code>: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, or <code>max</code>. Trades depth of reasoning against speed and cost; Opus 5.5 defaults to <code>medium</code>. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="end_turn the stop_reason when the model finished its answer normally.">
+        <dt id="term-end-turn">end_turn</dt>
+        <dd>The <code>stop_reason</code> when the model finished its answer normally. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="extraction turning unstructured text into structured data, such as fields from an email, usually with a json schema.">
+        <dt id="term-extraction">Extraction</dt>
+        <dd>Turning unstructured text into structured data, such as fields from an email, usually with a JSON Schema. <a class="gl-module" href="../modules/m05-structured-output.html">M05 Structured Output</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-f" class="gl-letter">F</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="few-shot prompting including a few worked examples of input and desired output in the prompt so the model copies the pattern.">
+        <dt id="term-few-shot-prompting">Few-shot prompting</dt>
+        <dd>Including a few worked examples of input and desired output in the prompt so the model copies the pattern. <a class="gl-module" href="../modules/m06-prompting.html">M06 Prompting That Holds Up</a></dd>
+      </div>
+      <div class="gl-entry" data-search="format_transcript al.format_transcript(messages): renders a conversation one block per line, the first thing to print when debugging a run.">
+        <dt id="term-format-transcript">format_transcript</dt>
+        <dd><code>al.format_transcript(messages)</code>: renders a conversation one block per line, the first thing to print when debugging a run. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-g" class="gl-letter">G</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="get_client al.get_client(): returns a real anthropic.anthropic() client when the package is installed; raises livemodelunavailableerror in the browser.">
+        <dt id="term-get-client">get_client</dt>
+        <dd><code>al.get_client()</code>: returns a real <code>anthropic.Anthropic()</code> client when the package is installed; raises <code>LiveModelUnavailableError</code> in the browser. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="get_final_message a streaming helper that consumes the rest of the stream and returns the complete message.">
+        <dt id="term-get-final-message">get_final_message</dt>
+        <dd>A streaming helper that consumes the rest of the stream and returns the complete <code>Message</code>. <a class="gl-module" href="../modules/m04-streaming.html">M04 Streaming</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-i" class="gl-letter">I</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="idempotent safe to repeat: doing it twice has the same effect as once. set_done(id, true) is idempotent; toggle_done(id) is not.">
+        <dt id="term-idempotent">Idempotent</dt>
+        <dd>Safe to repeat: doing it twice has the same effect as once. <code>set_done(id, True)</code> is idempotent; <code>toggle_done(id)</code> is not. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+      <div class="gl-entry" data-search="input and output tokens input tokens are what the request sends (history, system, tools); output tokens are what the model generates. output tokens cost more.">
+        <dt id="term-input-and-output-tokens">Input and output tokens</dt>
+        <dd>Input tokens are what the request sends (history, system, tools); output tokens are what the model generates. Output tokens cost more. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+      <div class="gl-entry" data-search="input_json_delta a stream event delta carrying a fragment of a tool call&#x27;s input json, so tool input can be shown as it is generated.">
+        <dt id="term-input-json-delta">input_json_delta</dt>
+        <dd>A stream event delta carrying a fragment of a tool call's input JSON, so tool input can be shown as it is generated. <a class="gl-module" href="../modules/m04-streaming.html">M04 Streaming</a></dd>
+      </div>
+      <div class="gl-entry" data-search="input_schema the json schema in a tool definition that describes the tool&#x27;s arguments. its top level is always {&quot;type&quot;: &quot;object&quot;}.">
+        <dt id="term-input-schema">input_schema</dt>
+        <dd>The JSON Schema in a tool definition that describes the tool's arguments. Its top level is always <code>{"type": "object"}</code>. <a class="gl-module" href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a></dd>
+      </div>
+      <div class="gl-entry" data-search="is_error a tool_result flag. &quot;is_error&quot;: true tells the model the tool failed; the content should say why and how to recover.">
+        <dt id="term-is-error">is_error</dt>
+        <dd>A <code>tool_result</code> flag. <code>"is_error": True</code> tells the model the tool failed; the content should say why and how to recover. <a class="gl-module" href="../modules/m10-errors-as-data.html">M10 Errors as Data</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-j" class="gl-letter">J</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="json schema a standard vocabulary for describing the shape of json data (types, required keys, enums, limits). used for tool inputs and structured output.">
+        <dt id="term-json-schema">JSON Schema</dt>
+        <dd>A standard vocabulary for describing the shape of JSON data (types, required keys, enums, limits). Used for tool inputs and structured output. <a class="gl-module" href="../modules/m05-structured-output.html">M05 Structured Output</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-l" class="gl-letter">L</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="latency time from sending a request to getting the answer. driven mostly by output length, model size, and input size.">
+        <dt id="term-latency">Latency</dt>
+        <dd>Time from sending a request to getting the answer. Driven mostly by output length, model size, and input size. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+      <div class="gl-entry" data-search="loop detection stopping a run when the model repeats the same tool call with the same input, a sign it is stuck.">
+        <dt id="term-loop-detection">Loop detection</dt>
+        <dd>Stopping a run when the model repeats the same tool call with the same input, a sign it is stuck. <a class="gl-module" href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-m" class="gl-letter">M</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="max_tokens the required cap on output tokens for one request. reaching it stops generation with stop_reason=&quot;max_tokens&quot; and cut-off content.">
+        <dt id="term-max-tokens">max_tokens</dt>
+        <dd>The required cap on output tokens for one request. Reaching it stops generation with <code>stop_reason="max_tokens"</code> and cut-off content. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="message one entry in messages with a role and content; also the response object the api returns.">
+        <dt id="term-message">Message</dt>
+        <dd>One entry in <code>messages</code> with a <code>role</code> and <code>content</code>; also the response object the API returns. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+      <div class="gl-entry" data-search="messages api the claude api endpoint for conversations: you send a model, a token limit, and a list of messages, and get back the next assistant message.">
+        <dt id="term-messages-api">Messages API</dt>
+        <dd>The Claude API endpoint for conversations: you send a model, a token limit, and a list of messages, and get back the next assistant message. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+      <div class="gl-entry" data-search="messages.parse the sdk helper that requests structured output and validates it into a pydantic model; the production path for typed results.">
+        <dt id="term-messages-parse">messages.parse</dt>
+        <dd>The SDK helper that requests structured output and validates it into a Pydantic model; the production path for typed results. <a class="gl-module" href="../modules/m05-structured-output.html">M05 Structured Output</a></dd>
+      </div>
+      <div class="gl-entry" data-search="mockclient agentlab&#x27;s scripted stand-in for anthropic.anthropic(). it validates requests like the api and answers from a script, offline and deterministically.">
+        <dt id="term-mockclient">MockClient</dt>
+        <dd>agentlab's scripted stand-in for <code>anthropic.Anthropic()</code>. It validates requests like the API and answers from a script, offline and deterministically. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="mockscripterror raised when a mockclient script is wrong or used up. it signals a bug in the exercise, not in your agent.">
+        <dt id="term-mockscripterror">MockScriptError</dt>
+        <dd>Raised when a MockClient script is wrong or used up. It signals a bug in the exercise, not in your agent. <a class="gl-module" href="agentlab.html">agentlab Reference</a></dd>
+      </div>
+      <div class="gl-entry" data-search="model id the string naming the model, such as claude-opus-5-5, claude-sonnet-5-5, or claude-haiku-5-5, with no date suffix.">
+        <dt id="term-model-id">Model id</dt>
+        <dd>The string naming the model, such as <code>claude-opus-5-5</code>, <code>claude-sonnet-5-5</code>, or <code>claude-haiku-5-5</code>, with no date suffix. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-n" class="gl-letter">N</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="next-token prediction how a language model generates text: it repeatedly predicts a likely next token given everything so far.">
+        <dt id="term-next-token-prediction">Next-token prediction</dt>
+        <dd>How a language model generates text: it repeatedly predicts a likely next token given everything so far. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-o" class="gl-letter">O</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="output_config the request field for output settings: effort and format (structured output). replaces the deprecated output_format.">
+        <dt id="term-output-config">output_config</dt>
+        <dd>The request field for output settings: <code>effort</code> and <code>format</code> (structured output). Replaces the deprecated <code>output_format</code>. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-p" class="gl-letter">P</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="pagination returning a long list one page at a time, with a total and a next_cursor, so tool results stay small.">
+        <dt id="term-pagination">Pagination</dt>
+        <dd>Returning a long list one page at a time, with a total and a <code>next_cursor</code>, so tool results stay small. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+      <div class="gl-entry" data-search="parallel tool use several tool_use blocks in one response. run them all and return every tool_result in one user message.">
+        <dt id="term-parallel-tool-use">Parallel tool use</dt>
+        <dd>Several <code>tool_use</code> blocks in one response. Run them all and return every <code>tool_result</code> in one user message. <a class="gl-module" href="../modules/m09-agent-loop.html">M09 The Agent Loop</a></dd>
+      </div>
+      <div class="gl-entry" data-search="pause_turn a stop_reason from server tools: the turn paused. append the assistant turn and send the request again to continue.">
+        <dt id="term-pause-turn">pause_turn</dt>
+        <dd>A <code>stop_reason</code> from server tools: the turn paused. Append the assistant turn and send the request again to continue. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="pixi the package manager and task runner the course uses for python, packages, and running code: pixi add, pixi run.">
+        <dt id="term-pixi">Pixi</dt>
+        <dd>The package manager and task runner the course uses for Python, packages, and running code: <code>pixi add</code>, <code>pixi run</code>. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="prefill ending messages with an assistant turn to start the model&#x27;s answer for it. rejected on current models.">
+        <dt id="term-prefill">Prefill</dt>
+        <dd>Ending <code>messages</code> with an assistant turn to start the model's answer for it. Rejected on current models. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="prompt injection untrusted text (a document, web page, or tool result) containing instructions that try to override yours. keep instructions separate from data.">
+        <dt id="term-prompt-injection">Prompt injection</dt>
+        <dd>Untrusted text (a document, web page, or tool result) containing instructions that try to override yours. Keep instructions separate from data. <a class="gl-module" href="../modules/m06-prompting.html">M06 Prompting That Holds Up</a></dd>
+      </div>
+      <div class="gl-entry" data-search="prompt regression test a test that runs a prompt against fixed cases and checks the outputs, so prompt changes are reviewed like code changes.">
+        <dt id="term-prompt-regression-test">Prompt regression test</dt>
+        <dd>A test that runs a prompt against fixed cases and checks the outputs, so prompt changes are reviewed like code changes. <a class="gl-module" href="../modules/m06-prompting.html">M06 Prompting That Holds Up</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-r" class="gl-letter">R</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="ratelimiterror http 429: too many requests. wait (honoring any retry-after hint) and retry.">
+        <dt id="term-ratelimiterror">RateLimitError</dt>
+        <dd>HTTP 429: too many requests. Wait (honoring any retry-after hint) and retry. <a class="gl-module" href="../modules/m10-errors-as-data.html">M10 Errors as Data</a></dd>
+      </div>
+      <div class="gl-entry" data-search="read tool a tool that only looks (search, read, list) and changes nothing. safe to call by mistake or twice.">
+        <dt id="term-read-tool">Read tool</dt>
+        <dd>A tool that only looks (search, read, list) and changes nothing. Safe to call by mistake or twice. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+      <div class="gl-entry" data-search="refusal a stop_reason meaning the model declined the request; stop_details gives a category and explanation.">
+        <dt id="term-refusal">Refusal</dt>
+        <dd>A <code>stop_reason</code> meaning the model declined the request; <code>stop_details</code> gives a category and explanation. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="retry sending a failed request again. right for 429, 5xx, and connection errors; wrong for 400s. the sdk retries some errors twice by default.">
+        <dt id="term-retry">Retry</dt>
+        <dd>Sending a failed request again. Right for 429, 5xx, and connection errors; wrong for 400s. The SDK retries some errors twice by default. <a class="gl-module" href="../modules/m10-errors-as-data.html">M10 Errors as Data</a></dd>
+      </div>
+      <div class="gl-entry" data-search="role who wrote a message: user or assistant. the first message is always user.">
+        <dt id="term-role">Role</dt>
+        <dd>Who wrote a message: <code>user</code> or <code>assistant</code>. The first message is always <code>user</code>; the system prompt goes in the separate <code>system</code> field. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+      <div class="gl-entry" data-search="run result the structured report an agent run returns: answer, steps, tokens, cost, and the reason it stopped.">
+        <dt id="term-run-result">Run result</dt>
+        <dd>The structured report an agent run returns: answer, steps, tokens, cost, and the reason it stopped. <a class="gl-module" href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-s" class="gl-letter">S</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="sampling parameters temperature, top_p, and top_k. rejected with a 400 on current models; steer with the prompt and effort instead.">
+        <dt id="term-sampling-parameters">Sampling parameters</dt>
+        <dd><code>temperature</code>, <code>top_p</code>, and <code>top_k</code>. Rejected with a 400 on current models; steer with the prompt and effort instead. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="statelessness the api remembers nothing between requests; you send the full history every time, and the history is a list you own.">
+        <dt id="term-statelessness">Statelessness</dt>
+        <dd>The API remembers nothing between requests; you send the full history every time, and the history is a list you own. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+      <div class="gl-entry" data-search="stop_details extra information on a refusal: category and explanation.">
+        <dt id="term-stop-details">stop_details</dt>
+        <dd>Extra information on a refusal: <code>category</code> and <code>explanation</code>. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="stop_reason why generation stopped: end_turn, max_tokens, stop_sequence, tool_use, pause_turn, or refusal. check it before reading content.">
+        <dt id="term-stop-reason">stop_reason</dt>
+        <dd>Why generation stopped: <code>end_turn</code>, <code>max_tokens</code>, <code>stop_sequence</code>, <code>tool_use</code>, <code>pause_turn</code>, or <code>refusal</code>. Check it before reading content. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="stop_sequences strings that end generation when the model produces them; the response then has stop_reason=&quot;stop_sequence&quot;.">
+        <dt id="term-stop-sequences">stop_sequences</dt>
+        <dd>Strings that end generation when the model produces them; the response then has <code>stop_reason="stop_sequence"</code>. <a class="gl-module" href="../modules/m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></dd>
+      </div>
+      <div class="gl-entry" data-search="stream event one server-sent event of a streamed response: message_start, content_block_start, content_block_delta, content_block_stop, message_delta, message_stop.">
+        <dt id="term-stream-event">Stream event</dt>
+        <dd>One server-sent event of a streamed response: <code>message_start</code>, <code>content_block_start</code>, <code>content_block_delta</code>, <code>content_block_stop</code>, <code>message_delta</code>, <code>message_stop</code>. <a class="gl-module" href="../modules/m04-streaming.html">M04 Streaming</a></dd>
+      </div>
+      <div class="gl-entry" data-search="streaming receiving the response as it is generated rather than all at once, for faster first output and long responses.">
+        <dt id="term-streaming">Streaming</dt>
+        <dd>Receiving the response as it is generated rather than all at once, for faster first output and long responses. <a class="gl-module" href="../modules/m04-streaming.html">M04 Streaming</a></dd>
+      </div>
+      <div class="gl-entry" data-search="strict tool a tool with &quot;strict&quot;: true, which guarantees the model&#x27;s input matches the schema. requires additionalproperties: false and required.">
+        <dt id="term-strict-tool">Strict tool</dt>
+        <dd>A tool with <code>"strict": True</code>, which guarantees the model's input matches the schema. Requires <code>additionalProperties: false</code> and <code>required</code>. <a class="gl-module" href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a></dd>
+      </div>
+      <div class="gl-entry" data-search="structured output responses guaranteed to match a json schema, requested with output_config.format.">
+        <dt id="term-structured-output">Structured output</dt>
+        <dd>Responses guaranteed to match a JSON Schema, requested with <code>output_config.format</code>. <a class="gl-module" href="../modules/m05-structured-output.html">M05 Structured Output</a></dd>
+      </div>
+      <div class="gl-entry" data-search="system prompt the system parameter: instructions and context that frame the whole conversation, sent outside messages.">
+        <dt id="term-system-prompt">System prompt</dt>
+        <dd>The <code>system</code> parameter: instructions and context that frame the whole conversation, sent outside <code>messages</code>. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-t" class="gl-letter">T</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="text_stream a streaming helper that yields only the text fragments of a response as they arrive.">
+        <dt id="term-text-stream">text_stream</dt>
+        <dd>A streaming helper that yields only the text fragments of a response as they arrive. <a class="gl-module" href="../modules/m04-streaming.html">M04 Streaming</a></dd>
+      </div>
+      <div class="gl-entry" data-search="token the unit models read and write: a word, part of a word, or punctuation. english averages about four characters per token.">
+        <dt id="term-token">Token</dt>
+        <dd>The unit models read and write: a word, part of a word, or punctuation. English averages about four characters per token. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+      <div class="gl-entry" data-search="token budget a cap on total tokens for a run, summed from each response&#x27;s usage.">
+        <dt id="term-token-budget">Token budget</dt>
+        <dd>A cap on total tokens for a run, summed from each response's <code>usage</code>. <a class="gl-module" href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tokenization splitting text into tokens. different models and languages tokenize differently, so count with count_tokens.">
+        <dt id="term-tokenization">Tokenization</dt>
+        <dd>Splitting text into tokens. Different models and languages tokenize differently, so count with <code>count_tokens</code>. <a class="gl-module" href="../modules/m01-llm-calls.html">M01 What an LLM Call Is</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool a capability you offer the model as a name, a description, and an input schema. the model asks for calls; your code runs them.">
+        <dt id="term-tool">Tool</dt>
+        <dd>A capability you offer the model as a name, a description, and an input schema. The model asks for calls; your code runs them. <a class="gl-module" href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool description the prose in a tool definition that says what the tool does, when to use it, and what it returns. the model&#x27;s main guide to choosing tools.">
+        <dt id="term-tool-description">Tool description</dt>
+        <dd>The prose in a tool definition that says what the tool does, when to use it, and what it returns. The model's main guide to choosing tools. <a class="gl-module" href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool runner the sdk&#x27;s beta helper (client.beta.messages.tool_runner) that runs the agent loop for you.">
+        <dt id="term-tool-runner">Tool runner</dt>
+        <dd>The SDK's beta helper (<code>client.beta.messages.tool_runner</code>) that runs the agent loop for you. <a class="gl-module" href="../modules/m09-agent-loop.html">M09 The Agent Loop</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool_choice controls tool use: auto (default) or none. forcing a call (any/tool) is rejected on opus 5.5.">
+        <dt id="term-tool-choice">tool_choice</dt>
+        <dd>Controls tool use: <code>auto</code> (default) or <code>none</code>. Forcing a call (<code>any</code>/<code>tool</code>) is rejected on Opus 5.5. <a class="gl-module" href="../modules/m07-tools-as-contracts.html">M07 Tools as Contracts</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool_result the block you send back in a user message with a tool&#x27;s output, its tool_use_id, and optionally is_error.">
+        <dt id="term-tool-result">tool_result</dt>
+        <dd>The block you send back in a user message with a tool's output, its <code>tool_use_id</code>, and optionally <code>is_error</code>. <a class="gl-module" href="../modules/m08-one-tool-call.html">M08 One Tool Call by Hand</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool_use the block the model sends to request a tool call: id, name, and parsed input. comes with stop_reason=&quot;tool_use&quot;.">
+        <dt id="term-tool-use">tool_use</dt>
+        <dd>The block the model sends to request a tool call: <code>id</code>, <code>name</code>, and parsed <code>input</code>. Comes with <code>stop_reason="tool_use"</code>. <a class="gl-module" href="../modules/m08-one-tool-call.html">M08 One Tool Call by Hand</a></dd>
+      </div>
+      <div class="gl-entry" data-search="tool_use_id the field in a tool_result that must equal the id of the tool_use it answers.">
+        <dt id="term-tool-use-id">tool_use_id</dt>
+        <dd>The field in a <code>tool_result</code> that must equal the <code>id</code> of the <code>tool_use</code> it answers. <a class="gl-module" href="../modules/m08-one-tool-call.html">M08 One Tool Call by Hand</a></dd>
+      </div>
+      <div class="gl-entry" data-search="transcript the full sequence of messages and blocks in a run. reading it is the main way to understand and debug an agent.">
+        <dt id="term-transcript">Transcript</dt>
+        <dd>The full sequence of messages and blocks in a run. Reading it is the main way to understand and debug an agent. <a class="gl-module" href="../modules/m00-orientation.html">M00 How This Practicum Works</a></dd>
+      </div>
+      <div class="gl-entry" data-search="truncation cutting a long tool result to a size cap, with a visible note saying what was cut and how to get more.">
+        <dt id="term-truncation">Truncation</dt>
+        <dd>Cutting a long tool result to a size cap, with a visible note saying what was cut and how to get more. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-u" class="gl-letter">U</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="untrusted data text you did not write, such as user files, web pages, or tool results. wrap it in tags and never treat it as instructions.">
+        <dt id="term-untrusted-data">Untrusted data</dt>
+        <dd>Text you did not write, such as user files, web pages, or tool results. Wrap it in tags and never treat it as instructions. <a class="gl-module" href="../modules/m06-prompting.html">M06 Prompting That Holds Up</a></dd>
+      </div>
+      <div class="gl-entry" data-search="usage the token counts on every response: input_tokens and output_tokens (plus cache counters).">
+        <dt id="term-usage">Usage</dt>
+        <dd>The token counts on every response: <code>input_tokens</code> and <code>output_tokens</code> (plus cache counters). <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+      <div class="gl-entry" data-search="user role the role of messages you send: the human&#x27;s turns and all tool_result blocks.">
+        <dt id="term-user-role">User role</dt>
+        <dd>The role of messages you send: the human's turns and all <code>tool_result</code> blocks. <a class="gl-module" href="../modules/m02-messages-api.html">M02 The Messages API</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-w" class="gl-letter">W</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="wall-clock limit a time limit on a whole run, measured with time.monotonic().">
+        <dt id="term-wall-clock-limit">Wall-clock limit</dt>
+        <dd>A time limit on a whole run, measured with <code>time.monotonic()</code>. <a class="gl-module" href="../modules/m11-stop-conditions.html">M11 Stop Conditions &amp; Budgets</a></dd>
+      </div>
+      <div class="gl-entry" data-search="write tool a tool that changes something outside the conversation (create, update, delete, send). gate it with confirmation and make it idempotent.">
+        <dt id="term-write-tool">Write tool</dt>
+        <dd>A tool that changes something outside the conversation (create, update, delete, send). Gate it with confirmation and make it idempotent. <a class="gl-module" href="../modules/m12-tool-design.html">M12 Tool Design</a></dd>
+      </div>
+    </dl>
+    <h3 id="letter-x" class="gl-letter">X</h3>
+    <dl class="gl-list">
+      <div class="gl-entry" data-search="xml tags tags such as &lt;document&gt; that mark where inputs begin and end in a prompt, separating data from instructions.">
+        <dt id="term-xml-tags">XML tags</dt>
+        <dd>Tags such as <code>&lt;document&gt;</code> that mark where inputs begin and end in a prompt, separating data from instructions. <a class="gl-module" href="../modules/m06-prompting.html">M06 Prompting That Holds Up</a></dd>
+      </div>
+    </dl>
+  </section>
+</main>
+<script>
+(function () {
+  var input = document.getElementById("gl-filter");
+  if (!input) return;
+  input.addEventListener("input", function () {
+    var q = input.value.trim().toLowerCase();
+    var shown = 0;
+    document.querySelectorAll(".gl-list").forEach(function (list) {
+      var any = false;
+      list.querySelectorAll(".gl-entry").forEach(function (entry) {
+        var hit = !q || entry.getAttribute("data-search").indexOf(q) !== -1;
+        entry.hidden = !hit;
+        if (hit) { any = true; shown += 1; }
+      });
+      list.hidden = !any;
+      var heading = list.previousElementSibling;
+      if (heading && heading.classList.contains("gl-letter")) heading.hidden = !any;
+    });
+    document.getElementById("gl-empty").hidden = shown !== 0;
+  });
+})();
+</script>
+</body>
+</html>

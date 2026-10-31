@@ -1,0 +1,1042 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M08 · One Tool Call by Hand · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m08">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Module 08</p>
+    <h1>One Tool Call by Hand</h1>
+    <p class="lede">In <a href="m07-tools-as-contracts.html">M07</a> you described tools to the model. Now you will
+      complete one tool call from start to finish, slowly, by hand: read the model's request, run the Python
+      function yourself, and send the result back so the model can answer. Every agent ever built repeats exactly
+      this round trip, so it pays to know each step and each way it can break.</p>
+    <div class="lesson-meta"><span>⏱ ~1.5 hours</span><span>Prerequisites: <a href="m02-messages-api.html">M02 The Messages API</a>, <a href="m07-tools-as-contracts.html">M07 Tools as Contracts</a></span></div>
+    <ul class="objectives">
+      <li>Describe the five moves of a tool round trip and which side (your code or the model) performs each one</li>
+      <li>Read a <code>tool_use</code> block's <code>id</code>, <code>name</code>, and <code>input</code> from a response, even when text comes first</li>
+      <li>Dispatch a tool call to a Python function through a name-to-function registry</li>
+      <li>Build a correct <code>tool_result</code> block whose <code>tool_use_id</code> matches the call</li>
+      <li>Send the assistant turn and the result back, and read the final answer</li>
+      <li>Recognize the exact <code>BadRequestError</code> produced by each pairing mistake, and fix it</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="big-picture">
+    <h2>The round trip in five moves</h2>
+    <p>A <strong>tool</strong>, as you saw in M07, is a contract: a name, a description, and an input schema. The
+      model never runs your code. It can only <em>ask</em> you to run a tool by writing a special content block
+      called <code>tool_use</code>. Your program does the work and replies with a <code>tool_result</code> block.
+      The model then continues with that result in front of it.</p>
+    <p>One complete exchange, which we will call a <strong>round trip</strong>, has five moves:</p>
+    <ol>
+      <li><strong>Offer the tools.</strong> Your code sends the user's question and the tool definitions.</li>
+      <li><strong>Read the request.</strong> The model replies with <code>stop_reason="tool_use"</code> and a
+        <code>tool_use</code> block: an <code>id</code>, the tool <code>name</code>, and an <code>input</code> dict.</li>
+      <li><strong>Run the tool.</strong> Your code looks up the Python function by name and calls it with the input.</li>
+      <li><strong>Wrap the result.</strong> Your code builds a <code>tool_result</code> block that repeats the same
+        id as <code>tool_use_id</code>.</li>
+      <li><strong>Send it back.</strong> Your code appends the model's turn and the result to the history and calls
+        the API again. This time the model answers in text and stops with <code>end_turn</code>.</li>
+    </ol>
+    <pre class="mermaid">sequenceDiagram
+    participant C as Your code
+    participant M as Model (API)
+    participant T as Python function
+    C->>M: 1. messages + tools
+    M-->>C: 2. tool_use (id, name, input), stop_reason=tool_use
+    C->>T: 3. get_weather(city="Paris")
+    T-->>C: "18°C, light rain"
+    Note over C: 4. tool_result with tool_use_id = id
+    C->>M: 5. history + assistant turn + tool_result
+    M-->>C: text answer, stop_reason=end_turn</pre>
+    <p>Notice that there are <strong>two</strong> API requests, not one. The first ends with the model asking for
+      something. The second carries the answer to that ask. Because the API is <em>stateless</em> (it remembers
+      nothing between requests, as you learned in <a href="m02-messages-api.html">M02</a>), the second request must
+      re-send everything: the question, the model's tool request, and your result.</p>
+    <p>Step through it with the visualizer. Watch the message list on the right: it grows by one block at each
+      move, and every request sends the whole list.</p>
+    <div class="viz" data-viz="agent-loop" data-config='{"scenario": "weather"}'></div>
+    <aside class="callout think"><p>Before reading on: in the visualizer, which participant actually runs
+      <code>get_weather</code>? What would happen if your code never sent the second request?</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the model asks, your code acts. A tool round trip is
+      two requests: one that ends in <code>tool_use</code>, and one that carries the <code>tool_result</code> and
+      ends in <code>end_turn</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="send-tools">
+    <h2>Move 1: offer the tools</h2>
+    <p>We will use one tool throughout this module: <code>get_weather</code>. Its definition follows the M07 rules:
+      a clear name, a description that says what it returns and when to use it, and an object schema.</p>
+    <pre><code class="language-python">TOOLS = [{
+    "name": "get_weather",
+    "description": (
+        "Get the current weather for one city. Returns temperature in Celsius and conditions. "
+        "Use it whenever the user asks about current weather; do not guess."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string", "description": "City name, e.g. 'Paris'"}},
+        "required": ["city"],
+    },
+}]</code></pre>
+    <p>You pass the list as <code>tools=</code> on <code>messages.create</code>. Everything else is the request you
+      already know: <code>model</code>, <code>max_tokens</code>, and <code>messages</code>. In this course the model
+      is <code>agentlab</code>'s <code>MockClient</code>, which follows a <strong>script</strong>: a list of
+      responses, one per request. Here the script says "first ask for the weather in Paris, then answer".</p>
+    <div class="runnable" data-title="The first request">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": "Get the current weather for one city. Returns temperature in Celsius and conditions.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+}]
+
+client = al.MockClient([
+    al.tool_call("get_weather", {"city": "Paris"}),   # response to request 1
+    "It's 18°C with light rain in Paris.",             # response to request 2
+])
+
+messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+
+print("stop_reason:", response.stop_reason)
+for block in response.content:
+    print(block)
+</textarea>
+    </div>
+    <p>The response has <code>stop_reason="tool_use"</code>. That value is the model's way of saying "I am not done;
+      I paused because I want a tool run." The content holds one <code>ToolUseBlock</code>. Nothing has been
+      executed. If you stopped here and printed the text, you would print nothing at all, which is the most common
+      first bug in tool code: treating a <code>tool_use</code> response as a final answer.</p>
+    <aside class="callout note"><p>The mock fills in ids like <code>toolu_mock_0001</code>. The real API uses ids
+      like <code>toolu_01A2b3...</code>. Never invent or predict ids; always copy the one the model gave you.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> check <code>stop_reason</code> before reading
+      <code>content</code>. <code>"tool_use"</code> means "run something and come back", not "here is my
+      answer".</p></aside>
+  </section>
+
+  <section class="lesson-section" id="read-tool-use">
+    <h2>Move 2: read the tool_use block</h2>
+    <p>A <code>tool_use</code> block has exactly the three fields you need:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Example</th><th>What you do with it</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td><code>"toolu_mock_0001"</code></td><td>Copy it into your <code>tool_result</code> as <code>tool_use_id</code>. It is how the API pairs a result with its request.</td></tr>
+        <tr><td><code>name</code></td><td><code>"get_weather"</code></td><td>Choose which Python function to call.</td></tr>
+        <tr><td><code>input</code></td><td><code>{"city": "Paris"}</code></td><td>Pass as keyword arguments. It is already a parsed dict, not a JSON string.</td></tr>
+      </tbody>
+    </table>
+    <p>The <code>tool_use</code> block is not always the first block. The model may write a sentence before the call
+      ("Let me check the weather."). So never write <code>response.content[0].input</code>. Instead, select blocks
+      by their <code>type</code>:</p>
+    <pre><code class="language-python">tool_uses = [block for block in response.content if block.type == "tool_use"]</code></pre>
+    <p>Predict what this cell prints before you run it. The script puts text before the call.</p>
+    <div class="runnable" data-title="Text before the call" data-predict>
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}, text="Let me check.")])
+response = client.messages.create(
+    model=al.MODEL, max_tokens=1024, tools=TOOLS,
+    messages=[{"role": "user", "content": "Weather in Paris?"}],
+)
+
+print(len(response.content))
+print(response.content[0].type)
+tool_uses = [b for b in response.content if b.type == "tool_use"]
+print(tool_uses[0].name, tool_uses[0].input["city"])
+</textarea>
+    </div>
+    <p>Two blocks: a <code>text</code> block and then the <code>tool_use</code> block. Code that read
+      <code>content[0].input</code> would crash with <code>AttributeError</code>, because text blocks have no
+      <code>input</code>.</p>
+    <p>Three more facts about <code>input</code>:</p>
+    <ul>
+      <li><strong>It is a dict.</strong> Do not call <code>json.loads</code> on it. The SDK has already parsed the JSON
+        the model wrote. Do not do string matching on serialized input either; work with the dict.</li>
+      <li><strong>It follows your schema, usually.</strong> With <code>"strict": True</code> (M07) the API guarantees
+        it validates. Without strict, a field may occasionally be missing or the wrong type. Validating input before
+        running a tool is part of <a href="m10-errors-as-data.html">M10</a>.</li>
+      <li><strong>It is model-written data.</strong> Treat it like any untrusted input: a <code>path</code> argument
+        could point anywhere. Your tool decides what is allowed.</li>
+    </ul>
+    <aside class="callout tip"><p><strong>Remember:</strong> find tool calls by <code>block.type == "tool_use"</code>,
+      never by position. Keep the <code>id</code>; use <code>name</code> to pick a function; pass <code>input</code>
+      as keyword arguments.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="dispatch">
+    <h2>Move 3: run the function yourself</h2>
+    <p>The model gave you a name. You need a function. The simplest correct mapping is a dict from tool name to
+      Python callable, called a <strong>registry</strong>:</p>
+    <pre><code class="language-python">def get_weather(city: str) -&gt; str:
+    return {"Paris": "18°C, light rain", "Oslo": "4°C, cloudy"}.get(city, f"No data for {city}")
+
+REGISTRY = {"get_weather": get_weather}</code></pre>
+    <p>Running the tool is then a lookup and a call. Turning the tool name into a function call is called
+      <strong>dispatch</strong>:</p>
+    <pre><code class="language-python">func = REGISTRY[block.name]
+output = func(**block.input)        # get_weather(city="Paris")</code></pre>
+    <p>Why a dict instead of <code>if</code> statements, or <code>globals()[block.name]</code>?</p>
+    <ul>
+      <li><strong>An explicit allow-list.</strong> Only functions you put in the registry can ever run. Looking a name
+        up in <code>globals()</code> would let the model call any function in your module, including ones you never
+        meant to expose. The registry is a security boundary, not just a convenience.</li>
+      <li><strong>One place to change.</strong> Adding a tool means adding one definition and one registry entry. The
+        dispatch code never changes.</li>
+      <li><strong>The schema matches the signature.</strong> Because the input schema's property names are the
+        function's parameter names, <code>func(**block.input)</code> just works. If you generated the schema from the
+        signature (M07), they cannot drift apart.</li>
+    </ul>
+    <p>Tool results go back to the model as text, so convert whatever your function returns into a string. Plain
+      strings pass through; anything structured (a dict, a list, a number) becomes JSON with
+      <code>json.dumps</code>, which the model reads well.</p>
+    <div class="runnable" data-title="Dispatch through a registry">
+<textarea>
+import json
+
+def get_weather(city: str) -> dict:
+    data = {"Paris": {"temp_c": 18, "conditions": "light rain"},
+            "Oslo": {"temp_c": 4, "conditions": "cloudy"}}
+    return data.get(city, {"error": f"no data for {city}"})
+
+def add(a: float, b: float) -> float:
+    return a + b
+
+REGISTRY = {"get_weather": get_weather, "add": add}
+
+def dispatch(name, tool_input, registry):
+    output = registry[name](**tool_input)
+    return output if isinstance(output, str) else json.dumps(output)
+
+print(dispatch("get_weather", {"city": "Paris"}, REGISTRY))
+print(dispatch("add", {"a": 2, "b": 3}, REGISTRY))
+print(repr(dispatch("add", {"a": 2, "b": 3}, REGISTRY)))
+</textarea>
+    </div>
+    <p>Two things can go wrong here, and both belong to <a href="m10-errors-as-data.html">M10</a>: the model can
+      name a tool that is not in the registry (<code>KeyError</code>), and the tool itself can raise. In M10 you will
+      turn both into a <code>tool_result</code> with <code>is_error: true</code> so the model can recover. For now,
+      just know that the function runs in <em>your</em> process, with your files, your network, and your
+      credentials. The model chose the arguments; you are responsible for what the call does.</p>
+    <aside class="callout warn"><p>Never <code>eval</code> or <code>exec</code> anything from <code>block.input</code>,
+      and never look tool names up in <code>globals()</code>. A registry dict is the allow-list.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>registry[block.name](**block.input)</code>, then
+      make the output a string (<code>json.dumps</code> for structured data).</p></aside>
+  </section>
+
+  <section class="lesson-section" id="tool-result">
+    <h2>Move 4: build the tool_result block</h2>
+    <p>A <code>tool_result</code> is a content block you write in a <strong>user</strong> message. It has three
+      required keys:</p>
+    <pre><code class="language-python">{
+    "type": "tool_result",
+    "tool_use_id": "toolu_mock_0001",   # copied from block.id, character for character
+    "content": "18°C, light rain",      # what the tool returned, as text
+}</code></pre>
+    <ul>
+      <li><code>type</code> is always the string <code>"tool_result"</code>.</li>
+      <li><code>tool_use_id</code> is the <code>id</code> of the <code>tool_use</code> block it answers. Not the tool
+        name, not a counter you keep: the exact id.</li>
+      <li><code>content</code> is the result. A string is simplest. It may also be a list of content blocks such as
+        <code>[{"type": "text", "text": "..."}]</code>, which you will see when a tool returns several pieces.</li>
+    </ul>
+    <p>There is one optional key you will meet in <a href="m10-errors-as-data.html">M10</a>:
+      <code>"is_error": True</code>, which tells the model the tool failed and the content is an error message.</p>
+    <p>Why does the id matter so much? Because a single response can contain several <code>tool_use</code> blocks
+      (parallel tool calls, the subject of <a href="m09-agent-loop.html">M09</a>). The id is the only thing that says
+      which result belongs to which call. The API therefore checks the pairing strictly, and refuses requests where
+      it does not line up.</p>
+    <div class="runnable" data-title="Build a tool_result from a block">
+<textarea>
+import json
+import agentlab as al
+
+block = al.ToolUseBlock(id="toolu_mock_0007", name="get_weather", input={"city": "Oslo"})
+
+def build_tool_result(tool_use_id, content):
+    return {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
+
+result = build_tool_result(block.id, "4°C, cloudy")
+print(json.dumps(result, indent=2, ensure_ascii=False))
+print(al.format_block(result))
+</textarea>
+    </div>
+    <p><code>al.format_block</code> renders one block on one line, the same way <code>al.format_transcript</code> shows
+      it inside a whole conversation. The id in square brackets is the pairing key; when you debug, line the
+      brackets up.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> a <code>tool_result</code> is
+      <code>{"type": "tool_result", "tool_use_id": block.id, "content": text}</code>, placed in a <em>user</em>
+      message.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="send-back">
+    <h2>Move 5: send the turn and the result back</h2>
+    <p>The second request needs the history in exactly this shape:</p>
+    <ol>
+      <li>the original <code>user</code> message (the question);</li>
+      <li>an <code>assistant</code> message whose content is <strong><code>response.content</code></strong>: the
+        model's whole turn, including the <code>tool_use</code> block;</li>
+      <li>a new <code>user</code> message whose content is a list starting with the <code>tool_result</code>
+        block(s).</li>
+    </ol>
+    <p>The second item is the one people get wrong. You must append the content <em>blocks</em>, not just the text.
+      The API checks that each <code>tool_result</code> answers a <code>tool_use</code> in the <em>previous assistant
+      message</em>. If that message does not contain the <code>tool_use</code> block, the result answers nothing.</p>
+    <p>Here is the full round trip in one cell. Read it top to bottom; every move is labelled.</p>
+    <div class="runnable" data-title="A complete round trip">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": "Get the current weather for one city. Returns temperature and conditions.",
+    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}]
+
+def get_weather(city: str) -> str:
+    return {"Paris": "18°C, light rain", "Oslo": "4°C, cloudy"}.get(city, f"No data for {city}")
+
+REGISTRY = {"get_weather": get_weather}
+
+client = al.MockClient([
+    al.tool_call("get_weather", {"city": "Paris"}),
+    "It's 18°C with light rain in Paris, so take an umbrella.",
+])
+
+# Move 1: offer the tools
+messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+assert response.stop_reason == "tool_use"
+
+# Move 2: read the request
+block = next(b for b in response.content if b.type == "tool_use")
+
+# Move 3: run the tool
+output = REGISTRY[block.name](**block.input)
+
+# Move 4: wrap the result
+result = {"type": "tool_result", "tool_use_id": block.id, "content": output}
+
+# Move 5: send the assistant turn and the result back
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [result]})
+final = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+
+print("stop_reason:", final.stop_reason)
+print("answer:", "".join(b.text for b in final.content if b.type == "text"))
+print()
+print(al.format_transcript(messages, final))
+</textarea>
+    </div>
+    <p>Read the transcript printed at the end. It is the conversation exactly as the model saw it on the second
+      request, plus the final response:</p>
+    <pre><code class="language-text">user: What's the weather in Paris?
+assistant: tool_use get_weather {"city": "Paris"} [toolu_mock_0001]
+user: tool_result [toolu_mock_0001] 18°C, light rain
+assistant: It's 18°C with light rain in Paris, so take an umbrella.
+(stop_reason=end_turn)</code></pre>
+    <p>The id in brackets appears twice, once on the call and once on the result. That is a correctly paired round
+      trip. A few details worth noticing:</p>
+    <ul>
+      <li><strong>Send <code>tools</code> again on the second request.</strong> The API is stateless; the tool
+        definitions are part of every request. The conversation contains <code>tool_use</code> blocks, and the model
+        may want to call a tool again.</li>
+      <li><strong>The final text is collected from text blocks.</strong> The pattern
+        <code>"".join(b.text for b in final.content if b.type == "text")</code> works with both the mock and the real
+        SDK. The mock also has a <code>.text</code> convenience property, but the real SDK's <code>Message</code>
+        does not, so code you want to port should not rely on it.</li>
+      <li><strong>Appending <code>response.content</code> works directly.</strong> Both the mock and the real SDK
+        accept the block objects back in <code>messages</code>; you do not have to convert them to dicts.</li>
+    </ul>
+    <p>You can also look at exactly what was sent. <code>client.requests</code> records every request the mock
+      accepted, with blocks converted to plain dicts. Exercise tests use it to check your work.</p>
+    <div class="runnable" data-title="Inspect what was sent">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}), "18°C in Paris."])
+
+messages = [{"role": "user", "content": "Weather in Paris?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+block = next(b for b in response.content if b.type == "tool_use")
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": block.id, "content": "18°C, sunny"}]})
+client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+
+second = client.requests[1]
+print("messages sent on request 2:", len(second.messages))
+for m in second.messages:
+    print(" ", m["role"], m["content"] if isinstance(m["content"], str) else [b["type"] for b in m["content"]])
+print("tool_results:", second.tool_results)
+</textarea>
+    </div>
+    <aside class="callout tip"><p><strong>Remember:</strong> history for request 2 is
+      <code>[question, {"role": "assistant", "content": response.content}, {"role": "user", "content": [tool_result]}]</code>,
+      sent with the same <code>tools</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="pairing-errors">
+    <h2>When pairing goes wrong: the exact errors</h2>
+    <p>The API validates the shape of every request before the model sees it. A request whose tool calls and results
+      do not line up is rejected with HTTP 400, raised in Python as <code>BadRequestError</code>. A 400 means
+      <em>your request is wrong</em>: retrying the same request will fail again, every time. You fix the code, not
+      the network. (Which errors are worth retrying is in <a href="m10-errors-as-data.html">M10</a>.)</p>
+    <p>The good news: the messages are specific. Each names the position of the bad message
+      (<code>messages.2</code> is the third message, counting from zero) and what is wrong. Learn to recognize these
+      four, because you will see them while building every agent.</p>
+    <p>Each cell below starts from the same first request, then builds a broken second request. They use a small
+      helper, <code>start()</code>, that performs Move 1 and returns the pieces.</p>
+
+    <h3>Mistake 1: no tool_result after a tool_use</h3>
+    <p>You append the model's turn correctly, but then send a plain text follow-up instead of the result. Perhaps
+      you forgot to run the tool, or you assumed the model already had the answer.</p>
+    <div class="runnable" data-title="Mistake 1: missing tool_result">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+def start():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}), "18°C in Paris."])
+    messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    block = next(b for b in response.content if b.type == "tool_use")
+    return client, messages, response, block
+
+client, messages, response, block = start()
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": "So what's the weather?"})     # no tool_result
+try:
+    client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+except al.BadRequestError as e:
+    print(e.status_code, e)
+</textarea>
+    </div>
+    <pre><code class="language-text">400 messages.2: tool_use ids were found without tool_result blocks immediately after: toolu_mock_0001. Each tool_use block must have a corresponding tool_result block in the next message.</code></pre>
+    <p><strong>Read it as:</strong> the message at index 2 should have answered <code>toolu_mock_0001</code>, and it
+      did not. Every <code>tool_use</code> needs its <code>tool_result</code> in the very next message. "Immediately
+      after" is literal: you cannot put another exchange in between and answer later.</p>
+
+    <h3>Mistake 2: the wrong tool_use_id</h3>
+    <p>You send a result, but with an id that is not the one the model gave: a hard-coded example id copied from
+      documentation, the tool's <em>name</em>, or an id from an earlier turn.</p>
+    <div class="runnable" data-title="Mistake 2: wrong tool_use_id">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+def start():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}), "18°C in Paris."])
+    messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    block = next(b for b in response.content if b.type == "tool_use")
+    return client, messages, response, block
+
+client, messages, response, block = start()
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": block.name, "content": "18°C, light rain"},   # name, not id
+]})
+try:
+    client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+except al.BadRequestError as e:
+    print(e.status_code, e)
+</textarea>
+    </div>
+    <pre><code class="language-text">400 messages.2: tool_use ids were found without tool_result blocks immediately after: toolu_mock_0001. Each tool_use block must have a corresponding tool_result block in the next message.</code></pre>
+    <p><strong>Read it as:</strong> the same error as Mistake 1, and that is the clue. From the API's point of view,
+      a result with the wrong id does not exist; <code>toolu_mock_0001</code> is still unanswered. When you see this
+      error even though you <em>did</em> send a result, compare the ids character by character. The fix is always
+      <code>"tool_use_id": block.id</code>.</p>
+
+    <h3>Mistake 3: text before the tool_result</h3>
+    <p>You want to add an instruction along with the result, and you put the text first.</p>
+    <div class="runnable" data-title="Mistake 3: text before tool_result">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+def start():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}), "18°C in Paris."])
+    messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    block = next(b for b in response.content if b.type == "tool_use")
+    return client, messages, response, block
+
+client, messages, response, block = start()
+messages.append({"role": "assistant", "content": response.content})
+messages.append({"role": "user", "content": [
+    {"type": "text", "text": "Here is the result:"},
+    {"type": "tool_result", "tool_use_id": block.id, "content": "18°C, light rain"},
+]})
+try:
+    client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+except al.BadRequestError as e:
+    print(e.status_code, e)
+
+# The fix: results first, then any text.
+messages[-1]["content"].reverse()
+final = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+print("after the fix:", final.stop_reason)
+</textarea>
+    </div>
+    <pre><code class="language-text">400 messages.2: tool_result blocks must come before any other content
+after the fix: end_turn</code></pre>
+    <p><strong>Read it as:</strong> in the user message that answers tool calls, the <code>tool_result</code> blocks
+      come first. Text <em>after</em> them is allowed, and is the right place for an extra instruction.</p>
+
+    <h3>Mistake 4: appending only the text instead of response.content</h3>
+    <p>This is the most common one, because it works perfectly in a plain chat (M02) and only breaks once tools
+      appear. You store the assistant turn as its text, dropping the <code>tool_use</code> block.</p>
+    <div class="runnable" data-title="Mistake 4: text-only assistant turn">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Current weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"}, text="Let me check."), "18°C."])
+messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+block = next(b for b in response.content if b.type == "tool_use")
+
+text = "".join(b.text for b in response.content if b.type == "text")
+messages.append({"role": "assistant", "content": text})            # the tool_use block is lost
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": block.id, "content": "18°C, light rain"},
+]})
+try:
+    client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+except al.BadRequestError as e:
+    print(e.status_code, e)
+print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <pre><code class="language-text">400 messages.2: tool_result blocks must answer tool_use blocks in the previous assistant message</code></pre>
+    <p><strong>Read it as:</strong> the result is fine, but the assistant message before it has no
+      <code>tool_use</code> to answer. The transcript makes it visible: the assistant line says
+      <code>Let me check.</code> with no <code>tool_use</code> line under it. When the model writes no text before a
+      call, the same mistake fails differently: the text is an empty string, and the API rejects empty text with
+      <code>messages.1.content: text content must be non-empty</code>. Both have one fix:
+      <code>{"role": "assistant", "content": response.content}</code>.</p>
+
+    <h3>Two related slips</h3>
+    <ul>
+      <li><strong>Sending the result without the assistant turn at all.</strong> The history goes
+        question → tool_result. The error is
+        <code>messages.1: tool_result blocks must answer tool_use blocks in the previous assistant message</code>.</li>
+      <li><strong>Appending the assistant turn and calling again with nothing after it.</strong> The last message is
+        then an assistant message, which the API reads as <em>prefill</em> (asking the model to continue your text),
+        and prefill is not supported on current models:
+        <code>messages: the final message must not be an assistant message; prefilling the assistant response is not supported on this model</code>.</li>
+    </ul>
+    <table>
+      <thead><tr><th>Error text (start)</th><th>Likely cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td><code>tool_use ids were found without tool_result blocks immediately after: &lt;id&gt;</code></td><td>No result sent, or the result's id is wrong</td><td>Send a <code>tool_result</code> for every call with <code>tool_use_id=block.id</code></td></tr>
+        <tr><td><code>tool_result blocks must come before any other content</code></td><td>Text placed before the results</td><td>Results first, text after</td></tr>
+        <tr><td><code>tool_result blocks must answer tool_use blocks in the previous assistant message</code></td><td>Assistant turn stored as text, or missing</td><td>Append <code>response.content</code> as the assistant turn</td></tr>
+        <tr><td><code>text content must be non-empty</code></td><td>Stored the (empty) text of a tool-only turn</td><td>Append <code>response.content</code></td></tr>
+        <tr><td><code>the final message must not be an assistant message</code></td><td>Called again before adding the results</td><td>Append the user message with the results first</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout pro"><p>When an agent fails with one of these, do not stare at the code first. Print
+      <code>al.format_transcript(messages)</code> just before the failing call and read the ids in brackets. Pairing
+      bugs are visible in the transcript in seconds and nearly invisible in the code.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> pairing errors are 400s; never retry them. The rule
+      behind all of them: the assistant turn holds the <code>tool_use</code> blocks, and the very next user message
+      starts with one <code>tool_result</code> per call, each carrying the matching id.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="real-api">
+    <h2>The same round trip against the real API</h2>
+    <p>Everything you wrote above runs unchanged against Claude. The only change is the line that creates the
+      client: <code>anthropic.Anthropic()</code> instead of <code>al.MockClient([...])</code>. The real model decides
+      for itself whether to call the tool, so there is no script.</p>
+    <pre data-label="round_trip.py"><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY (or an `ant auth login` profile) from the environment
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": "Get the current weather for one city. Returns temperature and conditions.",
+    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}]
+REGISTRY = {"get_weather": lambda city: f"18°C, light rain in {city}"}
+
+messages = [{"role": "user", "content": "What's the weather in Paris?"}]
+response = client.messages.create(model="claude-opus-5-5", max_tokens=1024, tools=TOOLS, messages=messages)
+
+if response.stop_reason == "tool_use":
+    messages.append({"role": "assistant", "content": response.content})
+    results = []
+    for block in response.content:
+        if block.type == "tool_use":
+            output = REGISTRY[block.name](**block.input)
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+    messages.append({"role": "user", "content": results})
+    response = client.messages.create(model="claude-opus-5-5", max_tokens=1024, tools=TOOLS, messages=messages)
+
+print("".join(b.text for b in response.content if b.type == "text"))</code></pre>
+    <pre data-label="Terminal"><code class="language-bash">pixi add anthropic
+pixi run python round_trip.py</code></pre>
+    <p>Notice the small generalization: the loop over <code>response.content</code> answers <em>every</em>
+      <code>tool_use</code> block, not just the first, and puts all results in one user message. The real model may
+      ask for two cities at once; that is <a href="m09-agent-loop.html">M09</a>'s subject, and this code already
+      handles it. Also notice that it does exactly one round trip. If the model wanted a second tool after seeing the
+      first result, this script would print an empty answer. Fixing that properly is what turns this script into an
+      agent loop.</p>
+    <aside class="callout warn"><p>Never paste an API key into code, a notebook, or a lesson cell. The client reads
+      it from the environment. See <a href="m00-orientation.html">M00</a> for key hygiene.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the mock and the SDK share one surface. Code that uses
+      <code>block.type</code>, <code>block.id</code>, <code>block.name</code>, <code>block.input</code>, and appends
+      <code>response.content</code> ports without edits.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Four exercises, from a single block to a full round trip and a debugging task. Tests build their own
+      <code>MockClient</code> scripts and inspect <code>client.requests</code>, so your functions must take the
+      client as an argument rather than creating one.</p>
+
+    <div class="exercise" data-id="m08-e1" data-title="Build a tool_result block">
+      <div class="exercise-prompt">
+        <p>Write <code>build_tool_result(tool_use_id, output)</code> that returns a <code>tool_result</code> dict
+          with exactly the keys <code>type</code>, <code>tool_use_id</code>, and <code>content</code>.</p>
+        <ul>
+          <li>If <code>output</code> is a string, use it as the content unchanged.</li>
+          <li>Otherwise (dict, list, number, bool, <code>None</code>), use <code>json.dumps(output)</code>.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import json
+
+def build_tool_result(tool_use_id, output):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import json
+
+def test_string_content():
+    r = build_tool_result("toolu_1", "18°C")
+    assert r == {"type": "tool_result", "tool_use_id": "toolu_1", "content": "18°C"}, f"got {r!r}"
+
+def test_dict_becomes_json():
+    r = build_tool_result("toolu_2", {"temp_c": 18})
+    assert isinstance(r["content"], str), "non-string output must be converted to a string with json.dumps"
+    assert json.loads(r["content"]) == {"temp_c": 18}, "the content should be the JSON of the dict"
+
+def test_number_and_list():
+    assert build_tool_result("a", 5)["content"] == "5", "5 should become the string '5'"
+    assert json.loads(build_tool_result("b", [1, 2])["content"]) == [1, 2], "lists become JSON arrays"
+
+def test_exact_keys():
+    r = build_tool_result("toolu_3", "x")
+    assert set(r) == {"type", "tool_use_id", "content"}, f"expected exactly three keys, got {sorted(r)}"
+    assert r["type"] == "tool_result", "type must be the string 'tool_result'"
+
+def test_mock_accepts_it():
+    import agentlab as al
+    tools = [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
+    client = al.MockClient([al.tool_call("t", {}), "done"])
+    msgs = [{"role": "user", "content": "go"}]
+    resp = client.messages.create(model=al.MODEL, max_tokens=100, tools=tools, messages=msgs)
+    block = resp.content[0]
+    msgs += [{"role": "assistant", "content": resp.content},
+             {"role": "user", "content": [build_tool_result(block.id, {"ok": True})]}]
+    final = client.messages.create(model=al.MODEL, max_tokens=100, tools=tools, messages=msgs)
+    assert final.stop_reason == "end_turn", "the mock API should accept your tool_result"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Use <code>isinstance(output, str)</code> to decide, and a
+        conditional expression for the content. Return a dict literal.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import json
+
+def build_tool_result(tool_use_id, output):
+    content = output if isinstance(output, str) else json.dumps(output)
+    return {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}</code></pre></details>
+    </div>
+
+    <div class="exercise" data-id="m08-e2" data-title="Dispatch through a registry">
+      <div class="exercise-prompt">
+        <p>Write <code>dispatch(name, tool_input, registry)</code>:</p>
+        <ul>
+          <li>Look up <code>name</code> in the <code>registry</code> dict and call the function with
+            <code>tool_input</code> as keyword arguments.</li>
+          <li>Return the output as a string: strings unchanged, anything else through <code>json.dumps</code>.</li>
+          <li>If <code>name</code> is not in the registry, raise <code>ValueError</code> with a message containing
+            <code>unknown tool</code> and the name. (M10 will turn this into an error result instead.)</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import json
+
+def dispatch(name, tool_input, registry):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import json
+
+def _weather(city):
+    return f"sunny in {city}"
+
+def _add(a, b):
+    return a + b
+
+def _info(city, units="metric"):
+    return {"city": city, "units": units}
+
+REG = {"get_weather": _weather, "add": _add, "info": _info}
+
+def test_string_output():
+    assert dispatch("get_weather", {"city": "Lima"}, REG) == "sunny in Lima", "call registry[name](**tool_input)"
+
+def test_keyword_arguments():
+    assert dispatch("add", {"b": 2, "a": 40}, REG) == "42", "pass input as keyword arguments, and stringify numbers"
+
+def test_dict_output_is_json():
+    out = dispatch("info", {"city": "Rome"}, REG)
+    assert isinstance(out, str), "the result must be a string"
+    assert json.loads(out) == {"city": "Rome", "units": "metric"}, "dicts should be returned as JSON text"
+
+def test_unknown_tool():
+    try:
+        dispatch("delete_everything", {}, REG)
+    except ValueError as e:
+        assert "unknown tool" in str(e) and "delete_everything" in str(e), f"message should name the tool, got {e}"
+    else:
+        raise AssertionError("an unknown tool name must raise ValueError")
+
+def test_no_globals_lookup():
+    try:
+        dispatch("json", {}, REG)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("only names in the registry may run; 'json' is not a registered tool")
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Check <code>if name not in registry</code> first and raise.
+        Then <code>output = registry[name](**tool_input)</code>, and convert as in the previous exercise.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import json
+
+def dispatch(name, tool_input, registry):
+    if name not in registry:
+        raise ValueError(f"unknown tool: {name}")
+    output = registry[name](**tool_input)
+    return output if isinstance(output, str) else json.dumps(output)</code></pre></details>
+    </div>
+
+    <div class="exercise" data-id="m08-e3" data-title="One round trip, as a function">
+      <div class="exercise-prompt">
+        <p>Write <code>answer_with_tools(client, question, tools, registry)</code> that performs at most one round
+          trip and returns the final answer text.</p>
+        <ol>
+          <li>Send <code>question</code> as the first user message, with <code>model=al.MODEL</code>,
+            <code>max_tokens=1024</code>, and <code>tools=tools</code>.</li>
+          <li>If <code>stop_reason</code> is not <code>"tool_use"</code>, return the response's text (join every
+            text block). Only one request is made.</li>
+          <li>Otherwise run <em>every</em> <code>tool_use</code> block through the registry, append the assistant
+            turn (<code>response.content</code>) and one user message holding all the results, make the second
+            request, and return its text.</li>
+        </ol>
+        <p>You may reuse ideas from the previous exercises; define any helpers you need in this cell.</p>
+      </div>
+<textarea class="starter">
+import json
+import agentlab as al
+
+def answer_with_tools(client, question, tools, registry):
+    messages = [{"role": "user", "content": question}]
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+def _weather(city):
+    return f"{city}: 21°C"
+
+def test_full_round_trip():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Lisbon"}), "It is 21°C in Lisbon."])
+    answer = answer_with_tools(client, "Weather in Lisbon?", TOOLS, {"get_weather": _weather})
+    assert answer == "It is 21°C in Lisbon.", f"return the final text, got {answer!r}"
+    assert len(client.requests) == 2, f"expected 2 requests, got {len(client.requests)}"
+
+def test_second_request_shape():
+    client = al.MockClient([al.tool_call("get_weather", {"city": "Lisbon"}, text="Checking."), "ok"])
+    answer_with_tools(client, "Weather in Lisbon?", TOOLS, {"get_weather": _weather})
+    sent = client.requests[1].messages
+    assert [m["role"] for m in sent] == ["user", "assistant", "user"], "history must be question, assistant turn, results"
+    kinds = [b["type"] for b in sent[1]["content"]]
+    assert kinds == ["text", "tool_use"], f"append response.content as the assistant turn, got {kinds}"
+    results = client.requests[1].tool_results
+    assert results and results[0]["content"] == "Lisbon: 21°C", "the tool_result should carry the tool's output"
+    assert client.requests[1].tools, "send tools on the second request too"
+
+def test_no_tool_needed():
+    client = al.MockClient(["Hello! No tools needed."])
+    answer = answer_with_tools(client, "Say hi", TOOLS, {"get_weather": _weather})
+    assert answer == "Hello! No tools needed.", "when stop_reason is end_turn, return the text directly"
+    assert len(client.requests) == 1, "no second request when the model did not ask for a tool"
+
+def test_two_calls_in_one_turn():
+    client = al.MockClient([al.tool_calls([("get_weather", {"city": "Oslo"}), ("get_weather", {"city": "Rome"})]), "Both done."])
+    answer_with_tools(client, "Oslo and Rome?", TOOLS, {"get_weather": _weather})
+    results = client.requests[1].tool_results
+    assert len(results) == 2, f"answer every tool_use block in one user message, got {len(results)} results"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Write a tiny <code>text_of(response)</code> helper that joins
+        <code>b.text</code> for blocks whose <code>type == "text"</code>. For the tool branch, build a
+        <code>results</code> list in a loop over <code>response.content</code>, then append two messages and call
+        <code>create</code> again with the same arguments.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import json
+import agentlab as al
+
+def text_of(response):
+    return "".join(b.text for b in response.content if b.type == "text")
+
+def answer_with_tools(client, question, tools, registry):
+    messages = [{"role": "user", "content": question}]
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+    if response.stop_reason != "tool_use":
+        return text_of(response)
+    results = []
+    for block in response.content:
+        if block.type == "tool_use":
+            output = registry[block.name](**block.input)
+            content = output if isinstance(output, str) else json.dumps(output)
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+    messages.append({"role": "assistant", "content": response.content})
+    messages.append({"role": "user", "content": results})
+    final = client.messages.create(model=al.MODEL, max_tokens=1024, tools=tools, messages=messages)
+    return text_of(final)</code></pre></details>
+    </div>
+
+    <div class="exercise" data-id="m08-e4" data-title="Fix this broken round trip">
+      <div class="exercise-prompt">
+        <p>A teammate wrote <code>ask_weather</code>. It fails on the second request with a
+          <code>BadRequestError</code>. Here is the transcript they printed just before the failing call:</p>
+        <pre><code class="language-text">user: What's the weather in Oslo?
+assistant: Let me look that up.
+user: Answer in one sentence.
+user: tool_result [get_weather] 4°C, cloudy</code></pre>
+        <p>There are <strong>three</strong> bugs. Find them in the transcript, then fix the code so
+          <code>ask_weather(client)</code> returns the final answer. Keep the function's signature.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+def get_weather(city):
+    return {"Oslo": "4°C, cloudy"}.get(city, "unknown")
+
+def ask_weather(client):
+    messages = [{"role": "user", "content": "What's the weather in Oslo?"}]
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    block = next(b for b in response.content if b.type == "tool_use")
+    output = get_weather(**block.input)
+    text = "".join(b.text for b in response.content if b.type == "text")
+    messages.append({"role": "assistant", "content": text})
+    messages.append({"role": "user", "content": [
+        {"type": "text", "text": "Answer in one sentence."},
+        {"type": "tool_result", "tool_use_id": block.name, "content": output},
+    ]})
+    final = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    return "".join(b.text for b in final.content if b.type == "text")
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def _client():
+    return al.MockClient([al.tool_call("get_weather", {"city": "Oslo"}, text="Let me look that up."),
+                          "It's 4°C and cloudy in Oslo."])
+
+def test_returns_answer():
+    try:
+        answer = ask_weather(_client())
+    except al.BadRequestError as e:
+        raise AssertionError(f"the second request is still rejected: {e}")
+    assert answer == "It's 4°C and cloudy in Oslo.", f"return the final text, got {answer!r}"
+
+def test_assistant_turn_keeps_tool_use():
+    client = _client()
+    ask_weather(client)
+    kinds = [b["type"] for b in client.requests[1].messages[1]["content"]]
+    assert "tool_use" in kinds, "bug 1: the assistant turn must be response.content, including the tool_use block"
+
+def test_result_first_and_id_matches():
+    client = _client()
+    ask_weather(client)
+    last = client.requests[1].messages[-1]["content"]
+    assert last[0]["type"] == "tool_result", "bug 2: the tool_result must come before any text"
+    tool_id = client.requests[1].messages[1]["content"][-1]["id"]
+    assert last[0]["tool_use_id"] == tool_id, "bug 3: tool_use_id must be block.id, not block.name"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>In the transcript: the assistant line has no
+        <code>tool_use</code> (so the turn was stored as text); the text line comes before the result; and the
+        bracketed id is a tool name. Each maps to one line of code.</p></details>
+      <details class="solution"><summary>Show solution</summary><pre><code class="language-python">import agentlab as al
+
+TOOLS = [{"name": "get_weather", "description": "Weather for a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+
+def get_weather(city):
+    return {"Oslo": "4°C, cloudy"}.get(city, "unknown")
+
+def ask_weather(client):
+    messages = [{"role": "user", "content": "What's the weather in Oslo?"}]
+    response = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    block = next(b for b in response.content if b.type == "tool_use")
+    output = get_weather(**block.input)
+    messages.append({"role": "assistant", "content": response.content})          # fix 1
+    messages.append({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": block.id, "content": output},      # fix 3
+        {"type": "text", "text": "Answer in one sentence."},                      # fix 2: text after
+    ]})
+    final = client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+    return "".join(b.text for b in final.content if b.type == "text")</code></pre></details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a one-shot tool CLI</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">clock.py: ask what time it is anywhere</span></div>
+      <div class="widget-body">
+        <p>Build a small command-line program that answers questions like "What time is it in Tokyo?" with exactly one
+          tool round trip. The tool is real: it uses the standard library's <code>zoneinfo</code> to read the clock,
+          so the model cannot know the answer without calling it.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir clock &amp;&amp; cd clock
+pixi init
+pixi add python=3.14 anthropic structlog
+# write clock.py, then:
+pixi run python clock.py "What time is it in Tokyo?"</code></pre>
+        <p><strong>What to build</strong></p>
+        <ul>
+          <li>A tool <code>get_time(timezone: str) -&gt; str</code> that returns the current local time for an IANA
+            timezone name such as <code>"Asia/Tokyo"</code>, using <code>datetime.now(ZoneInfo(timezone))</code>.</li>
+          <li>A <code>TOOLS</code> definition whose description tells the model to pass an IANA name (and gives an
+            example), and a <code>REGISTRY</code> dict.</li>
+          <li>A function <code>ask(client, question) -&gt; str</code> that does one round trip, built from your
+            <code>build_tool_result</code> and <code>dispatch</code> from the exercises.</li>
+          <li>A client chooser: try <code>al.get_client()</code> (the real API, if <code>anthropic</code> is installed
+            and a key is in the environment); if it raises <code>al.LiveModelUnavailableError</code>, fall back to an
+            <code>al.MockClient</code> scripted to call <code>get_time</code> with <code>"Asia/Tokyo"</code>.</li>
+          <li>Structured logging with <code>structlog</code>: log one event per tool call with the tool name, input,
+            and <code>tool_use_id</code>. Logs, not prints, because later you will want to search and filter what your
+            agent did; key=value lines are easy to grep and to ship to a log store.</li>
+        </ul>
+        <ul class="checklist" data-id="m08-mini">
+          <li>The program runs with <code>pixi run python clock.py "..."</code> and prints one answer</li>
+          <li>Without the real API available, the mock fallback runs the same <code>ask</code> function end to end</li>
+          <li>Every request uses <code>model="claude-opus-5-5"</code> (or <code>al.MODEL</code>) and an explicit <code>max_tokens</code></li>
+          <li>The assistant turn is appended as <code>response.content</code>, and every <code>tool_result</code> uses <code>block.id</code></li>
+          <li>Tools are looked up only through the registry dict</li>
+          <li>One structlog event per tool call includes <code>tool</code>, <code>input</code>, and <code>tool_use_id</code></li>
+          <li>No API key appears anywhere in the code or the repository</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> print <code>al.format_transcript(messages, final)</code> when a
+          <code>--debug</code> flag is given; make the tool return JSON with both the time and the UTC offset; ask
+          "What time is it in Tokyo and in Lima?" against the real API and see whether your code handles two
+          <code>tool_use</code> blocks in one response.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m08-quiz">
+<script type="application/json">
+{"title": "One Tool Call by Hand quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "Who executes the Python function behind a tool?", "options": ["The model, on Anthropic's servers", "Your code, in your process", "The SDK, automatically, whenever it sees tool_use", "Nobody; the model imagines the result"], "answer": 1, "explanation": "<p>The model only writes a <code>tool_use</code> block asking for the call. Your program looks up the function and runs it, with your permissions. That is why a registry (an allow-list) matters.</p>"},
+  {"type": "single", "prompt": "A response has <code>stop_reason == \"tool_use\"</code>. What does it mean?", "options": ["The model has finished and used a tool along the way", "The model paused because it wants you to run one or more tools and send back the results", "The tool failed", "max_tokens was reached during a tool call"], "answer": 1, "explanation": "<p><code>tool_use</code> means the turn is not finished. Run every requested tool, send the results, and the model continues. Treating it as a final answer prints nothing useful.</p>"},
+  {"type": "multi", "prompt": "Which fields of a <code>tool_use</code> block do you need to complete a round trip?", "options": ["<code>id</code>", "<code>name</code>", "<code>input</code>", "<code>usage</code>"], "answer": [0, 1, 2], "explanation": "<p><code>name</code> picks the function, <code>input</code> supplies its keyword arguments, and <code>id</code> goes into the result as <code>tool_use_id</code>. <code>usage</code> belongs to the response, not the block.</p>"},
+  {"type": "single", "prompt": "Why should you avoid <code>response.content[0].input</code>?", "options": ["<code>input</code> is a JSON string that must be parsed first", "The model may write a text block before the tool_use block, and text blocks have no <code>input</code>", "Content is always empty on tool_use responses", "Indexing content is not allowed by the SDK"], "answer": 1, "explanation": "<p>Responses can start with text such as \"Let me check.\" Select blocks by <code>block.type == \"tool_use\"</code>. And <code>input</code> is already a dict, so no parsing is needed.</p>"},
+  {"type": "text", "prompt": "In a <code>tool_result</code> block, which key must equal the <code>tool_use</code> block's <code>id</code>?", "answer": ["tool_use_id"], "explanation": "<p><code>tool_use_id</code> pairs a result with its call. It must be the exact id the model gave, not the tool name.</p>"},
+  {"type": "single", "prompt": "Which role does the message carrying <code>tool_result</code> blocks use?", "options": ["assistant", "user", "tool", "system"], "answer": 1, "explanation": "<p>Results are sent in a <code>user</code> message. The Messages API has no separate tool role; the user turn carries information from your side of the conversation, including tool output.</p>"},
+  {"type": "output", "prompt": "What does this print?", "code": "import json\nout = {\"temp_c\": 18}\ncontent = out if isinstance(out, str) else json.dumps(out)\nprint(type(content).__name__, content)", "answer": "str {\"temp_c\": 18}", "explanation": "<p>The dict is not a string, so it is serialized with <code>json.dumps</code>. Tool results go back as text the model can read.</p>"},
+  {"type": "single", "prompt": "You append <code>{\"role\": \"assistant\", \"content\": response.text}</code> (text only) and then the tool_result. The model wrote \"Let me check.\" before the call. What happens?", "options": ["It works; the API only needs the result", "BadRequestError: tool_result blocks must answer tool_use blocks in the previous assistant message", "BadRequestError: tool_result blocks must come before any other content", "The model calls the tool again"], "answer": 1, "explanation": "<p>The stored assistant turn lost its <code>tool_use</code> block, so the result answers nothing. Always append <code>response.content</code>.</p>"},
+  {"type": "single", "prompt": "You send a tool_result whose <code>tool_use_id</code> is <code>\"get_weather\"</code>. Which error do you get?", "options": ["tool_result references unknown tool_use id get_weather", "tool_use ids were found without tool_result blocks immediately after: toolu_...", "messages: the final message must not be an assistant message", "No error"], "answer": 1, "explanation": "<p>A result with the wrong id does not count, so the real call is still unanswered. Seeing \"without tool_result blocks\" when you did send a result is the clue to compare ids.</p>"},
+  {"type": "multi", "prompt": "Which of these user messages are valid answers to a single tool_use with id <code>T</code>?", "options": ["<code>[tool_result(T)]</code>", "<code>[tool_result(T), text(\"Be brief.\")]</code>", "<code>[text(\"Here:\"), tool_result(T)]</code>", "<code>\"The weather is 18°C\"</code> (a plain string)"], "answer": [0, 1], "explanation": "<p>Results must come first; text may follow. Text before the result is rejected, and a plain string has no tool_result at all, so <code>T</code> is unanswered.</p>"},
+  {"type": "single", "prompt": "A pairing mistake raises <code>BadRequestError</code> (HTTP 400). What should your code do?", "options": ["Retry with exponential backoff", "Retry once immediately", "Fix the request; retrying the same request fails the same way", "Switch to a different model"], "answer": 2, "explanation": "<p>400 means the request itself is malformed. Retries are for transient failures like 429 and 5xx (M10).</p>"},
+  {"type": "single", "prompt": "Why use a dict registry instead of <code>globals()[block.name]</code>?", "options": ["Dicts are faster", "The registry is an explicit allow-list: only functions you chose can be called by the model", "globals() does not contain functions", "The SDK requires a dict"], "answer": 1, "explanation": "<p>The model chooses the name. A registry limits it to the tools you deliberately exposed; <code>globals()</code> would expose every function in your module.</p>"},
+  {"type": "text", "prompt": "Which agentlab helper prints a conversation one block per line, with tool ids in brackets?", "answer": ["format_transcript", "al.format_transcript", "agentlab.format_transcript"], "explanation": "<p><code>al.format_transcript(messages, response)</code> is the first thing to print when a request is rejected: pairing bugs are visible in the bracketed ids.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>A tool round trip is two requests: the first ends with <code>stop_reason="tool_use"</code>, the second
+        carries the result and usually ends with <code>end_turn</code>.</li>
+      <li>The model never runs code. Your program reads <code>tool_use</code> (<code>id</code>, <code>name</code>,
+        <code>input</code>), runs the function, and replies.</li>
+      <li>Select tool calls by <code>block.type == "tool_use"</code>; text can come first. <code>input</code> is
+        already a dict.</li>
+      <li>Dispatch with a registry dict: <code>registry[block.name](**block.input)</code>. It is your allow-list.</li>
+      <li>A <code>tool_result</code> is <code>{"type": "tool_result", "tool_use_id": block.id, "content": text}</code>
+        in a user message.</li>
+      <li>Request 2 history: question, <code>{"role": "assistant", "content": response.content}</code>, then a user
+        message whose results come before any text. Send <code>tools</code> again.</li>
+      <li>Pairing mistakes are 400 <code>BadRequestError</code>s with specific messages. Fix them; never retry them.
+        Print <code>al.format_transcript</code> and compare the bracketed ids.</li>
+    </ul>
+    <div class="flashcards" data-title="One tool call">
+      <script type="application/json">
+      [{"front": "What does <code>stop_reason == \"tool_use\"</code> ask you to do?", "back": "Run every requested tool, send the results back in a user message, and call the API again."},
+       {"front": "The three fields of a <code>tool_use</code> block", "back": "<code>id</code> (echo it), <code>name</code> (pick the function), <code>input</code> (a dict of keyword arguments)."},
+       {"front": "The shape of a <code>tool_result</code> block", "back": "<code>{\"type\": \"tool_result\", \"tool_use_id\": block.id, \"content\": \"...\"}</code>"},
+       {"front": "What do you append as the assistant turn?", "back": "<code>response.content</code>: all blocks, including <code>tool_use</code>. Never just the text."},
+       {"front": "Where do tool results go?", "back": "In the very next <code>user</code> message, before any text blocks."},
+       {"front": "Why a registry dict for tools?", "back": "It maps names to functions in one place and is an allow-list: the model can only trigger what you registered."},
+       {"front": "Error: \"tool_use ids were found without tool_result blocks immediately after\"", "back": "A call went unanswered: no result was sent, or its <code>tool_use_id</code> is wrong."},
+       {"front": "Error: \"tool_result blocks must come before any other content\"", "back": "Text was placed before the results in the user message. Put results first."},
+       {"front": "Error: \"tool_result blocks must answer tool_use blocks in the previous assistant message\"", "back": "The assistant turn was stored as text (or omitted), so no <code>tool_use</code> precedes the result."},
+       {"front": "Retry a pairing <code>BadRequestError</code>?", "back": "No. A 400 means the request is wrong; it fails the same way every time. Fix the code."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Claude docs: Tool use overview</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use">Claude docs: How to implement tool use</a></li>
+      <li><a href="https://docs.python.org/3.14/library/zoneinfo.html">Python docs: zoneinfo</a> (for the mini-project)</li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> and <a href="../reference/glossary.html">glossary</a></li>
+      <li>Next: <a href="m09-agent-loop.html">M09 The Agent Loop</a>, where this round trip becomes a loop</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

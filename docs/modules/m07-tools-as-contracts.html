@@ -1,0 +1,1388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M07 · Tools as Contracts · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m07">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Module 07</p>
+    <h1>Tools as Contracts</h1>
+    <p class="lede">A model on its own can only write text. Tools let it ask your code to do things: look something
+      up, compute, read a file. But the model never sees your code. All it sees is a name, a description, and a schema.
+      That definition is a contract between you and the model, and an agent can only be as good as the contracts it is
+      given.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m05-structured-output.html">M05 Structured Output</a>, <a href="m06-prompting.html">M06 Prompting That Holds Up</a></span></div>
+    <ul class="objectives">
+      <li>Explain what a tool is to the model: a name, a description, and an input schema, with no code attached</li>
+      <li>Write a valid tool definition and predict which definitions the API rejects</li>
+      <li>Write <code>input_schema</code> with types, enums, bounds, arrays, and a correct <code>required</code> list</li>
+      <li>Write descriptions that say what a tool does, when to use it, and when not to</li>
+      <li>Use <code>"strict": true</code> with <code>additionalProperties: false</code> and explain what it guarantees</li>
+      <li>Generate a tool definition from a Python function's signature, type hints, and docstring</li>
+      <li>Use <code>tool_choice</code> correctly on Claude Opus 5.5 and read the <code>tool_use</code> block that comes back</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="what-a-tool-is">
+    <h2>What a tool is to the model</h2>
+    <p>In everyday speech a "tool" is a function your program can call. To the model, a <strong>tool</strong> is
+      something much smaller: a <em>description of</em> a function. You send a list of tool definitions with the
+      request. Each one has three parts:</p>
+    <ul>
+      <li><code>name</code>: an identifier the model uses to ask for the tool, such as <code>get_weather</code>;</li>
+      <li><code>description</code>: plain-language text saying what the tool does and when to use it;</li>
+      <li><code>input_schema</code>: a JSON Schema (<a href="m05-structured-output.html">M05</a>) describing the
+        arguments the tool accepts.</li>
+    </ul>
+    <p>When the model decides a tool would help, it does not run anything. It ends its turn with a
+      <strong><code>tool_use</code> block</strong>: a structured request that says "please call <code>get_weather</code>
+      with <code>{"city": "Paris"}</code>". The response's <code>stop_reason</code> is <code>"tool_use"</code>. Your code
+      reads that block, runs the real function, and sends the result back in the next request. The model then continues
+      with the result in view.</p>
+    <pre class="mermaid">sequenceDiagram
+    participant C as Your code
+    participant M as Model (via the API)
+    C->>M: messages + tools (name, description, input_schema)
+    M-->>C: tool_use {name: "get_weather", input: {"city": "Paris"}}<br/>stop_reason = "tool_use"
+    Note over C: You run get_weather("Paris")<br/>(M08 builds this step)
+    C->>M: tool_result with the output
+    M-->>C: final text answer, stop_reason = "end_turn"</pre>
+    <p>This division of labor is the most important idea in Stage 2:</p>
+    <div class="two-col">
+      <div>
+        <h4>The model decides</h4>
+        <ul>
+          <li>whether a tool would help</li>
+          <li>which tool to ask for</li>
+          <li>what arguments to pass</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Your code decides</h4>
+        <ul>
+          <li>which tools exist at all</li>
+          <li>whether to actually run a requested call</li>
+          <li>what the function really does, and what result to send back</li>
+        </ul>
+      </div>
+    </div>
+    <p>Because the model only sees the definition, the definition is the whole interface. A vague description, a
+      misleading name, or a loose schema leads to wrong calls even when the Python function behind it is perfect. That is
+      why this module calls tools <strong>contracts</strong>: the definition promises what the tool does and what input
+      it accepts, and the model holds you to it.</p>
+    <div class="runnable" data-title="A tool definition goes out; a tool_use block comes back">
+<textarea>
+import agentlab as al
+
+WEATHER_TOOL = {
+    "name": "get_weather",
+    "description": "Get the current temperature in degrees Celsius for a city. "
+                   "Use it when the user asks about current weather conditions.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string", "description": "City name, such as 'Paris'"}},
+        "required": ["city"],
+    },
+}
+
+client = al.MockClient([al.tool_call("get_weather", {"city": "Paris"})])
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=500,
+    tools=[WEATHER_TOOL],
+    messages=[{"role": "user", "content": "Is it warm in Paris right now?"}],
+)
+
+print("stop_reason:", response.stop_reason)
+block = response.content[0]
+print("type :", block.type)
+print("id   :", block.id)
+print("name :", block.name)
+print("input:", block.input)
+</textarea>
+    </div>
+    <p>The mock's script decided that the "model" would ask for the tool; the real model makes that choice from your
+      definitions and the conversation. Either way, the response shape is the same: a <code>tool_use</code> block with an
+      <code>id</code> (which your result must echo back), the tool <code>name</code>, and the <code>input</code>, already
+      parsed into a Python dict. In this module you only define tools and read what comes back. Running the function and
+      returning the result is <a href="m08-one-tool-call.html">M08</a>.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> a tool is a name, a description, and a schema. The model
+      asks; your code runs. The definition is the only thing the model knows about your function.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="anatomy">
+    <h2>Anatomy of a valid definition</h2>
+    <p>The API checks tool definitions before the model sees them, and rejects the whole request with a
+      <code>400 BadRequestError</code> if one is malformed. The rules worth knowing by heart:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Rule</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>1 to 64 characters from letters, digits, <code>_</code> and <code>-</code>
+          (the pattern <code>^[a-zA-Z0-9_-]{1,64}$</code>); unique within the request</td>
+          <td>The model writes this name back in <code>tool_use</code>; it must be an unambiguous identifier.</td></tr>
+        <tr><td><code>description</code></td><td>Plain text; not checked for quality by anyone but you</td>
+          <td>It is the model's main guide to when and how to use the tool.</td></tr>
+        <tr><td><code>input_schema</code></td><td>A JSON Schema whose top level is <code>{"type": "object", ...}</code></td>
+          <td>Tool input is always a JSON object of named arguments, never a bare string or list.</td></tr>
+      </tbody>
+    </table>
+    <p>The <code>agentlab</code> mock applies the same checks, so you can see the exact errors. Predict which of these
+      definitions pass before you run the cell:</p>
+    <div class="runnable" data-title="Which definitions does the API reject?" data-predict>
+<textarea>
+import agentlab as al
+
+def schema(**props):
+    return {"type": "object", "properties": props}
+
+candidates = {
+    "space in name":   [{"name": "get weather", "description": "x", "input_schema": schema()}],
+    "dotted name":     [{"name": "weather.get", "description": "x", "input_schema": schema()}],
+    "duplicate names": [{"name": "lookup", "description": "x", "input_schema": schema()},
+                        {"name": "lookup", "description": "y", "input_schema": schema()}],
+    "array schema":    [{"name": "lookup", "description": "x", "input_schema": {"type": "array"}}],
+    "no schema":       [{"name": "lookup", "description": "x"}],
+    "valid":           [{"name": "get-weather_v2", "description": "x", "input_schema": schema(city={"type": "string"})}],
+}
+
+for label, tools in candidates.items():
+    client = al.MockClient(["ok"])
+    try:
+        client.messages.create(model=al.MODEL, max_tokens=100, tools=tools,
+                               messages=[{"role": "user", "content": "hi"}])
+        print(f"{label:16} accepted")
+    except al.BadRequestError as e:
+        print(f"{label:16} BadRequestError: {e}")
+</textarea>
+    </div>
+    <p>The error messages name the field by its position (<code>tools.0.name</code>) the way the real API does, so when
+      you see one in a log you can go straight to the offending definition. These are <em>fix, do not retry</em>
+      errors: the same request will fail the same way every time (<a href="m10-errors-as-data.html">M10</a> covers which
+      errors to retry).</p>
+    <h3>Naming tools</h3>
+    <p>Valid is the minimum. A good name is a verb and a noun in <code>snake_case</code> that says what the tool does:
+      <code>search_orders</code>, <code>get_order</code>, <code>cancel_order</code>. Avoid names that only make sense
+      inside your codebase (<code>handler2</code>, <code>run_query_v3</code>) and names that overlap
+      (<code>find_customer</code> next to <code>lookup_customer</code>): if you cannot tell from the names which one to
+      use, neither can the model. <a href="m12-tool-design.html">M12</a> goes deeper into designing a tool set.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> names match <code>^[a-zA-Z0-9_-]{1,64}$</code> and are
+      unique; <code>input_schema</code> is an object schema. A bad definition is a 400 you fix, never one you retry.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="input-schema">
+    <h2>Writing the input schema</h2>
+    <p>The <code>input_schema</code> uses the same JSON Schema you met in <a href="m05-structured-output.html">M05</a>.
+      For tools, a small subset does almost all the work:</p>
+    <table>
+      <thead><tr><th>Keyword</th><th>Example</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><code>type</code></td><td><code>"string"</code>, <code>"integer"</code>, <code>"number"</code>, <code>"boolean"</code>, <code>"array"</code>, <code>"object"</code></td><td>Every property</td></tr>
+        <tr><td><code>description</code></td><td><code>"ISO date, such as 2026-03-01"</code></td><td>Format, units, examples for one argument</td></tr>
+        <tr><td><code>enum</code></td><td><code>["low", "normal", "high"]</code></td><td>A closed set of choices</td></tr>
+        <tr><td><code>minimum</code> / <code>maximum</code></td><td><code>1</code> / <code>50</code></td><td>Numeric bounds such as page size</td></tr>
+        <tr><td><code>items</code></td><td><code>{"type": "string"}</code></td><td>The type of each array element</td></tr>
+        <tr><td><code>required</code></td><td><code>["query"]</code></td><td>Arguments the call cannot do without</td></tr>
+      </tbody>
+    </table>
+    <p>Here is a complete schema for a note-search tool. Read it as a list of promises: <code>query</code> must be
+      present and a string; <code>limit</code> is optional and between 1 and 20; <code>sort</code>, if given, is one of
+      two words; <code>tags</code> is a list of strings.</p>
+    <pre><code class="language-json">{
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "description": "Words to search for in note titles and bodies"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum notes to return; default 5"},
+    "sort":  {"type": "string", "enum": ["relevance", "newest"], "description": "Result order; default relevance"},
+    "tags":  {"type": "array", "items": {"type": "string"}, "description": "Only return notes with all of these tags"}
+  },
+  "required": ["query"]
+}</code></pre>
+    <p><code>required</code> is where the contract gets precise. An argument with a sensible default (here
+      <code>limit</code> and <code>sort</code>) should be optional, and the description should say what the default is,
+      because the model cannot see your Python default values. An argument the function cannot work without must be
+      required, or the model will sometimes leave it out.</p>
+    <div class="runnable" data-title="Check inputs against the schema with al.validate">
+<textarea>
+import agentlab as al
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        "sort": {"type": "string", "enum": ["relevance", "newest"]},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["query"],
+}
+
+inputs = [
+    {"query": "pixi tasks"},
+    {"query": "pixi tasks", "limit": 50},
+    {"limit": 5},
+    {"query": "pixi", "sort": "oldest", "tags": ["build", 3]},
+    {"query": "pixi", "limit": "5"},
+]
+for value in inputs:
+    print(value, "->", al.validate(value, SCHEMA) or "valid")
+</textarea>
+    </div>
+    <p><code>al.validate</code> returns a list of problems (empty means valid). You will use exactly this check in
+      <a href="m10-errors-as-data.html">M10</a> to validate the model's tool input before running a tool, and to send the
+      problems back as an error result the model can correct.</p>
+    <aside class="callout warn"><p>Two schema mistakes the API will not catch for you: listing a name in
+      <code>required</code> that is not in <code>properties</code> (no valid input can satisfy it), and an
+      <code>enum</code> whose values do not match the declared <code>type</code> (<code>"type": "integer"</code> with
+      <code>"enum": ["1", "2"]</code>). Both make a tool impossible to call correctly. A unit test that validates one known
+      good input against each schema catches them.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> type every property, use <code>enum</code> and bounds to
+      close off bad values, describe formats and defaults, and require exactly the arguments the function cannot do
+      without.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="descriptions">
+    <h2>Descriptions that say when, and when not</h2>
+    <p>Everything in <a href="m06-prompting.html">M06</a> applies here: a tool description is a prompt. It is the
+      model's main evidence for <em>whether</em> to call the tool and <em>how</em>. One line is almost never enough;
+      several sentences is normal for any tool that matters. A good description answers:</p>
+    <ol>
+      <li><strong>What does it do?</strong> In concrete terms, including what it returns.</li>
+      <li><strong>When should it be used?</strong> The kinds of user requests it serves.</li>
+      <li><strong>When should it not be used?</strong> Especially when another tool is the better choice.</li>
+      <li><strong>What are its limits?</strong> Data it cannot see, ranges it cannot handle, side effects it has.</li>
+    </ol>
+    <div class="tabs">
+      <div class="tab" data-label="Thin">
+<pre><code class="language-python">{"name": "search_orders",
+ "description": "Searches orders.",
+ "input_schema": {"type": "object",
+                  "properties": {"q": {"type": "string"}},
+                  "required": ["q"]}}</code></pre>
+        <p>Search by what? Customer name, order number, product? What comes back? Should the model use this to look up a
+          single known order? What is <code>q</code>? The model will guess, and guesses differently each time.</p>
+      </div>
+      <div class="tab" data-label="Contract">
+<pre><code class="language-python">{"name": "search_orders",
+ "description": (
+     "Search a customer's orders by product name or date range and return up to "
+     "10 matches, newest first, each with order_id, date, status and total. "
+     "Use it when the user describes an order but does not know its id. "
+     "If the user gives an order id (like 'A-10442'), call get_order instead. "
+     "Only orders from the last 24 months are searchable."
+ ),
+ "input_schema": {
+     "type": "object",
+     "properties": {
+         "customer_id": {"type": "string", "description": "Customer id, such as 'C-2201'"},
+         "product": {"type": "string", "description": "Words from the product name"},
+         "since": {"type": "string", "description": "ISO date (YYYY-MM-DD); only orders on or after it"},
+     },
+     "required": ["customer_id"],
+ }}</code></pre>
+        <p>What, what it returns, when, when not (with the alternative named), and the limit. The property names and
+          descriptions remove the rest of the guessing.</p>
+      </div>
+    </div>
+    <p>Notice that the "when not" sentence points at another tool by name. When two tools could plausibly answer the
+      same request, the descriptions are where you draw the line between them. If you cannot write that sentence
+      clearly, the tools probably overlap and should be merged or renamed.</p>
+    <aside class="callout think"><p>Your agent has <code>get_weather(city)</code> and
+      <code>get_forecast(city, days)</code>. A user asks "Should I bring an umbrella tomorrow?" Which tool should be
+      called, and which sentence in which description makes that obvious to the model?</p></aside>
+    <details class="reveal"><summary>Reveal</summary>
+      <p><code>get_forecast</code>, with <code>days=1</code> or similar. The deciding sentence belongs in
+        <code>get_weather</code>'s description: "Current conditions only; for tomorrow or later, use get_forecast."
+        Without it, "weather" in the name is a strong pull toward the wrong tool.</p>
+    </details>
+    <aside class="callout tip"><p><strong>Remember:</strong> a description is a prompt. Say what the tool does and
+      returns, when to use it, when not to (naming the alternative), and its limits.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="strict">
+    <h2>Strict tools: schema-valid input, guaranteed</h2>
+    <p>By default the schema is guidance. The model almost always follows it, but "almost always" means your code must
+      still check every input: a missing required field or a string where you expected an integer is possible. Adding
+      <code>"strict": true</code> to a tool definition changes that. With strict tool use, the API
+      <strong>guarantees</strong> that the <code>input</code> in every <code>tool_use</code> block for that tool is valid
+      against its schema.</p>
+    <p>Strict mode asks more of the schema in return. Every object in it must set <code>additionalProperties:
+      false</code> (no undeclared keys), and must say which properties are <code>required</code>. That makes the schema a
+      closed, precise description the guarantee can be built on.</p>
+    <pre><code class="language-python">SET_ALARM = {
+    "name": "set_alarm",
+    "description": "Set an alarm on the user's phone for a time today, in 24-hour local time.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+            "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+            "label": {"type": "string", "description": "Short label shown with the alarm"},
+        },
+        "required": ["hour", "minute"],
+        "additionalProperties": False,
+    },
+}</code></pre>
+    <p>The mock models the guarantee from the other side. It will not hand you invalid input for a strict tool: if a
+      script tries to, it raises <code>MockScriptError</code>, which always means "the script is wrong", never "your code
+      is wrong". With a non-strict tool the same bad input comes straight through, and it is your job to catch it.</p>
+    <div class="runnable" data-title="Strict versus non-strict with the same bad input">
+<textarea>
+import copy
+import agentlab as al
+
+SET_ALARM = {
+    "name": "set_alarm",
+    "description": "Set an alarm for a time today, in 24-hour local time.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+            "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+        },
+        "required": ["hour", "minute"],
+        "additionalProperties": False,
+    },
+}
+bad_input = {"hour": "seven"}
+request = dict(model=al.MODEL, max_tokens=200, messages=[{"role": "user", "content": "Wake me at seven"}])
+
+# Strict: the API never produces this input, so the mock refuses to script it.
+client = al.MockClient([al.tool_call("set_alarm", bad_input)])
+try:
+    client.messages.create(tools=[SET_ALARM], **request)
+except al.MockScriptError as e:
+    print("strict    :", e)
+
+# Not strict: the input arrives as-is, and validating it is your job.
+loose = copy.deepcopy(SET_ALARM)
+del loose["strict"]
+client = al.MockClient([al.tool_call("set_alarm", bad_input)])
+response = client.messages.create(tools=[loose], **request)
+block = response.content[0]
+print("non-strict:", block.input, "->", al.validate(block.input, loose["input_schema"]))
+</textarea>
+    </div>
+    <p>When should you use strict? Whenever a malformed call would be expensive or confusing: tools with side effects,
+      tools whose input goes straight into another system, and agents where you want one less failure mode to handle. A
+      guaranteed shape does not make the <em>values</em> sensible, though. Strict guarantees <code>hour</code> is an
+      integer from 0 to 23; it does not guarantee it is the hour the user meant. Your tool still checks business rules.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>"strict": true</code> guarantees schema-valid input
+      and requires <code>additionalProperties: false</code> and a <code>required</code> list on every object. It
+      guarantees shape, not meaning.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="from-signature">
+    <h2>Generating a definition from a Python function</h2>
+    <p>Writing schemas by hand works for three tools. With twenty, the definitions drift away from the functions: someone
+      adds a parameter and forgets the schema, or renames one in only one place. The fix is to make the function the
+      single source of truth and <em>generate</em> the definition from it. A well-written Python function already
+      contains everything a tool definition needs:</p>
+    <table>
+      <thead><tr><th>Tool definition</th><th>Comes from</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td><code>func.__name__</code></td></tr>
+        <tr><td><code>description</code></td><td>the docstring, without its <code>Args:</code> / <code>Returns:</code> sections</td></tr>
+        <tr><td>property names</td><td>the parameter names, from <code>inspect.signature(func)</code></td></tr>
+        <tr><td>property types</td><td>the type hints, from <code>typing.get_type_hints(func)</code></td></tr>
+        <tr><td><code>required</code></td><td>parameters with no default value</td></tr>
+        <tr><td><code>enum</code></td><td><code>Literal["a", "b"]</code> type hints</td></tr>
+      </tbody>
+    </table>
+    <h3>Step 1: read the signature</h3>
+    <p><code>inspect.signature</code> returns the parameters in order. Each <code>Parameter</code> has a
+      <code>default</code>, which is the special marker <code>inspect.Parameter.empty</code> when there is none. That is
+      how you tell required from optional. <code>typing.get_type_hints</code> returns the annotations as real type
+      objects (it resolves string annotations too, which is why it is safer than reading
+      <code>__annotations__</code> directly).</p>
+    <div class="runnable" data-title="What inspect and typing can see">
+<textarea>
+import inspect
+import typing
+from typing import Literal
+
+def search_notes(query: str, limit: int = 5, sort: Literal["relevance", "newest"] = "relevance",
+                 tags: list[str] | None = None) -> list[str]:
+    """Search the user's notes by keyword.
+
+    Args:
+        query: Words to search for.
+        limit: Maximum notes to return.
+    """
+    return []
+
+hints = typing.get_type_hints(search_notes)
+for name, param in inspect.signature(search_notes).parameters.items():
+    required = param.default is inspect.Parameter.empty
+    print(f"{name:6} hint={hints[name]!r:40} required={required}")
+print("return hint:", hints["return"])
+</textarea>
+    </div>
+    <p>Note <code>tags</code>: its hint is the union <code>list[str] | None</code>, the usual way to write an optional
+      list without a mutable default. The generator below supports only the simple cases and will reject it with a
+      <code>TypeError</code>; handling <code>X | None</code> is a stretch goal in the mini-project.</p>
+    <h3>Step 2: map Python types to JSON Schema</h3>
+    <p>The core is a small, recursive function. Simple types map one to one. Generic types such as
+      <code>list[str]</code> and <code>Literal["a", "b"]</code> are taken apart with <code>typing.get_origin</code>
+      (the outer type: <code>list</code> or <code>Literal</code>) and <code>typing.get_args</code> (what is inside:
+      <code>(str,)</code> or <code>("a", "b")</code>). Anything unsupported raises <code>TypeError</code>: a generator
+      that silently guesses would produce exactly the drifting, misleading contracts it was meant to prevent.</p>
+    <div class="runnable" data-title="Python type hints to JSON Schema">
+<textarea>
+import typing
+from typing import Literal
+
+SIMPLE = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+def json_type(annotation):
+    if annotation in SIMPLE:
+        return {"type": SIMPLE[annotation]}
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        (item,) = typing.get_args(annotation)
+        return {"type": "array", "items": json_type(item)}
+    if origin is Literal:
+        values = list(typing.get_args(annotation))
+        return {"type": SIMPLE[type(values[0])], "enum": values}
+    raise TypeError(f"unsupported annotation: {annotation!r}")
+
+for hint in (str, int, float, bool, list[str], list[list[int]], Literal["low", "normal", "high"], Literal[1, 2, 3]):
+    print(f"{hint!r:38} -> {json_type(hint)}")
+
+try:
+    json_type(dict)
+except TypeError as e:
+    print("TypeError:", e)
+</textarea>
+    </div>
+    <aside class="callout note"><p>Why check <code>bool</code> by identity rather than with <code>issubclass</code>? In
+      Python, <code>bool</code> is a subclass of <code>int</code>, so <code>issubclass(bool, int)</code> is
+      <code>True</code>. A generator that tested "is it an int?" first would describe a <code>bool</code> flag as an
+      integer. Looking the exact type up in a dict avoids the trap.</p></aside>
+    <h3>Step 3: assemble the definition</h3>
+    <p>The docstring gives the description. Google-style docstrings put a summary first and then sections such as
+      <code>Args:</code>; the summary (everything before the first section header) is what the model needs. The
+      <code>Args:</code> section can supply per-property descriptions too, which is the last exercise in this module.</p>
+    <div class="runnable" data-title="A complete generator">
+<textarea>
+import inspect
+import json
+import typing
+from typing import Literal
+
+SIMPLE = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+def json_type(annotation):
+    if annotation in SIMPLE:
+        return {"type": SIMPLE[annotation]}
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        (item,) = typing.get_args(annotation)
+        return {"type": "array", "items": json_type(item)}
+    if origin is Literal:
+        values = list(typing.get_args(annotation))
+        return {"type": SIMPLE[type(values[0])], "enum": values}
+    raise TypeError(f"unsupported annotation: {annotation!r}")
+
+def summary(doc):
+    kept = []
+    for line in doc.splitlines():
+        if line.strip() in {"Args:", "Returns:", "Raises:"}:
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+def tool_from_function(func):
+    doc = inspect.getdoc(func)
+    if not doc:
+        raise ValueError(f"{func.__name__} has no docstring; a tool needs a description")
+    hints = typing.get_type_hints(func)
+    properties, required = {}, []
+    for name, param in inspect.signature(func).parameters.items():
+        if name not in hints:
+            raise TypeError(f"parameter {name!r} has no type hint")
+        properties[name] = json_type(hints[name])
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+    return {
+        "name": func.__name__,
+        "description": summary(doc),
+        "input_schema": {"type": "object", "properties": properties, "required": required},
+    }
+
+def book_room(room: str, hours: int, attendees: list[str], projector: bool = False,
+              priority: Literal["low", "normal", "high"] = "normal") -> str:
+    """Book a meeting room for a block of whole hours, starting now.
+
+    Use this only after the user has confirmed the room name. Returns a booking id.
+
+    Args:
+        room: Room name, such as "Aurora".
+        hours: Length of the booking in whole hours.
+    """
+    return "BK-1"
+
+print(json.dumps(tool_from_function(book_room), indent=2))
+</textarea>
+    </div>
+    <p>Run it and compare the output with the function. <code>room</code>, <code>hours</code>, and
+      <code>attendees</code> have no defaults, so they are required; <code>projector</code> and <code>priority</code> are
+      optional; <code>priority</code> became an enum. The description kept the "use this only after" sentence and dropped
+      the <code>Args:</code> section. Change the function and the definition follows.</p>
+    <aside class="callout pro"><p>The SDK's beta tool runner includes a <code>@beta_tool</code> decorator that builds the
+      definition from a decorated function in the same spirit, and Pydantic models can produce JSON Schema for complex
+      inputs. Writing a small generator yourself first means you know exactly what such helpers produce, and you can read
+      the schema they send when a call goes wrong.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> make the function the source of truth. Name from
+      <code>__name__</code>, description from the docstring summary, properties from the signature and type hints,
+      <code>required</code> from parameters without defaults, and fail loudly on anything you cannot map.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="tool-choice">
+    <h2>tool_choice: letting the model decide</h2>
+    <p>The <code>tool_choice</code> parameter controls whether the model may call tools on a request:</p>
+    <ul>
+      <li><code>{"type": "auto"}</code> (the default when you send tools): the model decides whether to call a tool or
+        answer in text.</li>
+      <li><code>{"type": "none"}</code>: the tools are in the request, but the model must answer in text. Useful for a
+        final "summarize what you found" turn where you keep the same tool list (so the request stays consistent) but do
+        not want more calls.</li>
+      <li><code>{"type": "any"}</code> (must call some tool) and <code>{"type": "tool", "name": ...}</code> (must call
+        this tool) force a call. <strong>Forcing is rejected on Claude Opus 5.5</strong> with a 400 error.</li>
+    </ul>
+    <div class="runnable" data-title="Which tool_choice values are accepted?" data-predict>
+<textarea>
+import agentlab as al
+
+TOOL = {"name": "get_weather", "description": "Current weather for a city.",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
+
+for choice in ({"type": "auto"}, {"type": "none"}, {"type": "any"}, {"type": "tool", "name": "get_weather"}):
+    client = al.MockClient(["It is mild."])
+    try:
+        client.messages.create(model=al.MODEL, max_tokens=100, tools=[TOOL], tool_choice=choice,
+                               messages=[{"role": "user", "content": "Weather in Oslo?"}])
+        print(f"{choice['type']:5} accepted")
+    except al.BadRequestError as e:
+        print(f"{choice['type']:5} BadRequestError: {e}")
+</textarea>
+    </div>
+    <p>So how do you make the model use a tool when it should? The same way you steer everything else on current models:
+      with words. A description that says clearly when the tool applies, and a system prompt rule such as "Always look up
+      the order with get_order before answering questions about an order; never answer from memory", are what make tool
+      use reliable. If you need a JSON object rather than an action, you do not need a tool at all: use
+      <a href="m05-structured-output.html">structured output</a>.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>auto</code> is the default and <code>none</code>
+      disables calls for one request. Forcing a call is rejected on Opus 5.5; steer with descriptions and the system
+      prompt.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="reading-tool-use">
+    <h2>Reading what comes back</h2>
+    <p>When the model asks for a tool, the response looks like this. It may start with a text block (the model saying what
+      it is about to do), followed by one or more <code>tool_use</code> blocks:</p>
+    <pre><code class="language-json">{
+  "stop_reason": "tool_use",
+  "content": [
+    {"type": "text", "text": "I'll look up that order."},
+    {"type": "tool_use", "id": "toolu_01A9...", "name": "get_order", "input": {"order_id": "A-10442"}}
+  ]
+}</code></pre>
+    <p>Three habits to build now, before you start running tools in <a href="m08-one-tool-call.html">M08</a>:</p>
+    <ol>
+      <li><strong>Check <code>stop_reason</code> first.</strong> <code>"tool_use"</code> means the turn ended because
+        the model wants a call; <code>"end_turn"</code> means it answered.</li>
+      <li><strong>Find blocks by <code>type</code>, not by position.</strong> The tool call is not always
+        <code>content[0]</code>; text may come first, and there may be several calls.</li>
+      <li><strong>Treat <code>input</code> as untrusted until checked</strong>, unless the tool is strict. It is a dict
+        the model wrote, and the same caution from <a href="m06-prompting.html#untrusted-data">M06</a> applies.</li>
+    </ol>
+    <div class="runnable" data-title="Read a tool_use response and its transcript">
+<textarea>
+import agentlab as al
+
+GET_ORDER = {
+    "name": "get_order",
+    "description": "Look up one order by its id (like 'A-10442') and return its status and items.",
+    "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
+}
+
+client = al.MockClient([al.tool_call("get_order", {"order_id": "A-10442"}, text="I'll look up that order.")])
+messages = [{"role": "user", "content": "Where is my order A-10442?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=500, tools=[GET_ORDER], messages=messages)
+
+if response.stop_reason == "tool_use":
+    calls = [b for b in response.content if b.type == "tool_use"]
+    for call in calls:
+        tool = next(t for t in [GET_ORDER] if t["name"] == call.name)
+        problems = al.validate(call.input, tool["input_schema"])
+        print(f"model wants {call.name}({call.input}) id={call.id} problems={problems}")
+
+print()
+print(al.format_transcript(messages, response))
+</textarea>
+    </div>
+    <p>The transcript shows the conversation so far: the user's question, then the assistant's text and its
+      <code>tool_use</code>, then the stop reason. This is where this module stops. The conversation is now waiting for a
+      <code>tool_result</code>; sending the next request without one is an error, and <a href="m08-one-tool-call.html">M08</a>
+      shows exactly which one and how to build the result correctly.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> check <code>stop_reason</code>, select blocks by
+      <code>type</code>, keep the <code>id</code>, and validate <code>input</code> unless the tool is strict.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="real-sdk">
+    <h2>The same definitions with the real SDK</h2>
+    <p>Tool definitions are plain dicts, so they are identical for the mock and the real API. Locally, the only change is
+      the client:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()           # reads ANTHROPIC_API_KEY from the environment
+
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    tools=[tool_from_function(book_room), GET_ORDER],
+    messages=[{"role": "user", "content": "Book Aurora for two hours for me and Sam."}],
+)
+for block in response.content:
+    if block.type == "tool_use":
+        print(block.name, block.input)</code></pre>
+    <p>Tool definitions count as input tokens on every request, because they are part of what the model reads (you can
+      see the difference with <code>count_tokens</code>, as in <a href="m01-llm-calls.html">M01</a>). Long, precise
+      descriptions are worth their tokens; twenty barely-used tools are not. That trade-off is a theme of
+      <a href="m12-tool-design.html">M12</a>.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> the same dicts work with the mock and the real client, and
+      every definition you send costs input tokens on every request.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser and are graded instantly. The middle three build up to the centerpiece: a generator
+      that turns any suitable Python function into a tool definition.</p>
+
+    <div class="exercise" data-id="m07-e1" data-title="Write a tool definition by hand">
+      <div class="exercise-prompt">
+        <p>Define <code>NOTES_TOOL</code>, a tool definition for a function
+          <code>search_notes(query, limit=5, sort="relevance")</code>:</p>
+        <ul>
+          <li><code>name</code> is <code>"search_notes"</code>; <code>description</code> is at least 60 characters and
+            says what it returns and when to use it;</li>
+          <li><code>query</code>: a string, required;</li>
+          <li><code>limit</code>: an integer from 1 to 20 (use <code>minimum</code>/<code>maximum</code>), optional;</li>
+          <li><code>sort</code>: one of <code>"relevance"</code> or <code>"newest"</code>, optional.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+NOTES_TOOL = {
+    "name": "search_notes",
+    "description": "...",
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def _schema():
+    return NOTES_TOOL["input_schema"]
+
+def test_name_and_description():
+    assert NOTES_TOOL["name"] == "search_notes", "name should be 'search_notes'"
+    assert len(NOTES_TOOL["description"]) >= 60, "write a description of at least 60 characters: what it returns and when to use it"
+
+def test_accepted_by_api():
+    client = al.MockClient(["ok"])
+    client.messages.create(model=al.MODEL, max_tokens=50, tools=[NOTES_TOOL], messages=[{"role": "user", "content": "hi"}])
+    assert client.requests[0].tool_names == ["search_notes"], "the mock should accept the definition"
+
+def test_required():
+    assert _schema().get("required") == ["query"], "only 'query' should be required"
+
+def test_valid_inputs():
+    for value in ({"query": "pixi"}, {"query": "pixi", "limit": 20, "sort": "newest"}, {"query": "x", "limit": 1}):
+        problems = al.validate(value, _schema())
+        assert problems == [], f"{value} should be valid, got {problems}"
+
+def test_invalid_inputs():
+    for value, why in (({"limit": 5}, "query is missing"), ({"query": "x", "limit": 50}, "limit above 20"),
+                       ({"query": "x", "limit": 0}, "limit below 1"), ({"query": "x", "sort": "oldest"}, "sort not in the enum"),
+                       ({"query": 3}, "query not a string"), ({"query": "x", "limit": "5"}, "limit not an integer")):
+        assert al.validate(value, _schema()), f"{value} should be rejected ({why})"
+      </script>
+      <details class="hint"><summary>Hint</summary><p><code>"limit": {"type": "integer", "minimum": 1, "maximum": 20}</code>,
+        <code>"sort": {"type": "string", "enum": ["relevance", "newest"]}</code>, and <code>"required": ["query"]</code>
+        next to <code>"properties"</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">NOTES_TOOL = {
+    "name": "search_notes",
+    "description": (
+        "Search the user's notes by keyword and return matching notes with their id, title and first line. "
+        "Use it when the user refers to something they wrote down earlier."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Words to search for"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum notes; default 5"},
+            "sort": {"type": "string", "enum": ["relevance", "newest"], "description": "Order; default relevance"},
+        },
+        "required": ["query"],
+    },
+}</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e2" data-title="Fix the broken tool list">
+      <div class="exercise-prompt">
+        <p>A teammate's agent fails on its very first request with a <code>BadRequestError</code>, and even after that
+          error is fixed the tools have contract bugs. Fix <code>TOOLS</code> so that:</p>
+        <ul>
+          <li>the mock accepts the request (run the starter first and read the error);</li>
+          <li>there are exactly four tools named <code>get_weather</code>, <code>search_docs</code>,
+            <code>search_tickets</code>, and <code>create_ticket</code>;</li>
+          <li>every name in each <code>required</code> list is defined in that tool's <code>properties</code>;</li>
+          <li><code>create_ticket</code>'s <code>priority</code> property is a string enum of
+            <code>"low"</code>, <code>"normal"</code>, <code>"high"</code>;</li>
+          <li>every description is at least 40 characters.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+TOOLS = [
+    {"name": "get weather", "description": "Gets weather.",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+    {"name": "search_docs", "description": "Search the product documentation and return matching page titles.",
+     "input_schema": {"type": "string"}},
+    {"name": "search_docs", "description": "Search support tickets by keyword and return ticket ids and titles.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "create_ticket", "description": "Create a support ticket and return its id.",
+     "input_schema": {"type": "object", "properties": {"title": {"type": "string"}},
+                      "required": ["title", "priority"]}},
+]
+
+client = al.MockClient(["ok"])
+client.messages.create(model=al.MODEL, max_tokens=100, tools=TOOLS,
+                       messages=[{"role": "user", "content": "My export is broken."}])
+print("accepted")
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_accepted():
+    client = al.MockClient(["ok"])
+    client.messages.create(model=al.MODEL, max_tokens=100, tools=TOOLS, messages=[{"role": "user", "content": "hi"}])
+    assert len(client.requests) == 1, "the request with TOOLS should be accepted"
+
+def test_names():
+    names = sorted(t["name"] for t in TOOLS)
+    assert names == ["create_ticket", "get_weather", "search_docs", "search_tickets"], f"expected the four names from the task, got {names}"
+
+def test_required_defined():
+    for tool in TOOLS:
+        schema = tool["input_schema"]
+        missing = [r for r in schema.get("required", []) if r not in schema.get("properties", {})]
+        assert not missing, f"{tool['name']}: required lists {missing} but properties does not define them"
+
+def test_search_docs_has_query():
+    tool = next(t for t in TOOLS if t["name"] == "search_docs")
+    assert tool["input_schema"].get("properties", {}).get("query", {}).get("type") == "string", "search_docs needs a string 'query' property"
+
+def test_priority_enum():
+    tool = next(t for t in TOOLS if t["name"] == "create_ticket")
+    prop = tool["input_schema"]["properties"].get("priority")
+    assert prop is not None, "create_ticket needs a 'priority' property"
+    assert prop.get("type") == "string" and sorted(prop.get("enum", [])) == ["high", "low", "normal"], "priority should be a string enum of low, normal, high"
+
+def test_descriptions():
+    for tool in TOOLS:
+        assert len(tool["description"]) >= 40, f"{tool['name']}: the description should be at least 40 characters"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>There are four bugs: a space in a name, a non-object schema, a
+        duplicated name (the second tool searches tickets), and a required <code>priority</code> that is never defined.
+        The fifth requirement is the thin <code>get_weather</code> description.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+TOOLS = [
+    {"name": "get_weather", "description": "Get the current temperature and conditions for a city.",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+    {"name": "search_docs", "description": "Search the product documentation and return matching page titles.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "search_tickets", "description": "Search support tickets by keyword and return ticket ids and titles.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "create_ticket", "description": "Create a support ticket and return its id.",
+     "input_schema": {"type": "object",
+                      "properties": {"title": {"type": "string"},
+                                     "priority": {"type": "string", "enum": ["low", "normal", "high"]}},
+                      "required": ["title", "priority"]}},
+]
+
+client = al.MockClient(["ok"])
+client.messages.create(model=al.MODEL, max_tokens=100, tools=TOOLS,
+                       messages=[{"role": "user", "content": "My export is broken."}])
+print("accepted")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e3" data-title="Map type hints to JSON Schema">
+      <div class="exercise-prompt">
+        <p>Write <code>json_type(annotation)</code> that returns the JSON Schema for one Python type hint:</p>
+        <ul>
+          <li><code>str</code>, <code>int</code>, <code>float</code>, <code>bool</code> map to
+            <code>{"type": "string" | "integer" | "number" | "boolean"}</code>;</li>
+          <li><code>list[X]</code> maps to <code>{"type": "array", "items": json_type(X)}</code>;</li>
+          <li><code>Literal[...]</code> maps to <code>{"type": ..., "enum": [values in order]}</code>, with the type
+            taken from the values; if the values do not all share one of the four simple types, raise
+            <code>TypeError</code>;</li>
+          <li>anything else (<code>dict</code>, <code>list</code> with no item type, <code>None</code>, a class) raises
+            <code>TypeError</code>.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import typing
+from typing import Literal
+
+def json_type(annotation):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+from typing import Literal
+
+def _raises(value):
+    try:
+        json_type(value)
+    except TypeError:
+        return True
+    return False
+
+def test_simple():
+    assert json_type(str) == {"type": "string"}, "str -> string"
+    assert json_type(int) == {"type": "integer"}, "int -> integer"
+    assert json_type(float) == {"type": "number"}, "float -> number"
+    assert json_type(bool) == {"type": "boolean"}, "bool -> boolean (careful: bool is a subclass of int)"
+
+def test_lists():
+    assert json_type(list[str]) == {"type": "array", "items": {"type": "string"}}, "list[str] -> array of strings"
+    assert json_type(list[list[int]]) == {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}, "nested lists should recurse"
+
+def test_literal():
+    assert json_type(Literal["low", "high"]) == {"type": "string", "enum": ["low", "high"]}, "string Literal -> string enum, values in order"
+    assert json_type(Literal[1, 2, 3]) == {"type": "integer", "enum": [1, 2, 3]}, "int Literal -> integer enum"
+
+def test_mixed_literal_rejected():
+    assert _raises(Literal["a", 1]), "a Literal mixing types should raise TypeError"
+
+def test_unsupported():
+    for bad in (dict, list, None, set[str], object):
+        assert _raises(bad), f"{bad!r} is unsupported and should raise TypeError"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Look the annotation up in a dict of the four simple types first.
+        Then use <code>typing.get_origin</code> (which is <code>list</code> for <code>list[str]</code> and
+        <code>Literal</code> for <code>Literal["a"]</code>) and <code>typing.get_args</code>. For a Literal, collect
+        <code>{type(v) for v in values}</code> and check it has exactly one member that is in your dict. Bare
+        <code>list</code> has no origin, so it falls through to the final <code>raise</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import typing
+from typing import Literal
+
+SIMPLE = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+def json_type(annotation):
+    if annotation in SIMPLE:
+        return {"type": SIMPLE[annotation]}
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        (item,) = typing.get_args(annotation)
+        return {"type": "array", "items": json_type(item)}
+    if origin is Literal:
+        values = list(typing.get_args(annotation))
+        kinds = {type(v) for v in values}
+        if len(kinds) != 1 or next(iter(kinds)) not in SIMPLE:
+            raise TypeError(f"Literal values must share one simple type: {values!r}")
+        return {"type": SIMPLE[type(values[0])], "enum": values}
+    raise TypeError(f"unsupported annotation: {annotation!r}")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e4" data-title="Generate a tool definition from a function">
+      <div class="exercise-prompt">
+        <p>The centerpiece. Write <code>tool_from_function(func)</code> that returns a complete tool definition:</p>
+        <ul>
+          <li><code>name</code>: the function's name;</li>
+          <li><code>description</code>: the docstring (via <code>inspect.getdoc</code>) up to, not including, the first
+            line that is exactly <code>Args:</code>, <code>Returns:</code>, or <code>Raises:</code> (after stripping), with
+            surrounding whitespace stripped;</li>
+          <li><code>input_schema</code>: <code>{"type": "object", "properties": {...}, "required": [...]}</code>, one
+            property per parameter in signature order (using <code>json_type</code> from the previous exercise, included
+            in the starter), and <code>required</code> listing the parameters with no default, in signature order.</li>
+        </ul>
+        <p>Raise <code>ValueError</code> if the function has no docstring, and <code>TypeError</code> if any parameter
+          has no type hint. Ignore the return annotation.</p>
+      </div>
+<textarea class="starter">
+import inspect
+import typing
+from typing import Literal
+
+SIMPLE = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+def json_type(annotation):
+    if annotation in SIMPLE:
+        return {"type": SIMPLE[annotation]}
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        (item,) = typing.get_args(annotation)
+        return {"type": "array", "items": json_type(item)}
+    if origin is Literal:
+        values = list(typing.get_args(annotation))
+        return {"type": SIMPLE[type(values[0])], "enum": values}
+    raise TypeError(f"unsupported annotation: {annotation!r}")
+
+def tool_from_function(func):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+from typing import Literal
+import agentlab as al
+
+def book_room(room: str, hours: int, attendees: list[str], projector: bool = False,
+              budget: float = 100.0, priority: Literal["low", "normal", "high"] = "normal") -> str:
+    """Book a meeting room for a block of hours.
+
+    Use this only after the user has confirmed the room and the time.
+
+    Args:
+        room: Room name, such as "Aurora".
+        hours: Length in whole hours.
+
+    Returns:
+        The booking id.
+    """
+    return "BK-1"
+
+def no_doc(x: int) -> int:
+    return x
+
+def no_hint(x, y: int = 1) -> int:
+    """Add things."""
+    return y
+
+def ping() -> str:
+    """Check that the service is up.
+
+    Returns:
+        The word pong.
+    """
+    return "pong"
+
+def test_name():
+    assert tool_from_function(book_room)["name"] == "book_room", "name should be func.__name__"
+
+def test_description():
+    desc = tool_from_function(book_room)["description"]
+    assert desc.startswith("Book a meeting room for a block of hours."), f"description should start with the summary line, got {desc!r}"
+    assert "Use this only after" in desc, "keep every paragraph before the Args: section"
+    assert "Args:" not in desc and "Returns:" not in desc and "Aurora" not in desc, "drop the Args:/Returns: sections"
+    assert desc == desc.strip(), "strip surrounding whitespace"
+
+def test_properties():
+    props = tool_from_function(book_room)["input_schema"]["properties"]
+    assert list(props) == ["room", "hours", "attendees", "projector", "budget", "priority"], f"one property per parameter, in order; got {list(props)}"
+    assert props["room"] == {"type": "string"}, "room -> string"
+    assert props["hours"] == {"type": "integer"}, "hours -> integer"
+    assert props["attendees"] == {"type": "array", "items": {"type": "string"}}, "attendees -> array of strings"
+    assert props["projector"] == {"type": "boolean"}, "projector -> boolean"
+    assert props["budget"] == {"type": "number"}, "budget -> number"
+    assert props["priority"] == {"type": "string", "enum": ["low", "normal", "high"]}, "priority -> string enum"
+
+def test_required_and_type():
+    schema = tool_from_function(book_room)["input_schema"]
+    assert schema["type"] == "object", "input_schema type must be 'object'"
+    assert schema["required"] == ["room", "hours", "attendees"], f"required should list parameters without defaults, got {schema['required']}"
+
+def test_no_parameters():
+    tool = tool_from_function(ping)
+    assert tool["input_schema"] == {"type": "object", "properties": {}, "required": []}, "a function with no parameters gets an empty object schema"
+    assert tool["description"] == "Check that the service is up.", f"got {tool['description']!r}"
+
+def test_errors():
+    try:
+        tool_from_function(no_doc)
+        assert False, "a function without a docstring should raise ValueError"
+    except ValueError:
+        pass
+    try:
+        tool_from_function(no_hint)
+        assert False, "a parameter without a type hint should raise TypeError"
+    except TypeError:
+        pass
+
+def test_api_accepts_it():
+    client = al.MockClient([al.tool_call("book_room", {"room": "Aurora", "hours": 2, "attendees": ["Sam"]})])
+    response = client.messages.create(model=al.MODEL, max_tokens=200, tools=[tool_from_function(book_room)],
+                                      messages=[{"role": "user", "content": "Book Aurora for 2 hours with Sam"}])
+    assert response.stop_reason == "tool_use", "the generated definition should be accepted and usable"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Get <code>doc = inspect.getdoc(func)</code> and
+        <code>hints = typing.get_type_hints(func)</code>. Loop over
+        <code>inspect.signature(func).parameters.items()</code>; a parameter is required when
+        <code>param.default is inspect.Parameter.empty</code>. For the description, collect lines until one whose
+        <code>.strip()</code> is in <code>{"Args:", "Returns:", "Raises:"}</code>, then join and strip.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import inspect
+import typing
+from typing import Literal
+
+SIMPLE = {str: "string", int: "integer", float: "number", bool: "boolean"}
+SECTIONS = {"Args:", "Returns:", "Raises:"}
+
+def json_type(annotation):
+    if annotation in SIMPLE:
+        return {"type": SIMPLE[annotation]}
+    origin = typing.get_origin(annotation)
+    if origin is list:
+        (item,) = typing.get_args(annotation)
+        return {"type": "array", "items": json_type(item)}
+    if origin is Literal:
+        values = list(typing.get_args(annotation))
+        return {"type": SIMPLE[type(values[0])], "enum": values}
+    raise TypeError(f"unsupported annotation: {annotation!r}")
+
+def tool_from_function(func):
+    doc = inspect.getdoc(func)
+    if not doc:
+        raise ValueError(f"{func.__name__} has no docstring")
+    kept = []
+    for line in doc.splitlines():
+        if line.strip() in SECTIONS:
+            break
+        kept.append(line)
+    hints = typing.get_type_hints(func)
+    properties, required = {}, []
+    for name, param in inspect.signature(func).parameters.items():
+        if name not in hints:
+            raise TypeError(f"parameter {name!r} has no type hint")
+        properties[name] = json_type(hints[name])
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+    return {
+        "name": func.__name__,
+        "description": "\n".join(kept).strip(),
+        "input_schema": {"type": "object", "properties": properties, "required": required},
+    }</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e5" data-title="Make a tool strict">
+      <div class="exercise-prompt">
+        <p>Write <code>make_strict(tool)</code> that returns a <em>new</em> definition ready for strict mode, without
+          changing the one passed in:</p>
+        <ul>
+          <li>the result has <code>"strict": True</code>;</li>
+          <li>every object schema in it (the top-level <code>input_schema</code>, any property whose type is
+            <code>"object"</code>, and any array <code>items</code> that are objects, at any depth) gets
+            <code>"additionalProperties": False</code>;</li>
+          <li>every object schema has a <code>required</code> list: keep an existing one, or add an empty list.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import copy
+
+def make_strict(tool):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import copy
+import agentlab as al
+
+TOOL = {
+    "name": "create_event",
+    "description": "Create a calendar event with optional attendees.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "when": {"type": "object", "properties": {"date": {"type": "string"}, "hour": {"type": "integer"}},
+                     "required": ["date"]},
+            "attendees": {"type": "array", "items": {"type": "object", "properties": {"email": {"type": "string"}}}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["title", "when"],
+    },
+}
+
+def test_strict_flag():
+    assert make_strict(TOOL).get("strict") is True, "the result should have strict: True"
+
+def test_does_not_mutate():
+    before = copy.deepcopy(TOOL)
+    make_strict(TOOL)
+    assert TOOL == before, "make_strict must not modify the tool passed in (use copy.deepcopy)"
+
+def test_top_level():
+    schema = make_strict(TOOL)["input_schema"]
+    assert schema.get("additionalProperties") is False, "the top-level schema needs additionalProperties: False"
+    assert schema["required"] == ["title", "when"], "keep the existing required list"
+
+def test_nested_object():
+    when = make_strict(TOOL)["input_schema"]["properties"]["when"]
+    assert when.get("additionalProperties") is False, "nested object properties need additionalProperties: False"
+    assert when["required"] == ["date"], "keep a nested object's existing required list"
+
+def test_array_items():
+    props = make_strict(TOOL)["input_schema"]["properties"]
+    item = props["attendees"]["items"]
+    assert item.get("additionalProperties") is False, "object items of an array need additionalProperties: False"
+    assert item.get("required") == [], "add an empty required list where none exists"
+    assert "additionalProperties" not in props["tags"]["items"], "only object schemas get additionalProperties"
+    assert "additionalProperties" not in props["title"], "do not add additionalProperties to non-object schemas"
+
+def test_strict_rejects_extra_keys():
+    schema = make_strict(TOOL)["input_schema"]
+    problems = al.validate({"title": "x", "when": {"date": "2026-11-02"}, "colour": "red"}, schema)
+    assert problems, "with additionalProperties: False an undeclared key should fail validation"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Deep-copy the tool, then write a recursive helper
+        <code>fix(schema)</code>: if <code>schema.get("type") == "object"</code>, set
+        <code>additionalProperties</code>, <code>setdefault("required", [])</code>, and call <code>fix</code> on each
+        value in <code>properties</code>; if it has a dict <code>items</code>, call <code>fix</code> on that.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import copy
+
+def make_strict(tool):
+    result = copy.deepcopy(tool)
+
+    def fix(schema):
+        if schema.get("type") == "object":
+            schema["additionalProperties"] = False
+            schema.setdefault("required", [])
+            for child in schema.get("properties", {}).values():
+                fix(child)
+        if isinstance(schema.get("items"), dict):
+            fix(schema["items"])
+
+    fix(result["input_schema"])
+    result["strict"] = True
+    return result</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m07-e6" data-title="Property descriptions from the Args section">
+      <div class="exercise-prompt">
+        <p>Per-property descriptions help the model fill arguments correctly, and a Google-style docstring already has
+          them. Write <code>parse_args_section(doc)</code> that returns a dict from parameter name to description:</p>
+        <ul>
+          <li>entries start after a line that is exactly <code>Args:</code> (after stripping) and end at the next line
+            that is exactly <code>Returns:</code> or <code>Raises:</code>, or at the end;</li>
+          <li>an entry line looks like <code>name: description</code>, indented under <code>Args:</code>;</li>
+          <li>a line indented <em>more</em> than the entry lines continues the previous description; join it with a
+            single space;</li>
+          <li>blank lines are ignored; a docstring without <code>Args:</code> returns <code>{}</code>.</li>
+        </ul>
+        <p>The tests pass docstrings already cleaned by <code>inspect.getdoc</code> (common indentation removed).</p>
+      </div>
+<textarea class="starter">
+def parse_args_section(doc):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import inspect
+
+def book_room(room: str, hours: int, note: str = "") -> str:
+    """Book a meeting room.
+
+    Args:
+        room: Room name, such as "Aurora".
+        hours: Length of the booking in whole hours.
+            Must be between 1 and 8.
+
+        note: Free text shown on the booking.
+
+    Returns:
+        The booking id.
+    """
+    return "BK-1"
+
+def test_simple_entries():
+    result = parse_args_section(inspect.getdoc(book_room))
+    assert result.get("room") == 'Room name, such as "Aurora".', f"room description wrong: {result.get('room')!r}"
+    assert result.get("note") == "Free text shown on the booking.", f"note description wrong (blank lines should be ignored): {result.get('note')!r}"
+
+def test_continuation():
+    result = parse_args_section(inspect.getdoc(book_room))
+    assert result.get("hours") == "Length of the booking in whole hours. Must be between 1 and 8.", f"continuation lines should be joined with one space, got {result.get('hours')!r}"
+
+def test_stops_at_returns():
+    result = parse_args_section(inspect.getdoc(book_room))
+    assert set(result) == {"room", "hours", "note"}, f"expected exactly room, hours, note; got {sorted(result)}"
+
+def test_no_args():
+    assert parse_args_section("Check the service.\n\nReturns:\n    pong") == {}, "no Args: section means an empty dict"
+
+def test_raises_section():
+    doc = "Divide.\n\nArgs:\n    a: Dividend.\n    b: Divisor.\n\nRaises:\n    ZeroDivisionError: If b is 0."
+    assert parse_args_section(doc) == {"a": "Dividend.", "b": "Divisor."}, "stop at Raises: as well"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Walk the lines with a flag that turns on at <code>Args:</code>
+        and off at <code>Returns:</code>/<code>Raises:</code>. Measure indentation with
+        <code>len(line) - len(line.lstrip())</code>. Remember the indentation of the first entry line; a line indented
+        further continues the last entry, otherwise split it once on <code>": "</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def parse_args_section(doc):
+    result = {}
+    in_args = False
+    entry_indent = None
+    last = None
+    for line in doc.splitlines():
+        stripped = line.strip()
+        if stripped == "Args:":
+            in_args = True
+            continue
+        if stripped in {"Returns:", "Raises:"}:
+            in_args = False
+            continue
+        if not in_args or not stripped:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if entry_indent is None:
+            entry_indent = indent
+        if indent &gt; entry_indent and last is not None:
+            result[last] += " " + stripped
+        else:
+            name, _, description = stripped.partition(":")
+            last = name.strip()
+            result[last] = description.strip()
+    return result</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">toolspec: definitions generated from your functions</span></div>
+      <div class="widget-body">
+        <p>Build a small library that turns plain, documented Python functions into tool definitions, with tests that
+          keep the definitions honest. You will use it in every later Level 1 module: in <a href="m08-one-tool-call.html">M08</a>
+          and <a href="m09-agent-loop.html">M09</a> the same registry dispatches the model's calls.</p>
+        <pre data-label="Terminal"><code class="language-bash">pixi init toolspec &amp;&amp; cd toolspec
+pixi add python=3.14 anthropic structlog pytest
+pixi run pytest tests/
+pixi run python -m toolspec.demo</code></pre>
+        <p>Add <code>agentlab</code> as a path dependency on your clone of this practicum (adjust the path), then run
+          <code>pixi install</code>:</p>
+        <pre data-label="pixi.toml"><code class="language-toml">[pypi-dependencies]
+agentic-systems-practicum = { path = "../agentic-systems-practicum", editable = true }</code></pre>
+        <p><strong>What to build</strong></p>
+        <ul>
+          <li><code>toolspec/schema.py</code>: <code>json_type</code> and <code>tool_from_function(func, *, strict=False)</code>,
+            including property descriptions from the <code>Args:</code> section and a <code>make_strict</code> step when
+            <code>strict=True</code>.</li>
+          <li><code>toolspec/registry.py</code>: a <code>Registry</code> class with a <code>register</code> decorator
+            that stores the function and its generated definition, a <code>definitions()</code> method returning the list
+            to pass as <code>tools=</code>, and a check that rejects duplicate or invalid names at registration time.</li>
+          <li><code>toolspec/tools.py</code>: three example tools (for instance <code>get_weather</code>,
+            <code>search_notes</code>, <code>convert_currency</code>) with Google-style docstrings that say when and when
+            not to use each.</li>
+          <li><code>toolspec/demo.py</code>: sends one request with the registry's definitions using
+            <code>al.get_client()</code> when available, falling back to an <code>al.MockClient</code> script; logs the
+            returned <code>tool_use</code> block (name, id, input) with structlog. Do not execute the call yet.</li>
+        </ul>
+        <p>Why structlog: a log event per tool request (<code>event="tool_requested" tool=... input=...</code>) is what
+          you will search when an agent misbehaves, and it is machine-readable from day one.</p>
+        <ul class="checklist" data-id="m07-mini">
+          <li>Every tool definition is generated from a function; none is written by hand</li>
+          <li>Registering two functions with the same name raises an error before any request is sent</li>
+          <li>Unsupported type hints and missing docstrings raise clear errors at registration time</li>
+          <li>A test validates one known-good input against every generated schema with <code>al.validate</code></li>
+          <li>With <code>strict=True</code>, every object schema has <code>additionalProperties: false</code> and a <code>required</code> list</li>
+          <li>The demo request is accepted by the mock and logs the <code>tool_use</code> block with structlog</li>
+          <li>No API key appears in code or in the repository</li>
+        </ul>
+        <p><strong>Stretch goals</strong></p>
+        <ul>
+          <li>Support <code>X | None = None</code> parameters by treating them as optional <code>X</code>.</li>
+          <li>Map a <code>dataclass</code> parameter to a nested object schema.</li>
+          <li>Add a test that fails if any description is shorter than two sentences.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m07-quiz">
+<script type="application/json">
+{"title": "Tools as Contracts quiz", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "When the model decides to use a tool, what does it actually do?", "options": ["Runs the Python function on Anthropic's servers", "Returns a <code>tool_use</code> block with a name, an id, and input; your code runs the function", "Imports your module and calls the function", "Sends an HTTP request to your function's URL"], "answer": 1, "explanation": "<p>The model never runs your code. It ends its turn with a structured request (<code>stop_reason</code> <code>tool_use</code>); your code decides whether and how to run it and sends the result back (M08).</p>"},
+  {"type": "multi", "prompt": "Which three fields make up a basic tool definition?", "options": ["<code>name</code>", "<code>code</code>", "<code>description</code>", "<code>input_schema</code>", "<code>returns</code>"], "answer": [0, 2, 3], "explanation": "<p>A name, a description, and an input schema. There is no field for code or return type: the description should say what the tool returns.</p>"},
+  {"type": "multi", "prompt": "Which tool names does the API reject?", "options": ["<code>get_weather</code>", "<code>get weather</code>", "<code>weather.get</code>", "<code>get-weather-v2</code>"], "answer": [1, 2], "explanation": "<p>Names must match <code>^[a-zA-Z0-9_-]{1,64}$</code>: letters, digits, underscores, and hyphens only. Spaces and dots are rejected with a 400.</p>"},
+  {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\ntool = {'name': 'lookup', 'description': 'x', 'input_schema': {'type': 'array'}}\ntry:\n    al.MockClient(['ok']).messages.create(model=al.MODEL, max_tokens=50, tools=[tool],\n        messages=[{'role': 'user', 'content': 'hi'}])\n    print('accepted')\nexcept al.BadRequestError:\n    print('rejected')", "answer": "rejected", "explanation": "<p>The top level of <code>input_schema</code> must be <code>{\"type\": \"object\"}</code>. Tool input is always a JSON object of named arguments.</p>"},
+  {"type": "single", "prompt": "A function has <code>limit: int = 5</code>. How should <code>limit</code> appear in the tool's schema?", "options": ["Required, because it has a type hint", "Optional (not in <code>required</code>), with the default mentioned in its description", "Omitted, because the function has a default", "As <code>\"type\": \"default\"</code>"], "answer": 1, "explanation": "<p>Parameters with defaults are optional. The model cannot see Python defaults, so say what the default is in the description.</p>"},
+  {"type": "single", "prompt": "What is the most useful sentence to add to a <code>get_weather</code> description when a <code>get_forecast</code> tool also exists?", "options": ["\"This tool is very accurate.\"", "\"Current conditions only; for tomorrow or later, use get_forecast.\"", "\"Call this tool often.\"", "\"Returns JSON.\""], "answer": 1, "explanation": "<p>Saying when <em>not</em> to use a tool, and naming the alternative, is how you draw the line between overlapping tools.</p>"},
+  {"type": "multi", "prompt": "What does <code>\"strict\": true</code> on a tool require or provide?", "options": ["Every object schema sets <code>additionalProperties: false</code>", "Objects say which properties are <code>required</code>", "Tool input is guaranteed to be valid against the schema", "Tool input is guaranteed to be what the user meant", "The model is forced to call the tool"], "answer": [0, 1, 2], "explanation": "<p>Strict guarantees shape, not meaning: the values are schema-valid, but your tool still checks business rules. It does not force a call.</p>"},
+  {"type": "single", "prompt": "In agentlab, a script gives a strict tool input that violates its schema. What happens?", "options": ["The input comes through and your code must validate it", "<code>BadRequestError</code>", "<code>MockScriptError</code>, because the real API would never produce that input", "The mock silently fixes the input"], "answer": 2, "explanation": "<p>The mock models the strict guarantee: invalid input for a strict tool is a bug in the script, not in your code. With a non-strict tool the bad input comes through.</p>"},
+  {"type": "output", "prompt": "What does this print?", "code": "import typing\nfrom typing import Literal\nprint(typing.get_origin(list[str]) is list, typing.get_args(Literal['a', 'b']))", "answer": "True ('a', 'b')", "explanation": "<p><code>get_origin</code> returns the outer type (<code>list</code>), and <code>get_args</code> returns what is inside, here the Literal's values as a tuple. A schema generator is built from these two calls.</p>"},
+  {"type": "single", "prompt": "Why should a generator look up <code>bool</code> by exact type rather than test <code>issubclass(annotation, int)</code> first?", "options": ["<code>bool</code> is not a type", "<code>bool</code> is a subclass of <code>int</code>, so a flag would be described as an integer", "JSON has no boolean type", "<code>issubclass</code> is slow"], "answer": 1, "explanation": "<p><code>issubclass(bool, int)</code> is <code>True</code> in Python. Exact lookup in a dict maps <code>bool</code> to <code>\"boolean\"</code> correctly.</p>"},
+  {"type": "single", "prompt": "On Claude Opus 5.5, what happens with <code>tool_choice={\"type\": \"tool\", \"name\": \"get_weather\"}</code>?", "options": ["The model must call get_weather", "The request is rejected with a 400 BadRequestError", "It is ignored", "The model may not call get_weather"], "answer": 1, "explanation": "<p>Forcing a call (<code>any</code> or <code>tool</code>) is rejected on Opus 5.5. Use <code>auto</code> (the default) or <code>none</code>, and steer with descriptions and the system prompt.</p>"},
+  {"type": "text", "prompt": "Which <code>tool_choice</code> type keeps the tools in the request but makes the model answer in text?", "answer": ["none"], "explanation": "<p><code>{\"type\": \"none\"}</code>. It is handy for a final summarizing turn when you want to keep the same tool list but no more calls.</p>"},
+  {"type": "single", "prompt": "Your code reads <code>response.content[0].input</code> to get the tool arguments. What can go wrong?", "options": ["Nothing; the tool call is always first", "The first block may be text, so it has no <code>input</code>; select blocks by <code>type == \"tool_use\"</code>", "<code>input</code> is a JSON string that must be parsed first", "The id is missing"], "answer": 1, "explanation": "<p>The model often writes a short text block before the call, and it can make several calls in one turn. Select blocks by type, and check <code>stop_reason</code> first. <code>input</code> is already a parsed dict.</p>"}
+]}
+</script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>To the model, a tool is a name, a description, and an input schema. It asks with a <code>tool_use</code> block; your code runs the function.</li>
+      <li>Names match <code>^[a-zA-Z0-9_-]{1,64}$</code> and are unique; <code>input_schema</code> is an object schema. Violations are 400s you fix.</li>
+      <li>Schemas type every property, close off bad values with <code>enum</code> and bounds, and require exactly what the function needs.</li>
+      <li>Descriptions are prompts: what it does and returns, when to use it, when not to, and its limits.</li>
+      <li><code>"strict": true</code> plus <code>additionalProperties: false</code> and <code>required</code> guarantees schema-valid input; it does not guarantee sensible values.</li>
+      <li>Generate definitions from functions: <code>inspect.signature</code>, <code>typing.get_type_hints</code>, <code>get_origin</code>/<code>get_args</code>, and the docstring.</li>
+      <li><code>tool_choice</code> is <code>auto</code> by default; <code>none</code> disables calls; forcing is rejected on Opus 5.5.</li>
+      <li>Check <code>stop_reason</code>, select blocks by <code>type</code>, keep the <code>id</code>, and validate non-strict input.</li>
+    </ul>
+    <div class="flashcards" data-title="Tools as Contracts">
+      <script type="application/json">
+      [{"front": "What is a tool, from the model's point of view?", "back": "A name, a description, and an input schema. No code."},
+       {"front": "What does the model return when it wants a tool?", "back": "A <code>tool_use</code> block (id, name, input) and <code>stop_reason</code> <code>\"tool_use\"</code>."},
+       {"front": "Tool name rule", "back": "<code>^[a-zA-Z0-9_-]{1,64}$</code>, unique within the request."},
+       {"front": "Top level of <code>input_schema</code>", "back": "Always <code>{\"type\": \"object\", ...}</code>."},
+       {"front": "Four things a tool description should say", "back": "What it does and returns, when to use it, when not to (naming the alternative), and its limits."},
+       {"front": "What does <code>strict: true</code> require?", "back": "<code>additionalProperties: false</code> and a <code>required</code> list on every object schema."},
+       {"front": "What does <code>strict: true</code> guarantee?", "back": "Tool input that is valid against the schema. Shape, not meaning."},
+       {"front": "Which parameters are required in a generated schema?", "back": "Those with no default: <code>param.default is inspect.Parameter.empty</code>."},
+       {"front": "<code>typing.get_origin</code> and <code>get_args</code>", "back": "Outer type (<code>list</code>, <code>Literal</code>) and its contents (<code>(str,)</code>, <code>('a', 'b')</code>)."},
+       {"front": "<code>tool_choice</code> values on Opus 5.5", "back": "<code>auto</code> (default) and <code>none</code> work; <code>any</code> and <code>tool</code> are rejected with a 400."},
+       {"front": "Three habits when reading a tool response", "back": "Check <code>stop_reason</code>, select blocks by <code>type</code>, validate <code>input</code> unless strict."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Claude docs: Tool use overview</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use">Claude docs: How to implement tool use</a></li>
+      <li><a href="https://json-schema.org/understanding-json-schema/">Understanding JSON Schema</a></li>
+      <li><a href="https://docs.python.org/3.14/library/inspect.html#introspecting-callables-with-the-signature-object">Python docs: <code>inspect.signature</code></a> and <a href="https://docs.python.org/3.14/library/typing.html#typing.get_type_hints"><code>typing.get_type_hints</code></a></li>
+      <li><a href="https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings">Google Python Style Guide: docstrings</a></li>
+      <li><a href="../reference/glossary.html">Glossary</a> and <a href="../reference/agentlab.html">agentlab reference</a></li>
+      <li>Next: <a href="m08-one-tool-call.html">M08 One Tool Call by Hand</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,1282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M02 · The Messages API · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m02">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Talking to a Model · Module 02</p>
+    <h1>The Messages API</h1>
+    <p class="lede">Every agent in this course, from a two-line script to a multi-agent system, is built on one
+      endpoint: you send a list of messages, the model sends back one more. This module takes that request and
+      response apart field by field, shows why the API remembers nothing between calls, and ends with a small chat
+      wrapper that owns the conversation history. Every loop you write later builds on that wrapper.</p>
+    <div class="lesson-meta"><span>⏱ ~2 hours</span><span>Prerequisites: <a href="m01-llm-calls.html">M01 What an LLM Call Is</a></span></div>
+    <ul class="objectives">
+      <li>Name the required fields of a Messages API request (<code>model</code>, <code>max_tokens</code>,
+        <code>messages</code>) and the most common optional one, <code>system</code></li>
+      <li>Explain the <code>user</code> and <code>assistant</code> roles, why the first message must be
+        <code>user</code>, and what happens to consecutive messages with the same role</li>
+      <li>Write message content as a plain string or as a list of content blocks, and say when each is used</li>
+      <li>Read a response object: <code>id</code>, <code>content</code> blocks, <code>stop_reason</code>, and
+        <code>usage</code></li>
+      <li>Explain why the API is stateless and keep conversation history in a list you own, appending
+        <code>response.content</code> rather than just the text</li>
+      <li>Recognize the <code>BadRequestError</code>s caused by a malformed history and fix them</li>
+      <li>Build a minimal <code>Conversation</code> wrapper that keeps the history valid even when a call fails</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="request-anatomy">
+    <h2>Anatomy of a request</h2>
+    <p>The <strong>Messages API</strong> is the HTTP endpoint you use to talk to Claude. A <strong>request</strong>
+      is one call to it: you send some JSON, the model generates a reply, and the API sends the reply back as a
+      <strong>response</strong>. The official Python package, <code>anthropic</code>, wraps that HTTP call in a
+      method, <code>client.messages.create(...)</code>, whose keyword arguments are the fields of the request.</p>
+    <p>Three fields are required on every request:</p>
+    <ul>
+      <li><strong><code>model</code></strong>: which model answers, as a model id string. This course uses
+        <code>"claude-opus-5-5"</code>, available in lesson code as <code>al.MODEL</code>. Use the id exactly as
+        written; model ids do not take date suffixes.</li>
+      <li><strong><code>max_tokens</code></strong>: the most tokens the model may <em>generate</em> in this reply.
+        It is a ceiling, not a target. If the model reaches it, the reply is cut off. You met tokens in
+        <a href="m01-llm-calls.html">M01</a>; <a href="m03-limits-stop-reasons.html">M03</a> covers what happens
+        at the limit and how to detect it.</li>
+      <li><strong><code>messages</code></strong>: the conversation so far, as a list of dicts. Each dict has a
+        <code>role</code> (<code>"user"</code> or <code>"assistant"</code>) and some <code>content</code>.</li>
+    </ul>
+    <p>Here is the smallest useful request against the course's mock model. <code>al.MockClient</code> has the
+      same <code>messages.create</code> method as the real client, but answers from a script you give it, so it
+      runs in the browser with no network and no API key. The script below has one step, so the client can answer
+      exactly one request.</p>
+    <div class="runnable" data-title="Your first request">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["The capital of France is Paris."])
+
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=256,
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+)
+
+print(response.content[0].text)
+print("stop_reason:", response.stop_reason)
+print("tokens in/out:", response.usage.input_tokens, response.usage.output_tokens)
+</textarea>
+    </div>
+    <p>The same request against the real API differs in exactly one line: you build the client from the
+      <code>anthropic</code> package instead of the mock. The client reads your key from the
+      <code>ANTHROPIC_API_KEY</code> environment variable; it never appears in code.</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()   # the only change from the mock
+
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+)
+print(response.content[0].text)</code></pre>
+    <p>Under the hood the SDK sends this JSON body in an HTTP <code>POST</code>. Seeing it once makes clear that
+      there is nothing magic in the client: it is a typed wrapper around a JSON document.</p>
+    <pre><code class="language-json">{
+  "model": "claude-opus-5-5",
+  "max_tokens": 256,
+  "messages": [
+    {"role": "user", "content": "What is the capital of France?"}
+  ]
+}</code></pre>
+    <p>Leave out a required field and the call fails before anything is sent. The SDK raises
+      <code>TypeError</code> for a missing keyword argument, and the mock does the same:</p>
+    <div class="runnable" data-title="Forgetting max_tokens">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+try:
+    client.messages.create(
+        model=al.MODEL,
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+except TypeError as e:
+    print("TypeError:", e)
+</textarea>
+    </div>
+    <aside class="callout note"><p>Why must you choose <code>max_tokens</code> yourself? Output tokens cost money
+      and time (<a href="m01-llm-calls.html">M01</a>), and only you know how long a useful answer can be. A
+      classifier that answers one word needs a few tokens; a report generator needs thousands. The current models
+      can produce up to 128K output tokens in one reply, and very large values need streaming
+      (<a href="m04-streaming.html">M04</a>).</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> a request is <code>model</code> +
+      <code>max_tokens</code> + <code>messages</code>, plus optional fields. The SDK method's keyword arguments
+      are the JSON fields. The mock and the real client share the same method, so code written against one runs
+      against the other.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="roles">
+    <h2>Roles and turns</h2>
+    <p>Each message has a <strong>role</strong> saying who produced it. There are two:</p>
+    <ul>
+      <li><strong><code>user</code></strong>: input from your side: what a person typed, a document you want
+        summarized, and later in the course the results of tools your code ran.</li>
+      <li><strong><code>assistant</code></strong>: output from the model: replies it gave on earlier calls.</li>
+    </ul>
+    <p>A <strong>turn</strong> is one message from one role. A conversation is a sequence of turns, normally
+      alternating <code>user</code>, <code>assistant</code>, <code>user</code>, <code>assistant</code>, and always
+      ending with the <code>user</code> turn you want answered. The model reads the whole list and writes the next
+      <code>assistant</code> turn.</p>
+    <pre><code class="language-python">messages = [
+    {"role": "user", "content": "Suggest a name for a black cat."},
+    {"role": "assistant", "content": "How about Ink?"},
+    {"role": "user", "content": "Something longer, please."},   # the turn to answer
+]</code></pre>
+    <p>The API enforces a few rules about this list. Breaking one gets you a <strong>400 Bad Request</strong>
+      error, which the SDK raises as <code>anthropic.BadRequestError</code>. The mock raises
+      <code>al.BadRequestError</code> with the same kind of message, so you can see each rule fail safely.</p>
+    <h3>Rule 1: the first message is a user message</h3>
+    <p>A conversation starts with input. Chat interfaces often show a greeting such as "Hi! How can I help?"
+      before the person types anything. If you store that greeting in your history as the first message, the next
+      request fails:</p>
+    <div class="runnable" data-title="A history that starts with the assistant">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+history = [
+    {"role": "assistant", "content": "Hi! How can I help?"},   # a UI greeting saved as history
+    {"role": "user", "content": "What is a token?"},
+]
+try:
+    client.messages.create(model=al.MODEL, max_tokens=256, messages=history)
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+    print("status code:", e.status_code)
+</textarea>
+    </div>
+    <p>The message names the exact field: <code>messages.0.role</code>, that is, the <code>role</code> of the
+      message at index 0. Error messages from the API use this dotted path style; read them literally. The fix is
+      to keep display-only text, such as a greeting, out of the history you send. If the model should know about
+      the greeting, describe it in the system prompt (next sections).</p>
+    <h3>Rule 2: text content must not be empty</h3>
+    <p>A message with an empty string (or only whitespace) is rejected. This usually happens when a person
+      presses Enter on an empty input box and your code appends it without checking:</p>
+    <div class="runnable" data-title="An empty user message">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+user_input = "   "      # someone pressed space a few times and hit Enter
+try:
+    client.messages.create(
+        model=al.MODEL,
+        max_tokens=256,
+        messages=[{"role": "user", "content": user_input}],
+    )
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+</textarea>
+    </div>
+    <p>Validate input before it reaches the history: <code>if not text.strip(): ...</code>. Rejecting it at the
+      edge of your program gives a friendlier message than a 400 from the API, and it never pollutes the stored
+      conversation.</p>
+    <h3>Rule 3: the last message is the one to answer</h3>
+    <p>On current models, the list must not end with an <code>assistant</code> message. Ending with a partial
+      assistant reply used to be a technique called <em>prefill</em>, and it is now rejected.
+      <a href="m03-limits-stop-reasons.html#no-prefill">M03</a> explains what to use instead. In normal chat code
+      this rule takes care of itself: you always append the new user turn before calling.</p>
+    <h3>Consecutive messages with the same role</h3>
+    <p>Strict alternation is the normal shape, but it is not an error to send two <code>user</code> messages in a
+      row. The API merges consecutive messages with the same role into a single turn. That is convenient (you can
+      add a reminder as a separate message), but it can surprise you when a bug duplicates a message: the model
+      sees one turn containing both texts, and nothing fails.</p>
+    <div class="runnable" data-title="Two user messages in a row are accepted" data-predict>
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Done."])
+client.messages.create(
+    model=al.MODEL,
+    max_tokens=64,
+    messages=[
+        {"role": "user", "content": "Here is my essay: ..."},
+        {"role": "user", "content": "Please proofread it."},
+    ],
+)
+print(len(client.requests), len(client.requests[0].messages))
+</textarea>
+    </div>
+    <p><code>client.requests</code> is a mock-only list of every request the client accepted, in order. Each entry
+      is an <code>al.Request</code> whose <code>.messages</code> holds the history exactly as it was sent. You will
+      use it constantly in exercises to check that your code sent what you meant to send.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> two roles, <code>user</code> and
+      <code>assistant</code>. Start with <code>user</code>, end with the <code>user</code> turn to answer, never
+      send empty text. A <code>BadRequestError</code> (400) means the request itself is wrong: read the field path
+      in the message, fix the code, and do not retry the same request.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="content-blocks">
+    <h2>Content: a string or a list of blocks</h2>
+    <p>So far every <code>content</code> has been a plain string. That is a shorthand. The general form of
+      content is a <strong>list of content blocks</strong>, where each block is a dict with a <code>type</code>
+      field. A text block looks like <code>{"type": "text", "text": "..."}</code>. These two messages mean the same
+      thing to the API:</p>
+    <pre><code class="language-python">{"role": "user", "content": "Summarize this."}
+
+{"role": "user", "content": [{"type": "text", "text": "Summarize this."}]}</code></pre>
+    <p>Why have blocks at all? Because a turn can hold more than one thing, and not everything is text. A user
+      turn can carry several pieces of text (an instruction and a document, kept separate), and other block types
+      carry images and, from <a href="m08-one-tool-call.html">M08</a> on, the results of tools your code ran. An
+      assistant turn can hold text followed by a request to call a tool. The block list is how the API keeps
+      those parts separate and in order.</p>
+    <div class="runnable" data-title="A user turn with two text blocks">
+<textarea>
+import agentlab as al
+
+article = "Pyodide runs CPython in the browser by compiling it to WebAssembly."
+client = al.MockClient(["Pyodide is CPython compiled to WebAssembly."])
+
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=128,
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Summarize the article below in one sentence."},
+            {"type": "text", "text": article},
+        ],
+    }],
+)
+print(response.content[0].text)
+
+sent = client.requests[0].messages[0]
+for block in sent["content"]:
+    print(block["type"], "|", block["text"][:40])
+</textarea>
+    </div>
+    <p>When should you use which form? Use a string when a turn is a single piece of text you wrote: it is shorter
+      and easier to read. Use blocks when a turn has several parts, when a part is not text, or when you are
+      sending back blocks the model produced. That last case matters most, and the section on history returns to
+      it.</p>
+    <aside class="callout warn"><p>Each text block must be non-empty, just like string content. A list that
+      contains <code>{"type": "text", "text": ""}</code> is rejected with a path such as
+      <code>messages.0.content.1</code>, pointing at the block at index 1. An empty list is rejected too.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> string content is shorthand for one text block. Blocks
+      let a turn hold several parts of different types, in order. Every block has a <code>type</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="system-prompt">
+    <h2>The system prompt</h2>
+    <p>A <strong>system prompt</strong> is text that sets the model's role, rules, and context for the whole
+      conversation: "You are a support assistant for Acme's billing product. Answer in two sentences or fewer."
+      It is not a turn in the conversation; it frames all of them. In the Messages API it is a separate top-level
+      field, <code>system</code>, next to <code>messages</code>, not a message with a special role.</p>
+    <div class="runnable" data-title="Sending a system prompt">
+<textarea>
+import agentlab as al
+
+SYSTEM = "You are a terse assistant for a Python course. Answer in one sentence."
+client = al.MockClient(["A list is an ordered, mutable sequence of values."])
+
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=128,
+    system=SYSTEM,
+    messages=[{"role": "user", "content": "What is a list?"}],
+)
+print(response.content[0].text)
+
+request = client.requests[0]
+print("system sent:", request.system)
+print("roles sent:", [m["role"] for m in request.messages])
+</textarea>
+    </div>
+    <p>A common mistake, especially for people who have used other chat APIs, is to put the system prompt in the
+      message list as <code>{"role": "system", ...}</code>. The system prompt belongs in the top-level <code>system</code>
+      field, and a conversation must start with a <code>user</code> turn, so a leading system message fails:</p>
+    <div class="runnable" data-title="A system message inside messages">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+try:
+    client.messages.create(
+        model=al.MODEL,
+        max_tokens=128,
+        messages=[
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "What is a list?"},
+        ],
+    )
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+</textarea>
+    </div>
+    <p>The system prompt can be a string or a list of text blocks, the same two shapes as message content. You send
+      it on <em>every</em> request, because, as the next sections show, the API keeps nothing between calls.
+      What makes a good system prompt is the subject of <a href="m06-prompting.html">M06</a>; here the point is
+      only where it goes.</p>
+    <aside class="callout think"><p>The system prompt is part of the input on every request, so it costs input
+      tokens every time (<a href="m01-llm-calls.html">M01</a>). A 2,000-token system prompt in a 30-turn chat is
+      read 30 times. What does that suggest about how long a system prompt should be?</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> the system prompt goes in the top-level
+      <code>system</code> field, never in <code>messages</code>. Send it with every request.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="response-object">
+    <h2>The response object</h2>
+    <p><code>messages.create</code> returns a <strong>Message</strong> object: the model's new turn plus some
+      metadata. Its fields, all of which you will use in this course:</p>
+    <table>
+      <thead><tr><th>Field</th><th>What it holds</th><th>Why you care</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>A unique id for this response, such as <code>msg_...</code></td><td>Log it; it identifies the call when you debug or report a problem.</td></tr>
+        <tr><td><code>type</code>, <code>role</code></td><td>Always <code>"message"</code> and <code>"assistant"</code></td><td>Confirms this is the model's turn.</td></tr>
+        <tr><td><code>model</code></td><td>The model that answered</td><td>Log it alongside the id.</td></tr>
+        <tr><td><code>content</code></td><td>A list of content blocks, in order</td><td>The answer itself: text blocks, and in Stage 2 tool requests.</td></tr>
+        <tr><td><code>stop_reason</code></td><td>Why generation stopped, such as <code>"end_turn"</code> or <code>"max_tokens"</code></td><td>Tells you whether the answer is complete and what to do next. Check it before reading <code>content</code>.</td></tr>
+        <tr><td><code>stop_sequence</code></td><td>The stop sequence that ended the reply, or <code>None</code></td><td>Covered in <a href="m03-limits-stop-reasons.html">M03</a>.</td></tr>
+        <tr><td><code>usage</code></td><td><code>input_tokens</code>, <code>output_tokens</code> (and cache counters)</td><td>What the call cost, and how full the context is getting.</td></tr>
+      </tbody>
+    </table>
+    <p>The response's content is always a list of blocks, even when the request used a string. That is why the
+      first example read <code>response.content[0].text</code>: the text of the first block.</p>
+    <div class="runnable" data-title="The whole response as JSON">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Tokens are chunks of text, roughly four characters of English each."])
+response = client.messages.create(
+    model=al.MODEL,
+    max_tokens=128,
+    messages=[{"role": "user", "content": "What is a token, in one sentence?"}],
+)
+print(response.to_json())
+</textarea>
+    </div>
+    <h3>Reading the text safely</h3>
+    <p><code>response.content[0].text</code> is fine for a quick experiment, but it makes two assumptions that
+      break in real programs: that there is at least one block, and that the first block is text. A reply can
+      start with a text block and continue with a tool request; a refused request
+      (<a href="m03-limits-stop-reasons.html#refusal">M03</a>) can come back with no blocks at all. The robust
+      way is to look at each block's <code>type</code> and join the text blocks:</p>
+    <pre><code class="language-python">def text_of(response):
+    """Join the text of every text block; return "" if there are none."""
+    return "".join(block.text for block in response.content if block.type == "text")</code></pre>
+    <div class="runnable" data-title="A reply with text and a tool request" data-predict>
+<textarea>
+import agentlab as al
+
+def text_of(response):
+    return "".join(block.text for block in response.content if block.type == "text")
+
+TOOLS = [{"name": "get_time", "description": "Current time in a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+client = al.MockClient([al.tool_call("get_time", {"city": "Oslo"}, text="Let me check.")])
+
+response = client.messages.create(
+    model=al.MODEL, max_tokens=256, tools=TOOLS,
+    messages=[{"role": "user", "content": "What time is it in Oslo?"}],
+)
+print([block.type for block in response.content])
+print(text_of(response))
+print(response.stop_reason)
+</textarea>
+    </div>
+    <p>Do not worry about tools yet; <a href="m07-tools-as-contracts.html">M07</a> and
+      <a href="m08-one-tool-call.html">M08</a> cover them. The point here is the shape: <code>content</code> is a
+      list, blocks have types, and code that assumes "one text block" breaks as soon as anything else appears.</p>
+    <aside class="callout warn" data-title="Mock-only convenience"><p>agentlab's <code>Message</code> has a
+      <code>.text</code> property that joins the text blocks for you. The real SDK's <code>Message</code> does not
+      have it. Use it for quick printing in lesson cells, but write <code>text_of(response)</code> (or the
+      equivalent loop) in code you intend to run against the real API. The exercises check that you do.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> a response is a <code>Message</code> with
+      <code>id</code>, <code>content</code> (a list of typed blocks), <code>stop_reason</code>, and
+      <code>usage</code>. Read text by filtering on <code>block.type == "text"</code>, never by assuming
+      <code>content[0]</code> exists.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="stateless">
+    <h2>The API is stateless</h2>
+    <p>Chat products make it look as if the model remembers you. The API does not. It is
+      <strong>stateless</strong>: each request is processed on its own, using only what that request contains.
+      Nothing from the previous call is kept on the server for the next one. If you want the model to "remember"
+      the earlier conversation, you send the earlier conversation again, every time.</p>
+    <p>The cell below makes that concrete. The mock is given a <strong>responder</strong>, a Python function that
+      receives each request and returns a reply, instead of a fixed script. This responder behaves the way the
+      real model must: it can only know your name if your name appears somewhere in the request it is handed.</p>
+    <div class="runnable" data-title="Two calls, no shared memory">
+<textarea>
+import agentlab as al
+
+def honest_model(request):
+    everything_sent = " ".join(str(m["content"]) for m in request.messages)
+    if "Ada" in everything_sent:
+        return "Your name is Ada."
+    return "I don't know your name. Nothing in this request mentions it."
+
+client = al.MockClient(responder=honest_model)
+
+first = client.messages.create(
+    model=al.MODEL, max_tokens=64,
+    messages=[{"role": "user", "content": "Hi, my name is Ada."}],
+)
+print("call 1:", first.content[0].text)
+
+second = client.messages.create(
+    model=al.MODEL, max_tokens=64,
+    messages=[{"role": "user", "content": "What is my name?"}],
+)
+print("call 2:", second.content[0].text)
+</textarea>
+    </div>
+    <p>The second call fails to recall the name because its <code>messages</code> list contains only "What is my
+      name?". A real model behaves the same way, for the same reason. Statelessness sounds like a limitation, but
+      it is what makes the API simple to reason about and to build on:</p>
+    <ul>
+      <li><strong>You control the context completely.</strong> The model sees exactly the list you send. You can
+        edit it, trim it, summarize old turns, or inject information, and there is no hidden server state to get
+        out of sync.</li>
+      <li><strong>Any request can be replayed.</strong> Save the request and you can resend it to reproduce a
+        problem, or send it to a different model to compare.</li>
+      <li><strong>Agents are just loops over a list.</strong> In <a href="m09-agent-loop.html">M09</a> the agent
+        loop is nothing more than "append to the list, call again" until the model is done.</li>
+    </ul>
+    <p>The cost is that history grows. Every turn you keep is re-sent, and re-billed as input tokens, on every
+      later request. Long conversations get slower and more expensive per turn, and eventually approach the
+      context window (1M tokens on current models). <a href="m11-stop-conditions.html">M11</a> shows how agents
+      budget for this.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> the API remembers nothing. The model's entire world on
+      each call is <code>system</code> + <code>messages</code> (+ tools). Memory is the list you send.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="history">
+    <h2>History is a list you own</h2>
+    <p>Since the API keeps no state, your program does. The pattern is short, and every chat program and every
+      agent in this course uses it:</p>
+    <ol>
+      <li>Append the new <code>user</code> turn to your list.</li>
+      <li>Send the whole list.</li>
+      <li>Append the model's reply as an <code>assistant</code> turn whose content is
+        <code>response.content</code>.</li>
+      <li>Repeat.</li>
+    </ol>
+    <pre class="mermaid">sequenceDiagram
+    participant C as Your code (owns messages)
+    participant A as Messages API
+    Note over C: messages = [user 1]
+    C->>A: create(messages=[user 1])
+    A-->>C: response 1
+    Note over C: append assistant 1, then user 2
+    C->>A: create(messages=[user 1, assistant 1, user 2])
+    A-->>C: response 2
+    Note over C: append assistant 2, then user 3
+    C->>A: create(messages=[user 1, assistant 1, user 2, assistant 2, user 3])
+    A-->>C: response 3</pre>
+    <p>Each request is longer than the last, and every request is complete on its own. Here is the pattern with
+      the honest responder from the previous section. This time the name is remembered, because it is in the list.</p>
+    <div class="runnable" data-title="A three-turn conversation">
+<textarea>
+import agentlab as al
+
+def honest_model(request):
+    everything_sent = " ".join(str(m["content"]) for m in request.messages)
+    if "What is my name" in request.last_user_text:
+        return "Your name is Ada." if "Ada" in everything_sent else "I don't know your name."
+    return "Nice to meet you!" if request.turn == 0 else "Happy to help."
+
+client = al.MockClient(responder=honest_model)
+messages = []
+
+for text in ["Hi, my name is Ada.", "Can you help me learn Python?", "What is my name?"]:
+    messages.append({"role": "user", "content": text})
+    response = client.messages.create(model=al.MODEL, max_tokens=64, messages=messages)
+    messages.append({"role": "assistant", "content": response.content})
+    print(f"turn {len(messages) // 2}: sent {len(client.requests[-1].messages)} messages,"
+          f" input tokens {response.usage.input_tokens}")
+
+print()
+print(al.format_transcript(messages))
+</textarea>
+    </div>
+    <p><code>al.format_transcript(messages)</code> prints one line per block, which is the quickest way to see what
+      a conversation actually contains. Use it whenever a multi-turn program does something you did not expect.
+      Notice also that <code>input_tokens</code> grows every turn: that is the whole history being re-read.</p>
+    <p>Two properties of <code>al.Request</code> appeared in the responder: <code>request.last_user_text</code>
+      (the text of the most recent user turn) and <code>request.turn</code> (how many assistant turns the history
+      already holds). They are mock-only helpers for writing responders and tests; the
+      <a href="../reference/agentlab.html">agentlab reference</a> lists them all.</p>
+    <h3>Append <code>response.content</code>, not the text</h3>
+    <p>Step 3 is where most bugs live. It is tempting to store only the reply's text:</p>
+    <pre><code class="language-python">messages.append({"role": "assistant", "content": text_of(response)})   # loses information</code></pre>
+    <p>For a plain chat that happens to work, which is why the habit forms. But it throws away every non-text
+      block. In Stage 2 the model's reply will contain <code>tool_use</code> blocks, and the API requires each one
+      to appear in the history so that your <code>tool_result</code> can answer it. Drop them and the next request
+      is rejected. Appending <code>response.content</code> keeps every block, exactly as the model produced it.
+      The SDK accepts its own block objects back in <code>messages</code>, so there is nothing to convert.</p>
+    <div class="runnable" data-title="Why the blocks matter">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_time", "description": "Current time in a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]
+client = al.MockClient([al.tool_call("get_time", {"city": "Oslo"}, text="Let me check.", id="toolu_1")])
+messages = [{"role": "user", "content": "What time is it in Oslo?"}]
+response = client.messages.create(model=al.MODEL, max_tokens=256, tools=TOOLS, messages=messages)
+
+text_only = {"role": "assistant", "content": "".join(b.text for b in response.content if b.type == "text")}
+full = {"role": "assistant", "content": response.content}
+
+print("text only:", al.format_transcript([text_only]))
+print("full:")
+print(al.format_transcript([full]))
+</textarea>
+    </div>
+    <p>The text-only version has silently lost the tool request. You will see exactly which error that causes
+      in <a href="m08-one-tool-call.html">M08</a>.</p>
+    <aside class="callout warn" data-title="Two more history mistakes"><p><strong>Appending the response object
+      itself</strong> (<code>messages.append(response)</code>) is wrong: a history entry is a dict with
+      <code>role</code> and <code>content</code>. <strong>Forgetting to append the reply at all</strong> makes the
+      next request contain two user turns in a row. As you saw, that is merged rather than rejected, so nothing
+      fails; the model simply never sees its own earlier answer, and the conversation feels forgetful.
+      <code>al.format_transcript</code> makes both mistakes obvious.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> append user turn, send the full list, append
+      <code>{"role": "assistant", "content": response.content}</code>. The list is your program's memory; keep it
+      valid and complete.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="chat-wrapper">
+    <h2>A minimal chat wrapper</h2>
+    <p>Every program that talks to the model more than once ends up repeating the same few lines: append, call,
+      append, extract text. Wrapping them in a small class keeps the rules in one place. A good wrapper has one
+      more responsibility that is easy to miss: <strong>the history must stay valid no matter what
+      happens</strong>. If the API call fails after you appended the user turn, that turn is now in the list with
+      no reply. The next <code>send</code> would add a second user turn, and the model would see both questions
+      merged into one. The fix is to roll back: remove the user turn if the call does not succeed.</p>
+    <div class="runnable" data-title="Conversation: a chat wrapper that owns its history">
+<textarea>
+import agentlab as al
+
+
+class Conversation:
+    """A multi-turn chat that owns its history and keeps it valid."""
+
+    def __init__(self, client, *, system=None, max_tokens=1024, model=al.MODEL):
+        self.client = client
+        self.system = system
+        self.max_tokens = max_tokens
+        self.model = model
+        self.messages = []
+
+    def send(self, text):
+        """Send one user turn and return the model's reply text."""
+        if not text.strip():
+            raise ValueError("message is empty")
+        self.messages.append({"role": "user", "content": text})
+        kwargs = {"model": self.model, "max_tokens": self.max_tokens, "messages": self.messages}
+        if self.system is not None:
+            kwargs["system"] = self.system
+        try:
+            response = self.client.messages.create(**kwargs)
+        except Exception:
+            self.messages.pop()          # roll back so the history stays valid, then re-raise
+            raise
+        if response.stop_reason != "end_turn":
+            self.messages.pop()          # M03 handles the other stop reasons properly
+            raise RuntimeError(f"unhandled stop_reason: {response.stop_reason}")
+        self.messages.append({"role": "assistant", "content": response.content})
+        return "".join(block.text for block in response.content if block.type == "text")
+
+
+client = al.MockClient([
+    "Hello, Ada.",
+    al.fail(al.RateLimitError()),        # the second request fails
+    "A dict maps keys to values.",
+])
+chat = Conversation(client, system="You are a friendly Python tutor.")
+
+print(chat.send("Hi, I'm Ada."))
+try:
+    chat.send("What is a dict?")
+except al.RateLimitError as e:
+    print("call failed:", type(e).__name__, "| history length:", len(chat.messages))
+print(chat.send("What is a dict?"))     # retry
+print()
+print(al.format_transcript(chat.messages))
+</textarea>
+    </div>
+    <p>Walk through what the wrapper guarantees:</p>
+    <ul>
+      <li><strong>Empty input never reaches the API.</strong> It raises <code>ValueError</code> at the edge, before
+        the history is touched.</li>
+      <li><strong>A failed call leaves no trace.</strong> <code>al.fail(al.RateLimitError())</code> is a script step
+        that makes that request raise the same error a real 429 would. The wrapper pops the user turn and
+        re-raises, so the caller decides what to do (here: retry). The history after the failure is exactly what it
+        was before. <a href="m10-errors-as-data.html">M10</a> covers which errors deserve a retry.</li>
+      <li><strong>Anything other than a complete answer is refused for now.</strong> A reply cut off at
+        <code>max_tokens</code>, a refusal, or a tool request each need their own handling, which is
+        <a href="m03-limits-stop-reasons.html">M03</a>'s subject. Raising is better than silently storing a
+        half-answer.</li>
+      <li><strong>The assistant turn keeps every block</strong>, and the system prompt is sent on every call.</li>
+    </ul>
+    <aside class="callout note"><p>The <code>except Exception: ...; raise</code> pattern catches everything only to
+      undo a change, then re-raises the same exception. It does not swallow errors. That is different from
+      <code>except Exception: pass</code>, which hides failures and is never acceptable.</p></aside>
+    <aside class="callout pro"><p>Notice that the wrapper takes the client as a parameter instead of creating one.
+      This is <strong>dependency injection</strong>: tests hand it a <code>MockClient</code>, production hands it
+      <code>anthropic.Anthropic()</code>, and the class never knows the difference. Every exercise in this course
+      relies on it, and so will your own test suites.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> a chat wrapper owns the list, validates input, sends
+      the system prompt every time, appends <code>response.content</code>, and rolls back the user turn when a
+      call fails.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="bad-requests">
+    <h2>Reading request errors</h2>
+    <p>You have now seen most of the ways a request can be malformed. They share one property: the request is
+      wrong, so sending it again will fail again. Fix the code (or the data) instead of retrying. Here they are in
+      one place, each with the exception your code receives:</p>
+    <table>
+      <thead><tr><th>Mistake</th><th>Exception</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Missing <code>model</code> or <code>max_tokens</code></td><td><code>TypeError</code> (raised before sending)</td><td>Pass both on every call.</td></tr>
+        <tr><td>First message is not <code>user</code></td><td><code>BadRequestError</code> (400)</td><td>Keep greetings and other display text out of the history.</td></tr>
+        <tr><td>Empty or whitespace-only text</td><td><code>BadRequestError</code> (400)</td><td>Validate input before appending it.</td></tr>
+        <tr><td><code>{"role": "system"}</code> as the first message</td><td><code>BadRequestError</code> (400)</td><td>Use the top-level <code>system</code> field.</td></tr>
+        <tr><td>History ends with an <code>assistant</code> turn</td><td><code>BadRequestError</code> (400)</td><td>Append the user turn before calling; see <a href="m03-limits-stop-reasons.html#no-prefill">M03</a>.</td></tr>
+        <tr><td>Unknown model id</td><td><code>NotFoundError</code> (404)</td><td>Use an exact id such as <code>claude-opus-5-5</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>The cell below runs a list of broken requests through the mock and prints each error. Before you run it,
+      try to predict which row of the table each one hits.</p>
+    <div class="runnable" data-title="A gallery of rejected requests">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["unused"])
+broken = {
+    "greeting first": [{"role": "assistant", "content": "Hi!"}, {"role": "user", "content": "Hello"}],
+    "empty block": [{"role": "user", "content": [{"type": "text", "text": "Read this:"}, {"type": "text", "text": ""}]}],
+    "ends with assistant": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
+    "no messages": [],
+}
+for label, messages in broken.items():
+    try:
+        client.messages.create(model=al.MODEL, max_tokens=64, messages=messages)
+    except al.BadRequestError as e:
+        print(f"{label:20} -> {e}")
+
+try:
+    client.messages.create(model="gpt-ish", max_tokens=64, messages=[{"role": "user", "content": "Hi"}])
+except al.NotFoundError as e:
+    print(f"{'bad model id':20} -> NotFoundError {e.status_code}: {e}")
+
+print("script steps still unused:", client.remaining)
+</textarea>
+    </div>
+    <p>The last line shows something useful about the mock: a request that fails validation never consumes a
+      script step, just as a real 400 never reaches the model. The API checks the request before any generation
+      happens.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>TypeError</code>, 400 and 404 mean "fix the
+      request". Read the dotted field path in the message; it points at the exact problem.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser and are graded instantly. Each test builds its own <code>al.MockClient</code>,
+      calls your function with it, and then inspects <code>client.requests</code> to check what you actually sent.
+      Start with the first and work down.</p>
+
+    <div class="exercise" data-id="m02-e1" data-title="Your first request">
+      <div class="exercise-prompt">
+        <p>Write <code>ask(client, question)</code> that sends <code>question</code> as a single user message using
+          <code>model=al.MODEL</code> and <code>max_tokens=512</code>, and returns the response object (not the
+          text).</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def ask(client, question):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_returns_response():
+    client = al.MockClient(["Paris."])
+    response = ask(client, "Capital of France?")
+    assert response is not None, "ask should return the response object"
+    assert hasattr(response, "content"), "return the response object from messages.create, not the text"
+    assert response.content[0].text == "Paris.", "the response should be the one the client returned"
+
+def test_request_fields():
+    client = al.MockClient(["ok"])
+    ask(client, "Hello there")
+    assert len(client.requests) == 1, "make exactly one request"
+    request = client.requests[0]
+    assert request.model == al.MODEL, f"use model=al.MODEL, got {request.model!r}"
+    assert request.max_tokens == 512, f"use max_tokens=512, got {request.max_tokens}"
+
+def test_messages_shape():
+    client = al.MockClient(["ok"])
+    ask(client, "Hello there")
+    sent = client.requests[0].messages
+    assert len(sent) == 1, f"send exactly one message, got {len(sent)}"
+    assert sent[0]["role"] == "user", "the message must use the 'user' role"
+    content = sent[0]["content"]
+    text = content if isinstance(content, str) else "".join(b.get("text", "") for b in content)
+    assert text == "Hello there", f"the message content should be the question, got {text!r}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Call <code>client.messages.create(model=..., max_tokens=...,
+        messages=[{"role": "user", "content": question}])</code> and return what it gives you.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def ask(client, question):
+    return client.messages.create(
+        model=al.MODEL,
+        max_tokens=512,
+        messages=[{"role": "user", "content": question}],
+    )</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e2" data-title="Text from any response">
+      <div class="exercise-prompt">
+        <p>Write <code>text_of(response)</code> that returns the text of every text block in
+          <code>response.content</code>, joined with no separator, or <code>""</code> when there are none. It must
+          work on responses that contain non-text blocks (such as <code>tool_use</code>) and on responses with an
+          empty <code>content</code> list. Do not use the mock-only <code>response.text</code>: the tests pass an
+          object that does not have it, just like a real SDK response.</p>
+      </div>
+<textarea class="starter">
+def text_of(response):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+from types import SimpleNamespace
+import agentlab as al
+
+def fake(blocks):
+    return SimpleNamespace(content=blocks)
+
+def test_single_text_block():
+    assert text_of(fake([al.TextBlock("hello")])) == "hello", "one text block should return its text"
+
+def test_joins_text_blocks():
+    blocks = [al.TextBlock("Hello, "), al.TextBlock("world.")]
+    assert text_of(fake(blocks)) == "Hello, world.", "join text blocks with no separator"
+
+def test_skips_tool_use():
+    blocks = [al.TextBlock("Checking. "), al.ToolUseBlock(id="toolu_1", name="get_time", input={})]
+    assert text_of(fake(blocks)) == "Checking. ", "skip blocks whose type is not 'text'"
+
+def test_tool_use_only():
+    blocks = [al.ToolUseBlock(id="toolu_1", name="get_time", input={})]
+    assert text_of(fake(blocks)) == "", "a response with no text blocks should give ''"
+
+def test_empty_content():
+    assert text_of(fake([])) == "", "an empty content list (for example, a refusal) should give ''"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Loop over <code>response.content</code>, keep blocks where
+        <code>block.type == "text"</code>, and <code>"".join(...)</code> their <code>.text</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def text_of(response):
+    return "".join(block.text for block in response.content if block.type == "text")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e3" data-title="Put the system prompt in the right place">
+      <div class="exercise-prompt">
+        <p>This function sends its instructions as a <code>system</code>-role message, which the API rejects.
+          Fix <code>ask_as(client, system, question)</code> so it sends <code>system</code> in the top-level
+          <code>system</code> field and the question as the only message, then returns the reply text (joined text
+          blocks). Keep <code>model=al.MODEL</code> and <code>max_tokens=256</code>.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def ask_as(client, system, question):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=256,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": question},
+        ],
+    )
+    return response.content[0].text
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_system_field():
+    client = al.MockClient(["Ahoy."])
+    ask_as(client, "Talk like a pirate.", "Say hello.")
+    assert client.requests, "the request was rejected or never sent; move the system prompt out of messages"
+    assert client.requests[0].system == "Talk like a pirate.", "send the system prompt in the top-level system field"
+
+def test_only_user_message():
+    client = al.MockClient(["Ahoy."])
+    ask_as(client, "Talk like a pirate.", "Say hello.")
+    roles = [m["role"] for m in client.requests[0].messages]
+    assert roles == ["user"], f"messages should contain only the user question, got roles {roles}"
+
+def test_returns_text():
+    client = al.MockClient(["Ahoy, matey."])
+    assert ask_as(client, "Talk like a pirate.", "Say hello.") == "Ahoy, matey.", "return the reply text"
+
+def test_handles_no_text_blocks():
+    client = al.MockClient([al.refusal()])
+    assert ask_as(client, "Be helpful.", "Hi") == "", "join text blocks so an empty content list returns '' instead of raising IndexError"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Add <code>system=system</code> to the
+        <code>create</code> call, delete the system-role dict, and replace <code>content[0].text</code> with a join
+        over text blocks (exercise 2).</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def ask_as(client, system, question):
+    response = client.messages.create(
+        model=al.MODEL,
+        max_tokens=256,
+        system=system,
+        messages=[{"role": "user", "content": question}],
+    )
+    return "".join(block.text for block in response.content if block.type == "text")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e4" data-title="A multi-turn conversation">
+      <div class="exercise-prompt">
+        <p>Write <code>run_chat(client, turns)</code>. <code>turns</code> is a list of user strings. Send them one at
+          a time as a single growing conversation: append each user turn, call
+          <code>messages.create</code> with the full history (<code>model=al.MODEL</code>,
+          <code>max_tokens=256</code>), then append the reply as
+          <code>{"role": "assistant", "content": response.content}</code>. Return the final history list. The tests
+          check every request you made, so the history must be complete and in order on each call.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def run_chat(client, turns):
+    messages = []
+    ...
+    return messages
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+TURNS = ["Hi, I'm Ada.", "What is a list?", "What is my name?"]
+
+def test_one_request_per_turn():
+    client = al.MockClient(["Hello Ada.", "An ordered collection.", "Ada."])
+    run_chat(client, TURNS)
+    assert len(client.requests) == 3, f"make one request per user turn; made {len(client.requests)}"
+
+def test_history_grows():
+    client = al.MockClient(["Hello Ada.", "An ordered collection.", "Ada."])
+    run_chat(client, TURNS)
+    sizes = [len(r.messages) for r in client.requests]
+    assert sizes == [1, 3, 5], f"each request should resend the whole history: expected sizes [1, 3, 5], got {sizes}"
+
+def test_roles_alternate():
+    client = al.MockClient(["Hello Ada.", "An ordered collection.", "Ada."])
+    run_chat(client, TURNS)
+    roles = [m["role"] for m in client.requests[2].messages]
+    assert roles == ["user", "assistant", "user", "assistant", "user"], f"roles should alternate, got {roles}"
+
+def test_assistant_content_is_blocks():
+    client = al.MockClient(["Hello Ada.", "An ordered collection.", "Ada."])
+    run_chat(client, TURNS)
+    assistant = client.requests[1].messages[1]
+    assert isinstance(assistant["content"], list), "append response.content (the blocks), not the reply text"
+    assert assistant["content"][0] == {"type": "text", "text": "Hello Ada."}, "the assistant turn should hold the model's reply blocks"
+
+def test_user_turns_in_order():
+    client = al.MockClient(["Hello Ada.", "An ordered collection.", "Ada."])
+    run_chat(client, TURNS)
+    assert client.requests[2].last_user_text == "What is my name?", "the last request should end with the third user turn"
+    assert client.requests[2].messages[0]["content"] == "Hi, I'm Ada.", "the first user turn should still be at the start of the history"
+
+def test_returns_final_history():
+    client = al.MockClient(["Hello Ada.", "An ordered collection.", "Ada."])
+    history = run_chat(client, TURNS)
+    assert isinstance(history, list) and len(history) == 6, "return the full history: 3 user turns and 3 assistant turns"
+    assert history[-1]["role"] == "assistant", "the returned history should end with the last reply"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Inside a <code>for text in turns:</code> loop: append the user
+        dict, call <code>create(..., messages=messages)</code>, append the assistant dict. The same list object is
+        passed every time and grows by two each iteration.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def run_chat(client, turns):
+    messages = []
+    for text in turns:
+        messages.append({"role": "user", "content": text})
+        response = client.messages.create(model=al.MODEL, max_tokens=256, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+    return messages</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e5" data-title="Repair a saved history">
+      <div class="exercise-prompt">
+        <p>A chat app saved conversations straight from its UI. Some saved histories start with the app's greeting
+          (an <code>assistant</code> message) and some contain empty messages where someone pressed Enter. Both make
+          the API return <code>BadRequestError</code>.</p>
+        <p>Write <code>clean_history(saved)</code> that returns a <em>new</em> list (do not modify
+          <code>saved</code>) with every message whose content is a string that is empty or only whitespace removed,
+          and then every leading <code>assistant</code> message removed, so the result starts with a user turn. Keep
+          all other messages, in order. Then write <code>resume(client, saved, text)</code> that cleans the history,
+          appends <code>text</code> as a user turn, sends it (<code>model=al.MODEL</code>,
+          <code>max_tokens=256</code>), and returns the reply text.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def clean_history(saved):
+    ...
+
+def resume(client, saved, text):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+SAVED = [
+    {"role": "assistant", "content": "Hi! How can I help?"},
+    {"role": "user", "content": "What is pixi?"},
+    {"role": "assistant", "content": "A package manager."},
+    {"role": "user", "content": "   "},
+    {"role": "assistant", "content": "Anything else?"},
+]
+
+def test_drops_leading_assistant():
+    cleaned = clean_history(SAVED)
+    assert cleaned, "clean_history returned an empty or None result"
+    assert cleaned[0] == {"role": "user", "content": "What is pixi?"}, "the cleaned history should start with the first user turn"
+
+def test_drops_empty_messages():
+    cleaned = clean_history(SAVED)
+    assert all(m["content"].strip() for m in cleaned), "remove messages whose content is empty or whitespace"
+    assert len(cleaned) == 3, f"expected 3 messages to remain, got {len(cleaned)}"
+
+def test_empty_before_greeting():
+    saved = [{"role": "user", "content": ""}, {"role": "assistant", "content": "Hi!"}, {"role": "user", "content": "Hello"}]
+    cleaned = clean_history(saved)
+    assert cleaned == [{"role": "user", "content": "Hello"}], "drop empty messages first, then leading assistant turns"
+
+def test_does_not_mutate():
+    saved = [dict(m) for m in SAVED]
+    clean_history(saved)
+    assert saved == SAVED, "clean_history must return a new list and leave the input unchanged"
+
+def test_resume_sends_valid_history():
+    client = al.MockClient(["Yes: pixi add anthropic."])
+    reply = resume(client, SAVED, "Can it install anthropic?")
+    assert client.requests, "the request was rejected; check the cleaned history"
+    sent = client.requests[0].messages
+    assert sent[0]["role"] == "user", "the sent history must start with a user turn"
+    assert sent[-1] == {"role": "user", "content": "Can it install anthropic?"}, "append the new text as the final user turn"
+    assert len(sent) == 4, f"expected 3 cleaned messages plus the new one, got {len(sent)}"
+    assert reply == "Yes: pixi add anthropic.", "resume should return the reply text"
+
+def test_resume_does_not_mutate():
+    saved = [dict(m) for m in SAVED]
+    resume(al.MockClient(["ok"]), saved, "Hi")
+    assert saved == SAVED, "resume must not change the saved history"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Build the list with a comprehension that keeps a message
+        unless its content is a string whose <code>.strip()</code> is empty. Then drop items from the front while
+        the first one has role <code>"assistant"</code>. In <code>resume</code>, the cleaned list is already a new
+        list, so appending to it does not touch <code>saved</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def clean_history(saved):
+    kept = [m for m in saved if not (isinstance(m["content"], str) and not m["content"].strip())]
+    while kept and kept[0]["role"] == "assistant":
+        kept.pop(0)
+    return kept
+
+def resume(client, saved, text):
+    messages = clean_history(saved)
+    messages.append({"role": "user", "content": text})
+    response = client.messages.create(model=al.MODEL, max_tokens=256, messages=messages)
+    return "".join(block.text for block in response.content if block.type == "text")</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m02-e6" data-title="A Conversation class that stays valid">
+      <div class="exercise-prompt">
+        <p>Write a class <code>Conversation</code> with:</p>
+        <ul>
+          <li><code>__init__(self, client, system=None, max_tokens=1024)</code>, storing an empty
+            <code>self.messages</code> list.</li>
+          <li><code>send(self, text)</code>: raise <code>ValueError</code> without calling the API if
+            <code>text</code> is empty or whitespace. Otherwise append the user turn, call
+            <code>messages.create</code> with <code>model=al.MODEL</code>, the stored <code>max_tokens</code>, the
+            full history, and <code>system</code> only when it is not <code>None</code>. On success, append
+            <code>{"role": "assistant", "content": response.content}</code> and return the joined reply text. If
+            the call raises, remove the user turn and re-raise the same exception.</li>
+          <li><code>reset(self)</code>: clear the history.</li>
+        </ul>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+class Conversation:
+    def __init__(self, client, system=None, max_tokens=1024):
+        ...
+
+    def send(self, text):
+        ...
+
+    def reset(self):
+        ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_two_turns():
+    client = al.MockClient(["Hello.", "Fine, thanks."])
+    chat = Conversation(client)
+    assert chat.send("Hi") == "Hello.", "send should return the reply text"
+    assert chat.send("How are you?") == "Fine, thanks.", "second send should return the second reply"
+    assert len(client.requests[1].messages) == 3, "the second request should carry the full history (3 messages)"
+    assert len(chat.messages) == 4, "after two turns the history holds 4 messages"
+
+def test_system_and_max_tokens():
+    client = al.MockClient(["ok", "ok"])
+    Conversation(client, system="Be brief.", max_tokens=99).send("Hi")
+    assert client.requests[0].system == "Be brief.", "send the system prompt in the system field"
+    assert client.requests[0].max_tokens == 99, "use the max_tokens given to __init__"
+    Conversation(client).send("Hi")
+    assert client.requests[1].system is None, "omit system when it is None"
+
+def test_assistant_blocks():
+    client = al.MockClient(["Hello."])
+    chat = Conversation(client)
+    chat.send("Hi")
+    assert chat.messages[1]["role"] == "assistant", "append the reply as an assistant turn"
+    assert isinstance(chat.messages[1]["content"], list), "store response.content (blocks), not the text"
+
+def test_rollback_on_failure():
+    client = al.MockClient(["Hello.", al.fail(al.RateLimitError()), "Recovered."])
+    chat = Conversation(client)
+    chat.send("Hi")
+    try:
+        chat.send("Second question")
+    except al.RateLimitError:
+        pass
+    else:
+        assert False, "send should re-raise the exception from messages.create"
+    assert len(chat.messages) == 2, f"a failed call must leave the history unchanged (2 messages), found {len(chat.messages)}"
+    assert chat.send("Second question") == "Recovered.", "the conversation should work again after a failure"
+    roles = [m["role"] for m in client.requests[-1].messages]
+    assert roles == ["user", "assistant", "user"], f"no duplicate user turn after a retry; roles were {roles}"
+
+def test_empty_input():
+    client = al.MockClient(["Hello."])
+    chat = Conversation(client)
+    try:
+        chat.send("   ")
+    except ValueError:
+        pass
+    else:
+        assert False, "send('   ') should raise ValueError"
+    assert chat.messages == [] and client.requests == [], "empty input must not touch the history or call the API"
+
+def test_reset():
+    client = al.MockClient(["Hello.", "Hi again."])
+    chat = Conversation(client)
+    chat.send("Hi")
+    chat.reset()
+    assert chat.messages == [], "reset should clear the history"
+    chat.send("Hello")
+    assert len(client.requests[1].messages) == 1, "after reset the next request starts a fresh history"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Build the keyword arguments in a dict and add
+        <code>"system"</code> only when it is set. Wrap the <code>create</code> call in
+        <code>try</code>/<code>except Exception:</code>, and in the handler call <code>self.messages.pop()</code>
+        and then a bare <code>raise</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+class Conversation:
+    def __init__(self, client, system=None, max_tokens=1024):
+        self.client = client
+        self.system = system
+        self.max_tokens = max_tokens
+        self.messages = []
+
+    def send(self, text):
+        if not text.strip():
+            raise ValueError("message is empty")
+        self.messages.append({"role": "user", "content": text})
+        kwargs = {"model": al.MODEL, "max_tokens": self.max_tokens, "messages": self.messages}
+        if self.system is not None:
+            kwargs["system"] = self.system
+        try:
+            response = self.client.messages.create(**kwargs)
+        except Exception:
+            self.messages.pop()
+            raise
+        self.messages.append({"role": "assistant", "content": response.content})
+        return "".join(block.text for block in response.content if block.type == "text")
+
+    def reset(self):
+        self.messages = []</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project: a terminal chat</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">chat.py: a terminal chat with saved history</span></div>
+      <div class="widget-body">
+        <p>Build a small command-line chat on top of your <code>Conversation</code> class. It talks to the real
+          API when the <code>anthropic</code> package and a key are available, and falls back to a mock otherwise,
+          so you can build and test it without spending anything.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir terminal-chat &amp;&amp; cd terminal-chat
+pixi init
+pixi add python=3.14 anthropic structlog
+# copy agentlab into the project, or work inside the practicum repository where it is installed
+# write chat.py, then:
+pixi run python chat.py</code></pre>
+        <p>Choose the client like this. <code>al.get_client()</code> returns a real
+          <code>anthropic.Anthropic()</code> when the package is installed; the key comes from the
+          <code>ANTHROPIC_API_KEY</code> environment variable, never from your code.</p>
+        <pre><code class="language-python">import os
+import agentlab as al
+
+def make_client():
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return al.get_client()
+    return al.MockClient(responder=lambda request: f"(mock) You said: {request.last_user_text}")</code></pre>
+        <p><strong>Spec</strong></p>
+        <ul>
+          <li>A loop reads a line with <code>input("you&gt; ")</code>, sends it, and prints the reply. Empty lines
+            are ignored without calling the API.</li>
+          <li>Commands: <code>/reset</code> clears the history, <code>/history</code> prints
+            <code>al.format_transcript(chat.messages)</code>, <code>/save FILE</code> writes the history as JSON,
+            <code>/load FILE</code> reads it back, <code>/quit</code> exits.</li>
+          <li>A <code>--system</code> command-line option (use <code>argparse</code>) sets the system prompt.</li>
+          <li>Saving converts each content block to a plain dict with <code>al.as_dict(block)</code>, since SDK
+            block objects are not JSON-serializable. Loading validates the file: the first message is
+            <code>user</code>, roles are only <code>user</code>/<code>assistant</code>, and no text is empty.</li>
+          <li>After each reply, log one structured event with structlog: the response <code>id</code>,
+            <code>stop_reason</code>, <code>input_tokens</code>, and <code>output_tokens</code>. Structured logs
+            (key=value or JSON) can be searched and summed later; plain prints cannot. Keep <code>print</code> for
+            the chat text the person reads.</li>
+          <li>API errors print a short message and leave the history unchanged (your rollback does this).</li>
+        </ul>
+        <ul class="checklist" data-id="m02-mini">
+          <li>The program runs against the mock with no API key set</li>
+          <li>With a key set, it holds a real multi-turn conversation that remembers earlier turns</li>
+          <li>Every request sends <code>model</code>, <code>max_tokens</code>, the full history, and the system prompt when given</li>
+          <li>Assistant turns are stored as <code>response.content</code>, never as plain text</li>
+          <li>Empty input never reaches the API</li>
+          <li><code>/save</code> then <code>/load</code> restores a conversation that can be continued without a <code>BadRequestError</code></li>
+          <li>Loading a file whose first message is an assistant greeting is rejected with a clear message</li>
+          <li>Each reply logs id, stop_reason, and token counts as one structlog event</li>
+          <li>No API key appears anywhere in the code or the saved files</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> print the running total of input and output tokens and an estimated cost
+          using the prices from <a href="m01-llm-calls.html">M01</a>; add <code>/undo</code>, which removes the last
+          user and assistant pair; write three pytest tests for <code>Conversation</code> using
+          <code>MockClient</code> and run them with <code>pixi run pytest</code> after adding it with
+          <code>pixi add pytest</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m02-quiz">
+      <script type="application/json">
+      {"title": "The Messages API quiz", "passScore": 0.7, "questions": [
+        {"type": "multi", "prompt": "Which arguments are required on every <code>messages.create</code> call?", "options": ["<code>model</code>", "<code>max_tokens</code>", "<code>messages</code>", "<code>system</code>", "<code>stop_sequences</code>"], "answer": [0, 1, 2],
+         "explanation": "<p><code>model</code>, <code>max_tokens</code> and <code>messages</code> are required. <code>system</code> and <code>stop_sequences</code> are optional fields you add when you need them.</p>"},
+        {"type": "single", "prompt": "Where does the system prompt go?", "options": ["As the first message, with <code>\"role\": \"system\"</code>", "In the top-level <code>system</code> field of the request", "Appended to the last user message", "It is configured once per API key"], "answer": 1,
+         "explanation": "<p>The system prompt is a separate top-level field. A conversation starts with a <code>user</code> turn and alternates <code>user</code> and <code>assistant</code>, and because the API is stateless you send <code>system</code> with every request.</p>"},
+        {"type": "single", "prompt": "Your history is <code>[{\"role\": \"assistant\", \"content\": \"Hi! How can I help?\"}, {\"role\": \"user\", \"content\": \"Hello\"}]</code>. What happens when you send it?", "options": ["It works; the model treats the greeting as its own earlier turn", "<code>BadRequestError</code>: the first message must use the <code>user</code> role", "<code>NotFoundError</code>", "The greeting is silently dropped"], "answer": 1,
+         "explanation": "<p>The first message must be a user message. Keep display-only text such as UI greetings out of the history you send.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\n\nclient = al.MockClient([\"Paris.\"])\nr = client.messages.create(model=al.MODEL, max_tokens=50,\n    messages=[{\"role\": \"user\", \"content\": \"Capital of France?\"}])\nprint(type(r.content).__name__, r.content[0].type, r.stop_reason)", "answer": "list text end_turn",
+         "explanation": "<p>Response content is always a <em>list</em> of blocks, even when the request used a string. The only block here is a text block, and a complete answer ends with <code>stop_reason</code> <code>end_turn</code>.</p>"},
+        {"type": "single", "prompt": "You make two separate calls. The first sends \"My name is Ada.\" The second sends only \"What is my name?\". Why can the model not answer the second?", "options": ["The model's memory expires after a few seconds", "The API is stateless: each request contains everything the model sees, and the second contains no name", "You must pass the first response's <code>id</code> to link them", "Names are filtered for privacy"], "answer": 1,
+         "explanation": "<p>Nothing is kept between requests. To continue a conversation you resend the earlier turns. There is no parameter that links requests by id.</p>"},
+        {"type": "single", "prompt": "After a reply, which line correctly extends the history?", "options": ["<code>messages.append(response)</code>", "<code>messages.append({\"role\": \"assistant\", \"content\": response.content})</code>", "<code>messages.append({\"role\": \"assistant\", \"content\": response.content[0].text})</code>", "<code>messages.append({\"role\": \"user\", \"content\": response.content})</code>"], "answer": 1,
+         "explanation": "<p>Append a dict with role <code>assistant</code> and the full block list. Storing only the first block's text loses non-text blocks such as <code>tool_use</code>, which Stage 2 depends on; appending the response object is not a valid history entry; and the reply came from the assistant, not the user.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\n\nclient = al.MockClient([\"A\", \"B\", \"C\"])\nmessages = []\nfor text in [\"one\", \"two\", \"three\"]:\n    messages.append({\"role\": \"user\", \"content\": text})\n    r = client.messages.create(model=al.MODEL, max_tokens=50, messages=messages)\n    messages.append({\"role\": \"assistant\", \"content\": r.content})\nprint([len(req.messages) for req in client.requests])", "answer": "[1, 3, 5]",
+         "explanation": "<p>Each request carries the whole history: one user turn, then user + assistant + user, then five messages. The list grows by two per turn, which is also why input tokens grow every turn.</p>"},
+        {"type": "multi", "prompt": "Which of these requests does the API reject with a 400 Bad Request?", "options": ["A user message whose content is <code>\"   \"</code>", "Two consecutive user messages", "A history whose last message is an assistant message", "A user message whose content is a list of two text blocks", "A text block with <code>\"text\": \"\"</code>"], "answer": [0, 2, 4],
+         "explanation": "<p>Empty text (as a string or as a block) is rejected, and ending with an assistant turn (prefill) is rejected on current models. Consecutive same-role messages are merged, not rejected, and a list of non-empty text blocks is perfectly valid.</p>"},
+        {"type": "text", "prompt": "Which response field tells you why the model stopped generating, and should be checked before you read <code>content</code>?", "answer": ["stop_reason", "response.stop_reason"],
+         "explanation": "<p><code>stop_reason</code> says whether the answer is complete (<code>end_turn</code>), cut off (<code>max_tokens</code>), a tool request, a refusal, and so on. M03 covers every value.</p>"},
+        {"type": "single", "prompt": "Why is <code>\"\".join(b.text for b in response.content if b.type == \"text\")</code> safer than <code>response.content[0].text</code>?", "options": ["It is faster", "It works when there are no blocks, when the first block is not text, and when there are several text blocks", "The SDK forbids indexing <code>content</code>", "It removes whitespace"], "answer": 1,
+         "explanation": "<p>A refusal can return no blocks, a tool request can put a non-text block anywhere, and a reply can have more than one text block. Filtering by type handles all three.</p>"},
+        {"type": "single", "prompt": "In a chat wrapper, the API call raises <code>RateLimitError</code> after you appended the user turn. What should the wrapper do with the history?", "options": ["Leave it; the next send will fix it", "Remove the user turn it just appended, then re-raise", "Append an empty assistant turn to keep alternation", "Clear the whole history"], "answer": 1,
+         "explanation": "<p>Rolling back keeps the history exactly as it was before the failed call, so a retry does not create a duplicate user turn. An empty assistant turn would itself be rejected, and clearing the history throws away the conversation.</p>"},
+        {"type": "output", "prompt": "What does this print?", "code": "import agentlab as al\n\nclient = al.MockClient([\"hi\"])\ntry:\n    client.messages.create(model=al.MODEL, max_tokens=50,\n        messages=[{\"role\": \"user\", \"content\": \"\"}])\nexcept al.BadRequestError as e:\n    print(e.status_code, client.remaining)", "answer": "400 1",
+         "explanation": "<p>Empty text fails validation with status 400. The request never reaches the model, so the scripted step is not used and one step remains.</p>"},
+        {"type": "single", "prompt": "What does the <code>usage.input_tokens</code> of each request do over a long conversation?", "options": ["Stays constant, because only the new message is sent", "Grows, because the full history is sent and read on every request", "Shrinks, because the model caches earlier turns automatically", "Resets every ten turns"], "answer": 1,
+         "explanation": "<p>Every request contains the system prompt plus the whole history, so input tokens (and input cost) grow with each turn you keep.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>A request is <code>model</code> + <code>max_tokens</code> + <code>messages</code>, plus optional fields such as <code>system</code>. The SDK's keyword arguments are the JSON fields.</li>
+      <li>Conversations are built from <code>user</code> and <code>assistant</code> turns, with the system prompt in its own <code>system</code> field. The first message is <code>user</code>, the last is the user turn to answer, and consecutive same-role messages are merged.</li>
+      <li>Content is a string (shorthand for one text block) or a list of typed blocks. Text must never be empty.</li>
+      <li>The system prompt goes in the top-level <code>system</code> field, on every request.</li>
+      <li>The response is a <code>Message</code>: <code>id</code>, <code>content</code> (a list of blocks), <code>stop_reason</code>, <code>usage</code>. Read text by filtering blocks on <code>type</code>.</li>
+      <li>The API is stateless. History is a list you own: append the user turn, send everything, append <code>response.content</code> as the assistant turn.</li>
+      <li>A chat wrapper validates input, sends the system prompt, keeps every block, and rolls back on failure.</li>
+      <li><code>TypeError</code>, 400 and 404 mean the request is wrong: fix it, do not retry it.</li>
+    </ul>
+    <div class="flashcards" data-title="The Messages API">
+      <script type="application/json">
+      [{"front": "The three required request fields", "back": "<code>model</code>, <code>max_tokens</code>, <code>messages</code>."},
+       {"front": "The two message roles", "back": "<code>user</code> (your input, later tool results) and <code>assistant</code> (the model's earlier replies)."},
+       {"front": "Where does the system prompt go?", "back": "The top-level <code>system</code> field, never inside <code>messages</code>. Send it on every request."},
+       {"front": "What must the first message be?", "back": "A <code>user</code> message. Otherwise: <code>BadRequestError</code> at <code>messages.0.role</code>."},
+       {"front": "What happens to two consecutive user messages?", "back": "They are merged into one turn. No error, which can hide bugs."},
+       {"front": "String content is shorthand for...", "back": "<code>[{\"type\": \"text\", \"text\": \"...\"}]</code>, a list with one text block."},
+       {"front": "Key fields of a response", "back": "<code>id</code>, <code>content</code> (list of blocks), <code>stop_reason</code>, <code>usage</code> (input and output tokens)."},
+       {"front": "What does stateless mean for the API?", "back": "Nothing is kept between requests. Each request must contain the full history the model should see."},
+       {"front": "How do you append the model's reply to history?", "back": "<code>{\"role\": \"assistant\", \"content\": response.content}</code>: the blocks, not just the text."},
+       {"front": "Safe way to get reply text", "back": "<code>\"\".join(b.text for b in response.content if b.type == \"text\")</code>"},
+       {"front": "A chat wrapper's call fails. What happens to the history?", "back": "Pop the user turn you just appended, then re-raise, so the history is unchanged."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/working-with-messages">Claude docs: Working with the Messages API</a></li>
+      <li><a href="https://platform.claude.com/docs/en/api/messages">Claude API reference: Messages</a></li>
+      <li><a href="https://github.com/anthropics/anthropic-sdk-python">The anthropic Python SDK on GitHub</a></li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> and <a href="../reference/glossary.html">Glossary</a></li>
+      <li><a href="https://docs.python.org/3/library/json.html">Python docs: json</a> (for saving histories)</li>
+      <li>Next: <a href="m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,50 @@
+[workspace]
+authors = ["Kevin Mills <millsks@gmail.com>"]
+channels = ["conda-forge"]
+name = "agentic-systems-practicum"
+platforms = ["osx-arm64", "osx-64", "linux-64", "win-64"]
+version = "0.1.0"
+
+[dependencies]
+python = "3.14.*"
+structlog = ">=26.1.0,<27"
+
+[pypi-dependencies]
+agentic-systems-practicum = { path = ".", editable = true }
+
+[feature.dev.dependencies]
+pytest = "*"
+pytest-cov = "*"
+mypy = "*"
+ruff = "*"
+pre-commit = "*"
+git-cliff = "*"
+python-build = "*"
+hatchling = "*"
+act = "*"
+
+[environments]
+default = { features = ["dev"], solve-group = "default" }
+
+[tasks]
+bootstrap = "pre-commit install --install-hooks && pre-commit install --hook-type commit-msg"
+fmt = "ruff format ."
+lint = "ruff check ."
+check = "mypy src/"
+test = "pytest tests/unit/"
+test-integration = "pytest tests/integration/"
+cov = "pytest tests/ --cov=src --cov-report=term-missing --cov-fail-under=90"
+build = "python -m build --no-isolation"
+changelog = "git cliff -o CHANGELOG.md"
+act = "act --container-architecture linux/amd64"
+pre-commit-all = "pre-commit run --all-files"
+ci = { depends-on = ["pre-commit-all", "build", "check", "lint", "cov"] }
+
+# Learner workflow
+serve = "practicum serve"
+projects = "practicum list"
+start = { cmd = "practicum start {{ project }}", args = ["project"] }
+grade = { cmd = "practicum grade {{ project }}", args = ["project"] }
+check-site = "practicum check-site"
+bundle = "practicum bundle"
+sync-runtime = "practicum sync-runtime"

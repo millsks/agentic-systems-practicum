@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capstone 1 · Research Agent · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="c1">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 2 · Tool Use and the Agent Loop · Capstone 1</p>
+    <h1>Capstone 1: Research Agent</h1>
+    <p class="lede">Build a tool-using research agent that searches a small library, reads the sources it needs, and
+      writes an answer where every claim cites a document it actually read. It is the whole of Level 1 in one
+      program: tool contracts, the agent loop, errors as data, stop conditions, and tool design, graded against a
+      scripted model so every edge case is tested offline.</p>
+    <div class="lesson-meta"><span>⏱ ~5–7 hours</span><span>Prerequisites: <a href="../modules/m09-agent-loop.html">M09</a>, <a href="../modules/m10-errors-as-data.html">M10</a>, <a href="../modules/m11-stop-conditions.html">M11</a>, <a href="../modules/m12-tool-design.html">M12</a></span></div>
+    <ul class="objectives">
+      <li>Write three tool definitions whose descriptions tell the model when to use each tool</li>
+      <li>Implement keyword search and document reading as plain, separately tested Python functions</li>
+      <li>Drive a complete agent loop from <code>stop_reason</code>, including parallel tool calls</li>
+      <li>Turn unknown tools, invalid input, and bad ids into <code>is_error</code> results the model can recover from</li>
+      <li>End every run with a structured result: answer, citations, steps, tokens, and why it stopped</li>
+      <li>Verify citations against what the agent read, so an answer cannot cite a source it never opened</li>
+      <li>Run the same code against the real Claude API from the command line</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="scenario">
+    <h2>What you'll build</h2>
+    <p>A science writer is preparing an article about honeybees and wants a research assistant that answers questions
+      from a vetted library, not from whatever the model half-remembers. The library is 14 short documents (the
+      <em>corpus</em>) on colony life, the waggle dance, swarming, varroa mites, beekeeping history, and more. The writer
+      has one hard rule: <strong>every claim must point to a document, and the assistant must have actually read that
+      document</strong>. A citation to a source nobody opened is worse than no citation, because it looks
+      trustworthy.</p>
+    <p>You will build <code>research</code>, a Python package with three tools and an agent loop. The model never sees
+      the library directly. It can only ask your code to <code>search</code> it, <code>read</code> one document, or
+      <code>list_sources</code>. Your loop runs each request, sends the results back, and repeats until the model
+      writes an answer or a limit is hit. Then your code parses the <code>[doc-id]</code> citations in the answer and
+      checks each one against the list of documents read during that run.</p>
+    <pre data-label="Terminal"><code class="language-bash">$ pixi run python -m research "How do honeybees tell each other where food is?"
+Foragers perform a waggle dance on the vertical comb. The angle of the waggle run relative to
+vertical gives the direction of the food relative to the sun, and the length of the run gives
+the distance [waggle-dance]. Followers also learn the flower scent from the dancer [waggle-dance].
+
+Sources: waggle-dance
+[3 steps, 4180 input / 160 output tokens, stopped: end_turn]</code></pre>
+    <aside class="callout note"><p>The token counts above are illustrative. The graded tests use
+      <code>agentlab.MockClient</code>, which estimates tokens at about four characters each; the real API reports
+      exact counts in <code>response.usage</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="architecture">
+    <h2>How the pieces fit</h2>
+    <p>The design keeps three concerns apart so each can be tested alone. The <strong>tools</strong> know nothing about
+      the model: they take Python arguments and return text or raise <code>ToolError</code>. The <strong>loop</strong>
+      knows nothing about bees: it moves blocks between the client and the toolbox. The <strong>citation check</strong>
+      is a pure function over three lists. This is the same split you practiced in
+      <a href="../modules/m12-tool-design.html">M12</a>: tools you can unit-test without a model, and a loop you can
+      test with a scripted one.</p>
+    <pre class="mermaid">
+flowchart LR
+  Q[question] --> L
+  subgraph L[run: the agent loop]
+    C[client.messages.create] -->|stop_reason = tool_use| X[execute_tool_calls]
+    X -->|all tool_result blocks in one user message| C
+  end
+  X --> T[Toolbox.dispatch]
+  T --> V{agentlab.validate}
+  V -->|ok| S[search / read / list_sources]
+  V -->|problems| E[ToolError]
+  S --> K[(corpus: 14 documents)]
+  S -->|read records doc id| R[read_ids]
+  E -->|is_error: true| X
+  C -->|end_turn, max_tokens, refusal, or max_steps| A[Answer]
+  R --> CC[check_citations]
+  A --> CC
+    </pre>
+    <p>Step through a run of this exact shape (search, read, answer) in the visualizer before you write the loop. Watch
+      the message list grow: each assistant turn is followed by a user turn carrying the tool results.</p>
+    <div class="viz" data-viz="agent-loop" data-config='{"scenario": "chain"}'></div>
+    <aside class="callout think"><p>Why does <code>read</code> record ids instead of letting the citation check look at
+      search results too? Because a search snippet is one sentence chosen by keyword overlap. A model that answers from
+      snippets is answering from fragments it never saw in context. Requiring a <code>read</code> is how the agent earns
+      the right to cite.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="setup">
+    <h2>Setup with Pixi</h2>
+    <pre data-label="Terminal"><code class="language-bash">pixi run projects                         # list projects and which you've started
+pixi run start c1                         # copy the starter into work/c1_research_agent/
+pixi run grade c1                         # run the 25 grading tests against your work/ copy
+pixi run practicum grade c1 -k tools -x   # one milestone at a time, stop at the first failure</code></pre>
+    <p>Your code lives in <code>work/c1_research_agent/research/</code>. The tests import the package
+      <code>research</code> from whichever copy is being graded, so keep the module and function names exactly as the
+      starter defines them.</p>
+    <table>
+      <thead><tr><th>File</th><th>Status</th><th>What it holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>corpus/*.md</code></td><td>provided</td><td>The 14 documents</td></tr>
+        <tr><td><code>corpus.py</code></td><td>provided</td><td><code>Document</code>, <code>Corpus</code>, <code>tokenize</code></td></tr>
+        <tr><td><code>tools.py</code></td><td>yours</td><td><code>tool_definitions</code>, <code>ToolError</code>, <code>Toolbox</code></td></tr>
+        <tr><td><code>agent.py</code></td><td>partly yours</td><td><code>SYSTEM_PROMPT</code> and <code>Answer</code> provided; <code>Usage.add</code>, <code>text_of</code>, <code>execute_tool_calls</code>, <code>run</code> to write</td></tr>
+        <tr><td><code>citations.py</code></td><td>yours</td><td><code>parse_citations</code>, <code>check_citations</code></td></tr>
+        <tr><td><code>cli.py</code>, <code>__main__.py</code></td><td>provided</td><td>The command line, structlog setup, answer formatting</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout pixi"><p>No extra packages are needed for grading: the agent uses only the standard library,
+      <code>agentlab</code>, and <code>structlog</code>, all already in the workspace. You add <code>anthropic</code>
+      only for the live run in milestone 5.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="corpus">
+    <h2>The corpus</h2>
+    <p>Each document is a markdown file whose name (without <code>.md</code>) is its <strong>id</strong> and whose first
+      line is a <code># Title</code> heading. Ids are lowercase words joined by hyphens, which is also the citation
+      format: <code>[waggle-dance]</code>.</p>
+    <table>
+      <thead><tr><th>Id</th><th>Title</th></tr></thead>
+      <tbody>
+        <tr><td><code>beekeeping-history</code></td><td>A Short History of Beekeeping</td></tr>
+        <tr><td><code>beeswax</code></td><td>Beeswax and Comb</td></tr>
+        <tr><td><code>colony-collapse-disorder</code></td><td>Colony Collapse Disorder</td></tr>
+        <tr><td><code>colony-structure</code></td><td>How a Honeybee Colony Is Organized</td></tr>
+        <tr><td><code>drones</code></td><td>Drones: The Male Bees</td></tr>
+        <tr><td><code>honey-production</code></td><td>How Bees Make Honey</td></tr>
+        <tr><td><code>pollination</code></td><td>Honeybees as Pollinators</td></tr>
+        <tr><td><code>propolis</code></td><td>Propolis: Bee Glue</td></tr>
+        <tr><td><code>queen-bee</code></td><td>The Queen Bee</td></tr>
+        <tr><td><code>swarming</code></td><td>Swarming and Choosing a New Home</td></tr>
+        <tr><td><code>thermoregulation</code></td><td>Keeping the Hive at the Right Temperature</td></tr>
+        <tr><td><code>varroa-mite</code></td><td>The Varroa Mite</td></tr>
+        <tr><td><code>waggle-dance</code></td><td>The Waggle Dance</td></tr>
+        <tr><td><code>worker-bees</code></td><td>Worker Bees and Their Jobs</td></tr>
+      </tbody>
+    </table>
+    <p>Several questions need more than one document. "Why do colonies die?" touches <code>varroa-mite</code> and
+      <code>colony-collapse-disorder</code>; "How does a swarm choose a home?" uses <code>swarming</code> and
+      <code>waggle-dance</code>. Those are the questions that make a model call tools in parallel.</p>
+    <pre><code class="language-python">from research.corpus import Corpus, tokenize
+
+corpus = Corpus.load()                 # every *.md file next to corpus.py
+corpus.ids()[:3]                       # ['beekeeping-history', 'beeswax', 'colony-collapse-disorder']
+corpus.get("drones").title             # 'Drones: The Male Bees'
+tokenize("How do bees dance?")         # ['bees', 'dance']  (lowercased, stopwords dropped)</code></pre>
+  </section>
+
+  <section class="lesson-section" id="interfaces">
+    <h2>The required interfaces</h2>
+    <p>The tests call these names directly. Signatures and docstrings are in the starter; this is the contract at a
+      glance.</p>
+    <h3>Tools (<code>tools.py</code>)</h3>
+    <table>
+      <thead><tr><th>Name</th><th>Behavior</th></tr></thead>
+      <tbody>
+        <tr><td><code>tool_definitions() -&gt; list[dict]</code></td><td>Three definitions in the order <code>search</code>, <code>read</code>, <code>list_sources</code>. Each has a description of at least 40 characters and an object <code>input_schema</code> with <code>additionalProperties: false</code>. <code>search</code> requires <code>query</code> (string) and accepts <code>limit</code> (integer 1 to 10); <code>read</code> requires <code>doc_id</code>; <code>list_sources</code> takes nothing.</td></tr>
+        <tr><td><code>ToolError</code></td><td>Exception for failures the model can fix. Its message becomes the <code>is_error</code> result.</td></tr>
+        <tr><td><code>Toolbox(corpus=None)</code></td><td>Tools for one run. <code>read_ids</code> lists documents read successfully, in first-read order.</td></tr>
+        <tr><td><code>Toolbox.search(query, limit=5)</code></td><td>Hits <code>{"id", "title", "snippet", "score"}</code>: 3 points per query word in the title, 1 per word in the body, plural <code>s</code> ignored, score-0 documents dropped, sorted by score then id. A query with no keywords raises <code>ToolError</code>.</td></tr>
+        <tr><td><code>Toolbox.read(doc_id)</code></td><td>Returns the title, the id, and the body; records the id. Unknown ids raise a <code>ToolError</code> that repeats the id and says to use <code>search</code> or <code>list_sources</code>.</td></tr>
+        <tr><td><code>Toolbox.list_sources()</code></td><td><code>{"id", "title"}</code> for every document, sorted by id.</td></tr>
+        <tr><td><code>Toolbox.dispatch(name, input) -&gt; str</code></td><td>Unknown name: <code>ToolError</code> naming the real tools. Input checked with <code>agentlab.validate</code> against the tool's schema; problems raise <code>ToolError</code>. Search results are formatted one per line as <code>[doc-id] Title (score N): snippet</code>.</td></tr>
+      </tbody>
+    </table>
+    <h3>The loop (<code>agent.py</code>)</h3>
+    <pre><code class="language-python">def run(client, question, *, corpus=None, max_steps=8, max_tokens=2048, model=MODEL) -&gt; Answer: ...
+
+@dataclass
+class Answer:
+    text: str                       # final text (partial if the run stopped early, "" on max_steps)
+    citations: list[str]            # [doc-id]s in the text, first-seen order
+    citation_problems: list[str]    # from check_citations; checked only when stopped_because == "end_turn"
+    read_ids: list[str]             # documents read in this run
+    steps: int                      # messages.create calls made
+    usage: Usage                    # input_tokens / output_tokens summed over every response
+    stopped_because: str            # "end_turn", "max_tokens", "refusal", "max_steps", ...
+    detail: str | None = None       # e.g. the refusal's stop_details.explanation
+    messages: list[dict] = ...      # full history, for al.format_transcript
+
+    @property
+    def ok(self) -&gt; bool: ...       # end_turn and no citation problems</code></pre>
+    <p>Every request is <code>client.messages.create(model=model, max_tokens=max_tokens, system=SYSTEM_PROMPT,
+      tools=tool_definitions(), messages=messages)</code>. Nothing else. That is what lets the same function run on the
+      mock and on <code>anthropic.Anthropic()</code>.</p>
+    <h3>Citations (<code>citations.py</code>)</h3>
+    <table>
+      <thead><tr><th>Call</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><code>parse_citations("A [swarming]. B [waggle-dance]. C [swarming]. [Note]")</code></td><td><code>["swarming", "waggle-dance"]</code></td></tr>
+        <tr><td><code>check_citations([], read_ids, known)</code></td><td><code>["the answer cites no sources"]</code></td></tr>
+        <tr><td><code>check_citations(["bee-tv"], read_ids, known)</code></td><td><code>["[bee-tv] is not a document in the corpus"]</code></td></tr>
+        <tr><td><code>check_citations(["drones"], [], known)</code></td><td><code>["[drones] was cited but never read"]</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="milestones">
+    <h2>Milestones</h2>
+
+    <div class="milestone">
+      <h3>Milestone 1: the tools</h3>
+      <p>Write <code>tool_definitions</code> and the four <code>Toolbox</code> methods. Test them in a Pixi shell before
+        any model is involved: if <code>toolbox.search("waggle dance")</code> does not put <code>waggle-dance</code>
+        first, no prompt will save the agent. Revisit <a href="../modules/m07-tools-as-contracts.html">M07</a> for
+        schemas and <a href="../modules/m12-tool-design.html">M12</a> for result formatting.</p>
+      <ul class="checklist" data-id="c1-m1">
+        <li>Descriptions say what each tool returns and when to use it (and when not to)</li>
+        <li><code>search</code> ranks by title and body matches and returns ids the model can cite</li>
+        <li><code>read</code> on an unknown id raises a <code>ToolError</code> that tells the model what to do next</li>
+        <li><code>dispatch</code> validates input with <code>agentlab.validate</code> before running anything</li>
+        <li><code>pixi run practicum grade c1 -k "tools"</code> passes</li>
+      </ul>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 2: citations you can trust</h3>
+      <p>Write <code>parse_citations</code> and <code>check_citations</code>. They are pure functions over strings and
+        lists, so they are quick to finish, and the loop tests in the next milestones rely on them: a run is only
+        <code>ok</code> when its citations are sound.</p>
+      <ul class="checklist" data-id="c1-m2">
+        <li>Citations are unique and in first-seen order; <code>[Note]</code> is not a citation</li>
+        <li>An answer with no citations is flagged</li>
+        <li>A citation of a real document that was only seen in search results is flagged as never read</li>
+        <li><code>-k test_citations</code> passes</li>
+      </ul>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 3: the loop</h3>
+      <p>Write <code>Usage.add</code>, <code>text_of</code>, <code>execute_tool_calls</code>, and <code>run</code>.
+        This is the ~50-line agent from <a href="../modules/m09-agent-loop.html">M09</a>, driven by
+        <code>stop_reason</code>. Append <code>response.content</code> itself (the blocks, text included) as the
+        assistant turn, and put every <code>tool_result</code> for that turn in <strong>one</strong> user message, in
+        the order of the <code>tool_use</code> blocks. When the run ends with <code>end_turn</code>, fill
+        <code>Answer.citations</code> and <code>Answer.citation_problems</code> with your milestone 2 functions; a
+        truncated or refused run already reports why it is incomplete, so skip the check there.</p>
+      <ul class="checklist" data-id="c1-m3">
+        <li>A single search followed by an answer takes exactly two requests</li>
+        <li>Search, read, answer works as a three-request chain</li>
+        <li>Two parallel <code>read</code> calls come back in one user message, in order</li>
+        <li>Every request carries the system prompt, the tools, and the full history</li>
+        <li>An answer citing a document that was only searched is not <code>ok</code></li>
+        <li><code>-k "single or chained or parallel or well_formed or usage or citing"</code> passes</li>
+      </ul>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 4: errors and stop conditions</h3>
+      <p>Make the loop survive a bad model and end every run on purpose
+        (<a href="../modules/m10-errors-as-data.html">M10</a>, <a href="../modules/m11-stop-conditions.html">M11</a>).
+        A <code>ToolError</code> is data: it becomes <code>{"type": "tool_result", ..., "is_error": True}</code> and the
+        loop continues. A non-tool stop reason ends the run and is recorded, never ignored.</p>
+      <ul class="checklist" data-id="c1-m4">
+        <li>A bad id, an unknown tool, and invalid input each produce an <code>is_error</code> result with an actionable message</li>
+        <li>The agent recovers when the model corrects its call</li>
+        <li><code>max_steps</code> caps the number of requests and reports <code>stopped_because="max_steps"</code></li>
+        <li><code>max_tokens</code> and <code>refusal</code> stop the run, keep partial text and <code>stop_details</code></li>
+        <li><code>-k "error or unknown or invalid or max_steps or refusal or max_tokens"</code> passes, and
+          <code>pixi run grade c1</code> shows all 25 tests passing</li>
+      </ul>
+    </div>
+
+    <div class="milestone">
+      <h3>Milestone 5: a live run</h3>
+      <p>The CLI is provided. Run it against Claude (see <a href="#real-api">below</a>), then read the transcript of one
+        run line by line with <code>agentlab.format_transcript(answer.messages)</code> and check that you can explain
+        every block.</p>
+      <ul class="checklist" data-id="c1-m5">
+        <li>The agent answers three different questions with sound citations</li>
+        <li>At least one question made the model call tools in parallel</li>
+        <li>You found one question the library cannot answer and the agent said so instead of guessing</li>
+        <li>No API key appears in your code, your shell history file, or any commit</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="key-code">
+    <h2>The heart of it: one step of the loop</h2>
+    <p>This is the shape the tests expect. Study why each line is there before you write yours.</p>
+    <pre><code class="language-python">response = client.messages.create(
+    model=model, max_tokens=max_tokens, system=SYSTEM_PROMPT, tools=tools, messages=messages
+)
+usage.add(response.usage)
+if response.content:                                   # a refusal has no content to append
+    messages.append({"role": "assistant", "content": response.content})
+if response.stop_reason != "tool_use":                 # end_turn, max_tokens, refusal, ...
+    stopped = response.stop_reason
+    ...                                                # record it and leave the loop
+messages.append({"role": "user", "content": execute_tool_calls(toolbox, response.content)})</code></pre>
+    <p>And the error path inside <code>execute_tool_calls</code>, which is what keeps one bad call from ending the
+      run:</p>
+    <pre><code class="language-python">result = {"type": "tool_result", "tool_use_id": block.id}
+try:
+    result["content"] = toolbox.dispatch(block.name, dict(block.input))
+except ToolError as exc:
+    result["content"] = f"Error: {exc}"
+    result["is_error"] = True
+    log.warning("tool_error", tool=block.name, error=str(exc))</code></pre>
+    <aside class="callout warn"><p>Never <code>print</code> inside the agent. Log with <code>structlog</code>
+      (<code>log = structlog.get_logger(__name__)</code>). The provided CLI sends log lines to stderr as
+      <code>key=value</code> pairs and keeps stdout for the answer, so <code>pixi run python -m research "..." &gt;
+      answer.txt</code> captures only the answer.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="grading">
+    <h2>How grading works</h2>
+    <p><code>pixi run grade c1</code> runs 25 pytest tests in <code>projects/c1_research_agent/tests/</code> against
+      your work copy. Nothing touches the network. Each agent test builds an <code>agentlab.MockClient</code> with a
+      script, one step per <code>messages.create</code> call, runs your agent, and then inspects both your
+      <code>Answer</code> and <code>client.requests</code>, the list of every request your code sent. For example:</p>
+    <pre><code class="language-python">client = al.MockClient([
+    al.tool_calls([("read", {"doc_id": "swarming"}), ("read", {"doc_id": "waggle-dance"})], ids=["t_a", "t_b"]),
+    "Scouts dance for nest sites [swarming] [waggle-dance].",
+])
+answer = run(client, "How do swarms pick a home?")
+last = client.requests[1].messages[-1]
+assert [b["tool_use_id"] for b in last["content"]] == ["t_a", "t_b"]   # one user message, in order
+assert answer.ok</code></pre>
+    <p>The mock validates every request the way the API does, so a malformed history fails loudly with the same
+      <code>BadRequestError</code> the real API would raise: a <code>tool_use</code> with no matching
+      <code>tool_result</code> or a history ending in an assistant turn. It is stricter in one place: results split across
+      two user messages fail here, while the real API merges them. Send them in one message anyway; splitting
+      discourages parallel calls.</p>
+    <table>
+      <thead><tr><th>File</th><th>Tests</th><th>What it checks</th></tr></thead>
+      <tbody>
+        <tr><td><code>test_tools.py</code></td><td>9</td><td>Corpus, search ranking and limits, read and its errors, list_sources, schemas, dispatch validation</td></tr>
+        <tr><td><code>test_agent.py</code></td><td>12</td><td>Single, chained, and parallel runs; error recovery; unknown tools; invalid input; max_steps; refusal; max_tokens; unread citations; request shape; usage totals</td></tr>
+        <tr><td><code>test_citations.py</code></td><td>2</td><td>Parsing and checking citations</td></tr>
+        <tr><td><code>test_cli.py</code></td><td>2</td><td>Answer on stdout; a helpful message when the real API is unavailable</td></tr>
+      </tbody>
+    </table>
+    <aside class="callout tip"><p>When a test fails, re-run it alone with
+      <code>pixi run practicum grade c1 -k parallel -x</code> and read the assertion message. Each one says what the
+      test expected and why.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="real-api">
+    <h2>Running against the real API</h2>
+    <p>The agent calls only <code>client.messages.create</code>, so switching to Claude changes one line: the client.
+      The provided CLI does it for you with <code>agentlab.get_client()</code>, which returns
+      <code>anthropic.Anthropic()</code> when the package is installed.</p>
+    <pre data-label="Terminal"><code class="language-bash">pixi add anthropic                       # the SDK, from conda-forge
+export ANTHROPIC_API_KEY=...             # or sign in with `ant auth login`
+cd work/c1_research_agent
+pixi run python -m research "How does a swarm choose a new home?" -v</code></pre>
+    <p>Without the package the CLI exits with code 2 and explains these steps instead of crashing. In your own scripts
+      the equivalent is:</p>
+    <pre><code class="language-python">import anthropic
+from research import run
+
+client = anthropic.Anthropic()           # reads ANTHROPIC_API_KEY from the environment
+answer = run(client, "Why do honeybee colonies die?", max_steps=8)</code></pre>
+    <p>A typical run makes three to five requests. Each request re-sends the system prompt, the tool definitions, and
+      the whole history, so input tokens grow with every step; this is the cost of a stateless API
+      (<a href="../modules/m02-messages-api.html">M02</a>). At Opus 5.5 prices ($4 per million input tokens, $20 per
+      million output) a five-step run with 20,000 input and 600 output tokens in total costs about
+      $0.08 + $0.012 = $0.092. Try the same question with <code>--model claude-haiku-5-5</code> and compare the
+      answers and the token line.</p>
+    <aside class="callout danger"><p>Never paste an API key into code, a test, or a notebook, and never commit one. The
+      SDK reads it from the environment.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="hints">
+    <h2>Hints</h2>
+    <details class="reveal"><summary>BadRequestError: tool_use ids were found without tool_result blocks</summary>
+      <p>You appended the assistant turn but sent a result for only some of its <code>tool_use</code> blocks, or sent
+        them in separate messages. Build all results first, then append one user message with the whole list.</p></details>
+    <details class="reveal"><summary>BadRequestError: the final message must not be an assistant message</summary>
+      <p>Your loop called the model again right after appending the assistant turn, without adding the tool results.
+        Only <code>tool_use</code> continues the loop, and only after the results are appended.</p></details>
+    <details class="reveal"><summary>The text before a tool call disappears from the history</summary>
+      <p>Append <code>response.content</code>, not a dict you built from the tool call alone. The assistant turn must
+        hold every block the model produced, text included.</p></details>
+    <details class="reveal"><summary>The max_steps test hangs or raises MockScriptError</summary>
+      <p>The loop must count requests, not tool calls, and stop after <code>max_steps</code> of them, even when the
+        model keeps asking for tools.</p></details>
+    <details class="reveal"><summary>My citation check passes answers that only searched</summary>
+      <p>Only <code>Toolbox.read</code> appends to <code>read_ids</code>, and only after the id was found. Search
+        results must not count.</p></details>
+  </section>
+
+  <section class="lesson-section" id="stretch">
+    <h2>Stretch goals</h2>
+    <ul>
+      <li>Add <code>"strict": True</code> to the tool definitions. Explain what it guarantees and why
+        <code>dispatch</code> still validates (hint: the mock and the API are not your only callers).</li>
+      <li>Add a token budget and a cost budget that stop the run with their own <code>stopped_because</code>, and detect
+        a model repeating the identical call (<a href="../modules/m11-stop-conditions.html">M11</a>).</li>
+      <li>Build an eval set: ten questions with the ids that should be cited. Score citation precision and recall
+        against the real API, and track the numbers when you change the system prompt.</li>
+      <li>A grounding check: every sentence citing <code>[x]</code> shares at least two keywords with document
+        <code>x</code>; flag the ones that do not.</li>
+      <li>Replace keyword scoring with BM25 and show on your eval set whether it helps.</li>
+    </ul>
+  </section>
+
+  <section class="lesson-section" id="rubric">
+    <h2>Rubric</h2>
+    <table class="rubric">
+      <thead><tr><th>Criterion</th><th>Weight</th><th>Excellent</th></tr></thead>
+      <tbody>
+        <tr><td>Correctness</td><td>45%</td><td>All 25 tests pass with <code>pixi run grade c1</code>; the live CLI answers real questions with sound citations</td></tr>
+        <tr><td>Eval coverage</td><td>20%</td><td>Your own extra tests or eval questions cover a case the graded suite does not (for example a two-document answer, or an unanswerable question)</td></tr>
+        <tr><td>Safety</td><td>15%</td><td>Every tool input is validated; errors are data, never crashes; every run ends for a recorded reason; no key in code or history</td></tr>
+        <tr><td>Cost</td><td>10%</td><td>Concise tool results; a sensible <code>max_steps</code> and <code>max_tokens</code>; you can state what one run costs from <code>Answer.usage</code></td></tr>
+        <tr><td>Code quality</td><td>10%</td><td>Type hints, Google docstrings, structlog not <code>print</code>, <code>pixi run ruff check</code> clean</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Reflection quiz</h2>
+    <div class="quiz" data-id="c1-quiz">
+<script type="application/json">
+{"title": "Research agent reflection", "passScore": 0.7, "questions": [
+  {"type": "single", "prompt": "The model calls <code>read</code> twice in one response. How do the results go back?", "options": ["One user message per result, in any order", "One user message holding both <code>tool_result</code> blocks, each with its matching <code>tool_use_id</code>", "Only the first result; the model will ask again", "As text inside the next assistant message"], "answer": 1, "explanation": "<p>Parallel tool use requires every result for a turn in the next user message, before any other content. Splitting them leaves a <code>tool_use</code> unanswered, which the API rejects with a 400.</p>"},
+  {"type": "single", "prompt": "The model asks to read <code>bee-dances</code>, which does not exist. What should your code send back?", "options": ["Nothing; skip the call", "Raise the exception and end the run", "A <code>tool_result</code> with <code>is_error: true</code> and a message saying the id is unknown and to use search or list_sources", "An empty string"], "answer": 2, "explanation": "<p>Errors are data. An actionable error lets the model correct itself on the next step; dropping the result breaks the history, and crashing wastes the run.</p>"},
+  {"type": "multi", "prompt": "Which of these end the run without another request?", "options": ["<code>stop_reason == \"end_turn\"</code>", "<code>stop_reason == \"tool_use\"</code>", "<code>stop_reason == \"refusal\"</code>", "<code>stop_reason == \"max_tokens\"</code>", "Reaching <code>max_steps</code>"], "answer": [0, 2, 3, 4], "explanation": "<p>Only <code>tool_use</code> continues the loop. Every other outcome ends it, and the <code>Answer</code> records which one so the caller can tell a real answer from a truncated or refused one.</p>"},
+  {"type": "single", "prompt": "The agent searched for <code>varroa</code> and answered citing <code>[varroa-mite]</code> without reading it. What does <code>check_citations</code> report?", "options": ["Nothing; the id is real", "<code>[varroa-mite] was cited but never read</code>", "<code>[varroa-mite] is not a document in the corpus</code>", "<code>the answer cites no sources</code>"], "answer": 1, "explanation": "<p>The document exists, but a search snippet is not the document. Only ids recorded by a successful <code>read</code> may be cited.</p>"},
+  {"type": "output", "prompt": "What does this print?", "code": "from research import parse_citations\nprint(parse_citations(\"A [drones]. B [Note]. C [queen-bee] [drones].\"))", "answer": "['drones', 'queen-bee']", "explanation": "<p>Ids are lowercase words joined by hyphens, so <code>[Note]</code> does not match. Duplicates are removed while keeping first-seen order.</p>"},
+  {"type": "text", "prompt": "Which <code>MockClient</code> attribute lists every request your agent sent, so tests can inspect the history?", "answer": ["requests", "client.requests"], "explanation": "<p><code>client.requests</code> holds one validated <code>Request</code> per <code>messages.create</code> call, with <code>.messages</code>, <code>.tools</code>, <code>.system</code>, and <code>.tool_results</code>.</p>"}
+]}
+</script>
+    </div>
+  </section>
+</main>
+</body>
+</html>

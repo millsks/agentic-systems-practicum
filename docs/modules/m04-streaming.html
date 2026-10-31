@@ -1,0 +1,1148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M04 · Streaming · Agentic Systems Practicum</title>
+<link rel="stylesheet" href="../assets/css/course.css">
+<script src="../assets/js/curriculum.js"></script>
+<script src="../assets/js/agentlab-src.js"></script>
+<script src="../assets/js/viz.js" defer></script>
+<script src="../assets/js/viz-agent.js" defer></script>
+<script src="../assets/js/course.js" defer></script>
+</head>
+<body data-root="../" data-module="m04">
+<main class="lesson">
+  <header class="lesson-hero">
+    <p class="eyebrow">Stage 1 · Talking to a Model · Module 04</p>
+    <h1>Streaming</h1>
+    <p class="lede">A model writes its answer one token at a time, but a plain request makes you wait for the last
+      token before you see the first. Streaming hands you each piece as it is generated. It is how chat interfaces
+      feel fast, how long outputs avoid timeouts, and how an agent shows its work while it runs.</p>
+    <div class="lesson-meta"><span>⏱ ~75 minutes</span><span>Prerequisites: <a href="m02-messages-api.html">M02 The Messages API</a>, <a href="m03-limits-stop-reasons.html">M03 Limits, Effort &amp; Stop Reasons</a></span></div>
+    <ul class="objectives">
+      <li>Explain what streaming changes (time to first token) and what it does not change (total time, cost, the final answer)</li>
+      <li>Print a response as it arrives with <code>client.messages.stream(...)</code> and <code>stream.text_stream</code></li>
+      <li>Name every stream event, say what each one carries, and read a raw event sequence</li>
+      <li>Rebuild a complete response from events by hand, and get the same result from <code>get_final_message()</code></li>
+      <li>Use <code>messages.create(..., stream=True)</code> when you want the raw event iterator</li>
+      <li>Reassemble a tool call's input from <code>input_json_delta</code> fragments, and parse it at the right moment</li>
+      <li>Measure time to first token and total time, and keep streamed turns in conversation history correctly</li>
+    </ul>
+  </header>
+
+  <section class="lesson-section" id="why-stream">
+    <h2>Why stream at all</h2>
+    <p>In <a href="m01-llm-calls.html">M01</a> you saw that a model generates output one <strong>token</strong> at a
+      time: it predicts a token, appends it, and predicts the next. A response of 600 tokens is 600 small steps. With a
+      plain <code>messages.create(...)</code> call, the API runs all 600 steps on its side and only then sends you the
+      finished <code>Message</code>. Your program, and the person watching it, see nothing until the very end.</p>
+    <p><strong>Streaming</strong> means the API sends the response in pieces over the same HTTP connection while it is
+      still being generated. Each piece is a small <strong>event</strong> (a JSON object such as "here are three more
+      words"). The technical format is <em>server-sent events</em> (SSE): one long-lived HTTP response that delivers
+      a sequence of events. The SDK reads them for you and hands you Python objects.</p>
+    <p>Two time measurements make the difference concrete:</p>
+    <ul>
+      <li><strong>Time to first token (TTFT)</strong>: how long from sending the request until the first piece of the
+        answer is visible.</li>
+      <li><strong>Total time</strong>: how long until the response is complete.</li>
+    </ul>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 640 190" role="img" aria-label="Timeline comparing a blocking call with a streamed call">
+        <text x="10" y="22" fill="var(--fg)" font-size="13" font-weight="600">Without streaming</text>
+        <rect x="10" y="32" width="470" height="26" rx="4" fill="var(--bg-sunk)" stroke="var(--border-strong)"/>
+        <text x="20" y="50" fill="var(--fg-muted)" font-size="12">model generating... user sees nothing</text>
+        <rect x="480" y="32" width="150" height="26" rx="4" fill="var(--viz-1)"/>
+        <text x="490" y="50" fill="var(--accent-fg)" font-size="12">whole answer at once</text>
+        <text x="10" y="102" fill="var(--fg)" font-size="13" font-weight="600">With streaming</text>
+        <rect x="10" y="112" width="60" height="26" rx="4" fill="var(--bg-sunk)" stroke="var(--border-strong)"/>
+        <g fill="var(--viz-3)">
+          <rect x="72" y="112" width="34" height="26" rx="3"/><rect x="110" y="112" width="34" height="26" rx="3"/>
+          <rect x="148" y="112" width="34" height="26" rx="3"/><rect x="186" y="112" width="34" height="26" rx="3"/>
+          <rect x="224" y="112" width="34" height="26" rx="3"/><rect x="262" y="112" width="34" height="26" rx="3"/>
+          <rect x="300" y="112" width="34" height="26" rx="3"/><rect x="338" y="112" width="34" height="26" rx="3"/>
+          <rect x="376" y="112" width="34" height="26" rx="3"/><rect x="414" y="112" width="34" height="26" rx="3"/>
+          <rect x="452" y="112" width="34" height="26" rx="3"/><rect x="490" y="112" width="34" height="26" rx="3"/>
+          <rect x="528" y="112" width="34" height="26" rx="3"/><rect x="566" y="112" width="34" height="26" rx="3"/>
+        </g>
+        <line x1="70" y1="146" x2="70" y2="160" stroke="var(--viz-4)" stroke-width="2"/>
+        <text x="76" y="172" fill="var(--viz-4)" font-size="12">time to first token</text>
+        <line x1="600" y1="146" x2="600" y2="160" stroke="var(--fg-muted)" stroke-width="2"/>
+        <text x="480" y="184" fill="var(--fg-muted)" font-size="12">total time (about the same)</text>
+      </svg>
+      <figcaption>Streaming does not make the model faster. It moves the first visible output from the end of the
+        request to near the start.</figcaption>
+    </figure>
+    <p>Notice what the picture does <em>not</em> show: streaming does not shorten the total time, and it does not
+      change the tokens generated, the price, or the final text. The model does the same work. You simply get to
+      use the output earlier. Reasons to stream:</p>
+    <ol>
+      <li><strong>Perceived speed.</strong> A person reading a chat answer can start reading after a fraction of a
+        second instead of waiting for the whole paragraph. This is the reason every chat product streams.</li>
+      <li><strong>Long outputs and timeouts.</strong> A response of tens of thousands of tokens can take minutes. A
+        single HTTP response that sits silent for minutes is fragile: proxies and clients give up on idle
+        connections. A stream keeps data flowing. Current models can produce up to 128K output tokens, and large
+        <code>max_tokens</code> values need streaming; the SDK expects you to stream for them.</li>
+      <li><strong>Progress and early decisions.</strong> An agent that streams can show "thinking about X, calling
+        tool Y" while it works, and your code can react to a tool call the moment its block is complete.</li>
+    </ol>
+    <aside class="callout think"><p>You run a batch job overnight that classifies 50,000 support tickets, one short
+      answer each, and nobody watches it. Does streaming help? Mostly not: no one is waiting to read the first word,
+      and the answers are short. Streaming is a tool for latency people can feel and for long outputs, not a
+      default you must always switch on.</p></aside>
+    <aside class="callout note" data-title="About the mock">
+      <p>agentlab's <code>MockClient</code> has the real SDK's streaming surface, but it does not wait between
+        events: it builds the full scripted response first and then replays it as events, splitting text at word
+        boundaries. Everything about the <em>shape</em> of a stream is faithful; the timing is not. Later in this
+        module you will simulate timing with a fake clock.</p>
+    </aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> streaming cuts time to first token, not total time or
+      cost. Stream when a person is watching, when outputs are long, or when your code wants to act on partial
+      progress.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="text-stream">
+    <h2>Printing text as it arrives</h2>
+    <p>The SDK's streaming helper is <code>client.messages.stream(...)</code>. It takes exactly the same arguments as
+      <code>messages.create</code>: <code>model</code>, <code>max_tokens</code>, <code>messages</code>, and the
+      optional fields from <a href="m02-messages-api.html">M02</a> and <a href="m03-limits-stop-reasons.html">M03</a>.
+      Instead of a <code>Message</code>, it returns a <strong>stream object</strong> that you use as a context manager
+      (a <code>with</code> block), so the connection is closed when you are done, even if your code raises.</p>
+    <p>The simplest thing to do with a stream is read <code>stream.text_stream</code>: an iterator that yields only
+      the new pieces of text, as plain strings, in order.</p>
+    <div class="runnable" data-title="Stream a reply word by word">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Streaming shows each piece of the answer as soon as the model writes it."])
+
+with client.messages.stream(
+    model=al.MODEL,
+    max_tokens=256,
+    messages=[{"role": "user", "content": "In one sentence, what does streaming do?"}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+print()   # finish the line once the stream is done
+</textarea>
+    </div>
+    <p>Two details in that loop matter in real programs:</p>
+    <ul>
+      <li><code>end=""</code> stops <code>print</code> from adding a newline after every piece. The pieces already
+        contain their own spaces and newlines; adding more would scramble the text.</li>
+      <li><code>flush=True</code> forces Python to write to the terminal immediately. Without it, output may sit in a
+        buffer and appear in bursts, which defeats the purpose of streaming.</li>
+    </ul>
+    <p>To see the pieces themselves rather than the assembled sentence, print each one with <code>repr</code>. In the
+      mock, each piece is a word plus its trailing space. The real API's pieces are not words: they are whatever
+      chunk of tokens was ready, sometimes part of a word, sometimes several words. Never write code that assumes a
+      piece is a whole word.</p>
+    <div class="runnable" data-title="Look at the raw pieces" data-predict>
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Tokens arrive in order."])
+with client.messages.stream(model=al.MODEL, max_tokens=64,
+                            messages=[{"role": "user", "content": "Say something short."}]) as stream:
+    pieces = list(stream.text_stream)
+
+print(len(pieces))
+print(pieces)
+print("".join(pieces))
+</textarea>
+    </div>
+    <p>Here is the same code against the real API. The only change from the mock is how the client is created:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from the environment
+
+with client.messages.stream(
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "In one sentence, what does streaming do?"}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+print()</code></pre>
+    <aside class="callout warn"><p>A common mistake is collecting every piece into a list and printing it at the end.
+      That works, but it throws away the benefit: you have rebuilt a blocking call with more code. If you need the
+      complete text <em>and</em> want to show progress, print each piece as it arrives and also keep it (or ask the
+      stream for the final message, as the next sections show).</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>with client.messages.stream(...) as stream:</code>
+      then <code>for text in stream.text_stream: print(text, end="", flush=True)</code>. Pieces are arbitrary chunks
+      of text, not words.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="events">
+    <h2>Stream events: what actually comes over the wire</h2>
+    <p><code>text_stream</code> is a convenience. Underneath, the API sends a sequence of typed events that describe
+      the whole <code>Message</code> being built: its start, each content block, the pieces of each block, the
+      final stop reason, and the end. Recall from <a href="m02-messages-api.html">M02</a> that a response's
+      <code>content</code> is a <em>list of blocks</em>, each with a <code>type</code> such as <code>"text"</code>
+      or <code>"tool_use"</code>. The events mirror that structure exactly.</p>
+    <pre class="mermaid">
+flowchart TD
+  A["message_start<br/>(empty message: id, model, role)"] --> B["content_block_start index=0<br/>(empty block: type text)"]
+  B --> C["content_block_delta index=0<br/>text_delta: 'Hello '"]
+  C --> D["content_block_delta index=0<br/>text_delta: 'world.'"]
+  D --> E["content_block_stop index=0"]
+  E --> F["...more blocks, same pattern..."]
+  F --> G["message_delta<br/>stop_reason, usage.output_tokens"]
+  G --> H["message_stop"]
+    </pre>
+    <table>
+      <thead><tr><th>Event <code>type</code></th><th>When</th><th>What it carries</th></tr></thead>
+      <tbody>
+        <tr><td><code>message_start</code></td><td>Once, first</td><td><code>event.message</code>: a <code>Message</code> with an id and model but <em>empty</em> content</td></tr>
+        <tr><td><code>content_block_start</code></td><td>Once per block</td><td><code>event.index</code> (position in <code>content</code>) and <code>event.content_block</code>: an empty block that says its type (an empty <code>TextBlock</code>, or a <code>ToolUseBlock</code> with id and name but empty input)</td></tr>
+        <tr><td><code>content_block_delta</code></td><td>Many per block</td><td><code>event.index</code> and <code>event.delta</code>; <code>delta.type</code> is <code>"text_delta"</code> (new text in <code>delta.text</code>) or <code>"input_json_delta"</code> (a fragment of tool input JSON in <code>delta.partial_json</code>)</td></tr>
+        <tr><td><code>content_block_stop</code></td><td>Once per block</td><td><code>event.index</code>: this block is complete</td></tr>
+        <tr><td><code>message_delta</code></td><td>Near the end</td><td><code>event.delta.stop_reason</code>, <code>event.delta.stop_sequence</code>, and <code>event.usage.output_tokens</code></td></tr>
+        <tr><td><code>message_stop</code></td><td>Once, last</td><td>Nothing: the stream is over</td></tr>
+      </tbody>
+    </table>
+    <p>A <strong>delta</strong> is a change to apply: "append this text to block 0". The <strong>index</strong> tells
+      you which block the change belongs to. That is how one stream can carry several blocks, for example a
+      sentence of text (block 0) followed by a tool call (block 1).</p>
+    <p>You can iterate the stream object itself to get these events. Run this and match each printed line to a row of
+      the table:</p>
+    <div class="runnable" data-title="Print every event">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Hello from the stream."])
+with client.messages.stream(model=al.MODEL, max_tokens=64,
+                            messages=[{"role": "user", "content": "Greet me."}]) as stream:
+    for event in stream:
+        if event.type == "message_start":
+            print("message_start      id:", event.message.id, "content:", event.message.content)
+        elif event.type == "content_block_start":
+            print("content_block_start", event.index, event.content_block.type)
+        elif event.type == "content_block_delta":
+            print("content_block_delta", event.index, event.delta.type, repr(event.delta.text))
+        elif event.type == "content_block_stop":
+            print("content_block_stop ", event.index)
+        elif event.type == "message_delta":
+            print("message_delta      stop_reason:", event.delta.stop_reason,
+                  "output_tokens:", event.usage.output_tokens)
+        elif event.type == "message_stop":
+            print("message_stop")
+</textarea>
+    </div>
+    <p>Look at where <code>stop_reason</code> lives. In a plain call it is on the response; in a stream it arrives
+      in <code>message_delta</code>, near the very end, because the model does not know why it will stop until it
+      stops. Anything you would check on a finished response (<code>stop_reason</code>, the final
+      <code>usage.output_tokens</code>) is only known after the content has streamed.</p>
+    <aside class="callout warn"><p>Always branch on <code>event.type</code> and silently skip types you do not
+      handle. Do not write an <code>else: raise</code> for unknown events. The real SDK's helper can yield extra
+      convenience event types alongside the raw ones, and a robust consumer treats any event it does not recognise
+      as something to ignore, not an error.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> one <code>message_start</code>; for each block a
+      <code>content_block_start</code>, many <code>content_block_delta</code>s, and a
+      <code>content_block_stop</code>; then <code>message_delta</code> (stop reason and output tokens) and
+      <code>message_stop</code>. The <code>index</code> ties deltas to blocks.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="accumulate">
+    <h2>Rebuilding the message by hand</h2>
+    <p>The best way to understand events is to do what the SDK does: start with an empty message and apply each event
+      until you have the full response. This is called <strong>accumulating</strong> the stream. You will rarely
+      write it in production (the SDK does it for you), but once you have written it, nothing about streaming is
+      mysterious, and you can handle any custom need (forwarding events to a web page, logging per block, cutting a
+      stream short).</p>
+    <div class="runnable" data-title="An accumulator in twenty lines">
+<textarea>
+import agentlab as al
+
+def accumulate(events):
+    """Apply stream events in order and return (blocks, stop_reason, output_tokens)."""
+    blocks = []                       # one dict per content block, by index
+    stop_reason = None
+    output_tokens = 0
+    for event in events:
+        if event.type == "content_block_start":
+            blocks.append({"type": event.content_block.type, "text": ""})
+        elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+            blocks[event.index]["text"] += event.delta.text
+        elif event.type == "message_delta":
+            stop_reason = event.delta.stop_reason
+            output_tokens = event.usage.output_tokens
+    return blocks, stop_reason, output_tokens
+
+client = al.MockClient(["The stream is just the message, delivered in installments."])
+with client.messages.stream(model=al.MODEL, max_tokens=128,
+                            messages=[{"role": "user", "content": "Explain streams."}]) as stream:
+    blocks, stop_reason, output_tokens = accumulate(stream)
+
+print(blocks)
+print(stop_reason, output_tokens)
+</textarea>
+    </div>
+    <p>Notice the design: <code>blocks[event.index]</code> uses the index to find the block a delta belongs to, so
+      the function stays correct when a response has more than one block. A tempting shortcut is a single
+      <code>text = ""</code> that every delta is added to. It works for one text block and silently merges blocks
+      when there are several.</p>
+    <p>Accumulation also handles the stop reasons from <a href="m03-limits-stop-reasons.html">M03</a>. When the
+      output hits <code>max_tokens</code>, the stream simply ends early and <code>message_delta</code> says so.
+      Predict what this prints. The mock truncates at about four characters per token, so <code>max_tokens=4</code>
+      keeps about 16 characters:</p>
+    <div class="runnable" data-title="A truncated stream" data-predict>
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["This answer is much longer than the limit allows."])
+stream_events = client.messages.create(
+    model=al.MODEL, max_tokens=4, stream=True,
+    messages=[{"role": "user", "content": "Write a long answer."}],
+)
+text = ""
+stop_reason = None
+for event in stream_events:
+    if event.type == "content_block_delta":
+        text += event.delta.text
+    elif event.type == "message_delta":
+        stop_reason = event.delta.stop_reason
+print(repr(text))
+print(stop_reason)
+</textarea>
+    </div>
+    <p>A person watching that stream saw text appear and then stop mid-word. Your program must still check the stop
+      reason at the end: streaming does not remove the need for the handler you wrote in M03. If anything, it is
+      easier to forget, because the text "looked fine" while it was arriving.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> accumulate by <code>index</code>: start a block on
+      <code>content_block_start</code>, append on each delta, read <code>stop_reason</code> and
+      <code>output_tokens</code> from <code>message_delta</code>. Check the stop reason after the stream ends.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="final-message">
+    <h2><code>get_final_message()</code> and conversation history</h2>
+    <p>Writing an accumulator teaches the mechanism; in real code you call <code>stream.get_final_message()</code>.
+      It consumes whatever is left of the stream and returns the complete <code>Message</code>: the same object, with
+      the same <code>content</code> blocks, <code>stop_reason</code>, and <code>usage</code>, that
+      <code>messages.create</code> would have returned. The usual pattern streams the text for display and then asks
+      for the final message for everything else:</p>
+    <div class="runnable" data-title="Stream for display, keep the final message">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Paris is the capital of France.", "About 2.1 million people live in the city proper."])
+history = [{"role": "user", "content": "What is the capital of France?"}]
+
+with client.messages.stream(model=al.MODEL, max_tokens=256, messages=history) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+    final = stream.get_final_message()
+print()
+
+print("stop_reason:", final.stop_reason, "| output_tokens:", final.usage.output_tokens)
+history.append({"role": "assistant", "content": final.content})   # the blocks, as in M02
+
+history.append({"role": "user", "content": "How many people live there?"})
+with client.messages.stream(model=al.MODEL, max_tokens=256, messages=history) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+    final = stream.get_final_message()
+print()
+history.append({"role": "assistant", "content": final.content})
+
+print(al.format_transcript(history))
+</textarea>
+    </div>
+    <p>Everything you learned in <a href="m02-messages-api.html">M02</a> still holds. The API is stateless, so the
+      second request sends the whole history. You append <code>final.content</code> (the list of blocks), not just the
+      text, so that tool calls and other blocks survive. Streaming changes how the response <em>arrives</em>; it does
+      not change what you do with it.</p>
+    <p>One trap catches almost everyone once. A stream is a one-way pipe: each event can be read once. If you iterate
+      <code>text_stream</code> to the end and then iterate the stream again, there is nothing left. Predict the
+      output:</p>
+    <div class="runnable" data-title="A stream can be read only once" data-predict>
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["One two three."])
+with client.messages.stream(model=al.MODEL, max_tokens=64,
+                            messages=[{"role": "user", "content": "Count."}]) as stream:
+    first_pass = "".join(stream.text_stream)
+    second_pass = [event.type for event in stream]
+    final = stream.get_final_message()
+
+print(repr(first_pass))
+print(second_pass)
+print(final.content[0].text)
+</textarea>
+    </div>
+    <p>The second loop sees no events because <code>text_stream</code> already consumed them. But
+      <code>get_final_message()</code> still works: it returns the accumulated message no matter how much of the
+      stream you have read. So the rule is: read the events <em>one</em> way (either <code>text_stream</code> or
+      the events), then call <code>get_final_message()</code> for the complete result.</p>
+    <aside class="callout note" data-title="Mock convenience versus the real SDK">
+      <p>agentlab's <code>Message</code> has a <code>.text</code> property that joins all text blocks. The real SDK's
+        <code>Message</code> does not. Code you intend to run against the real API should join text blocks itself:
+        <code>"".join(b.text for b in final.content if b.type == "text")</code>.</p>
+    </aside>
+    <p>Errors behave as you would hope. The request is checked before any event is produced, so a bad request (a
+      sampling parameter, an assistant message last, a missing <code>max_tokens</code>) raises the same
+      <code>BadRequestError</code> or <code>TypeError</code> you saw in M03, at the moment the stream is opened,
+      before any text appears:</p>
+    <div class="runnable" data-title="Bad requests fail before the first event">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["never sent"])
+try:
+    with client.messages.stream(model=al.MODEL, max_tokens=64, temperature=0.2,
+                                messages=[{"role": "user", "content": "Hi"}]) as stream:
+        for text in stream.text_stream:
+            print(text, end="")
+except al.BadRequestError as e:
+    print("BadRequestError:", e)
+</textarea>
+    </div>
+    <aside class="callout tip"><p><strong>Remember:</strong> display with <code>text_stream</code>, then
+      <code>final = stream.get_final_message()</code> for <code>content</code>, <code>stop_reason</code> and
+      <code>usage</code>. Append <code>final.content</code> to history. A stream can be iterated only once.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="raw-stream">
+    <h2>The raw iterator: <code>create(stream=True)</code></h2>
+    <p>There is a second way to stream: pass <code>stream=True</code> to the ordinary <code>messages.create</code>.
+      Instead of a <code>Message</code>, it returns a plain iterator of the raw events from the table above. There is
+      no <code>text_stream</code>, no <code>get_final_message()</code>, and no context manager: you get the events,
+      and accumulating them is your job.</p>
+    <div class="runnable" data-title="Raw events from create(stream=True)">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Raw events, no helpers."])
+events = client.messages.create(
+    model=al.MODEL, max_tokens=64, stream=True,
+    messages=[{"role": "user", "content": "Describe the raw stream."}],
+)
+for event in events:
+    detail = event.delta.text if event.type == "content_block_delta" else ""
+    print(f"{event.type:22} {detail!r}")
+</textarea>
+    </div>
+    <p>A classic mistake is to switch on <code>stream=True</code> and keep the rest of the code unchanged:</p>
+    <div class="runnable" data-title="The iterator is not a Message">
+<textarea>
+import agentlab as al
+
+client = al.MockClient(["Hello."])
+response = client.messages.create(model=al.MODEL, max_tokens=64, stream=True,
+                                  messages=[{"role": "user", "content": "Hi"}])
+try:
+    print(response.content)
+except AttributeError:
+    print("AttributeError: an event iterator has no .content; accumulate the events instead")
+</textarea>
+    </div>
+    <p>Which should you use?</p>
+    <div class="card-grid">
+      <div class="card"><h4><code>messages.stream(...)</code></h4><p>The default choice. Gives you
+        <code>text_stream</code> for display, events if you want them, and <code>get_final_message()</code> so you
+        never have to accumulate by hand. Use it in agents and chat interfaces.</p></div>
+      <div class="card"><h4><code>create(..., stream=True)</code></h4><p>The low-level choice. Use it when you are
+        forwarding raw events somewhere else (for example relaying them to a browser), or when you want full control
+        and fewer abstractions. You accumulate yourself.</p></div>
+    </div>
+    <p>The real SDK forms are the same calls on <code>anthropic.Anthropic()</code>; again the only change is the
+      client:</p>
+    <pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+events = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Describe the raw stream."}],
+    stream=True,
+)
+for event in events:
+    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+        print(event.delta.text, end="", flush=True)</code></pre>
+    <aside class="callout tip"><p><strong>Remember:</strong> <code>create(stream=True)</code> returns an iterator of
+      raw events, not a <code>Message</code>. Prefer <code>messages.stream(...)</code> unless you need the raw
+      events themselves.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="tool-input">
+    <h2>Streaming tool calls: <code>input_json_delta</code></h2>
+    <p>Tools are the subject of Stage 2 (<a href="m07-tools-as-contracts.html">M07</a> onward), but you should see
+      now how they look in a stream, because agents stream tool calls all the time. In brief: when a model wants to
+      use a tool, its response contains a <code>tool_use</code> block with an <code>id</code>, a tool
+      <code>name</code>, and an <code>input</code> dict of arguments, and the <code>stop_reason</code> is
+      <code>"tool_use"</code>.</p>
+    <p>In a stream, a <code>tool_use</code> block starts with <code>content_block_start</code> carrying the id and
+      name and an <em>empty</em> input. The input then arrives as <code>input_json_delta</code> events, each holding a
+      fragment of a JSON string in <code>delta.partial_json</code>. Only when you have all the fragments (at
+      <code>content_block_stop</code>) do you have valid JSON to parse.</p>
+    <div class="runnable" data-title="Watch a tool call stream in">
+<textarea>
+import agentlab as al
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}, "units": {"type": "string"}},
+                     "required": ["city"]},
+}]
+client = al.MockClient([
+    al.tool_call("get_weather", {"city": "Paris", "units": "celsius"}, text="Let me check the weather."),
+])
+events = client.messages.create(model=al.MODEL, max_tokens=256, tools=TOOLS, stream=True,
+                                messages=[{"role": "user", "content": "Weather in Paris?"}])
+for event in events:
+    if event.type == "content_block_start":
+        block = event.content_block
+        print(f"start  [{event.index}] {block.type}", getattr(block, "name", ""))
+    elif event.type == "content_block_delta":
+        piece = event.delta.text if event.delta.type == "text_delta" else event.delta.partial_json
+        print(f"delta  [{event.index}] {event.delta.type:16} {piece!r}")
+    elif event.type == "content_block_stop":
+        print(f"stop   [{event.index}]")
+    elif event.type == "message_delta":
+        print("stop_reason:", event.delta.stop_reason)
+</textarea>
+    </div>
+    <p>The fragments are pieces of a string, cut wherever the generator happened to be, not neat key-value pairs. A
+      fragment such as <code>', "units": "cels'</code> is not JSON on its own. Try to parse fragments early and you
+      get exceptions:</p>
+    <div class="runnable" data-title="Parse at the end, not along the way">
+<textarea>
+import json
+
+fragments = ['{"city": "Paris"', ', "units": "cels', 'ius"}']
+
+buffer = ""
+for fragment in fragments:
+    buffer += fragment
+    try:
+        json.loads(buffer)
+        print("parsed:", buffer)
+    except json.JSONDecodeError as e:
+        print("not yet valid JSON:", repr(buffer), "-", e.msg)
+
+print("final input:", json.loads(buffer))
+</textarea>
+    </div>
+    <p>The correct pattern: keep one string buffer per block index; append each <code>partial_json</code>; on
+      <code>content_block_stop</code>, <code>json.loads</code> the buffer once. (Some tools have no arguments; a
+      buffer that is still empty at the stop event means the input is <code>{}</code>.) You will write exactly this
+      in the practice section. With <code>messages.stream(...)</code>, <code>get_final_message()</code> does it for
+      you and gives you <code>ToolUseBlock</code>s whose <code>input</code> is already a dict.</p>
+    <aside class="callout pro"><p>Why would anyone handle tool deltas by hand? A user interface can show "Calling
+      get_weather..." as soon as <code>content_block_start</code> names the tool, long before the arguments finish.
+      For tools with large inputs (a whole file to write, say), that early signal matters. For running the tool
+      itself, always wait for the complete block.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> a <code>tool_use</code> block's id and name come in
+      <code>content_block_start</code>; its input comes as <code>input_json_delta</code> fragments. Buffer them by
+      index and parse once at <code>content_block_stop</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="ttft">
+    <h2>Measuring time to first token</h2>
+    <p>Latency is something you measure, not guess. For a streamed call you want two numbers: TTFT (request sent to
+      first text delta) and total time (request sent to <code>message_stop</code>). In a local script you take
+      timestamps with <code>time.perf_counter()</code>, a clock meant for measuring short intervals:</p>
+    <div class="runnable" data-title="Timing a real stream" data-local="Calls the real Claude API through al.get_client(); run it locally with pixi run python after adding the anthropic package and setting ANTHROPIC_API_KEY.">
+<textarea>
+import time
+import agentlab as al
+
+client = al.get_client()
+start = time.perf_counter()
+first_token_at = None
+with client.messages.stream(
+    model=al.MODEL,
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Write a short paragraph about rivers."}],
+) as stream:
+    for text in stream.text_stream:
+        if first_token_at is None:
+            first_token_at = time.perf_counter()
+        print(text, end="", flush=True)
+    final = stream.get_final_message()
+end = time.perf_counter()
+
+print()
+print(f"time to first token: {first_token_at - start:.2f}s")
+print(f"total time:          {end - start:.2f}s")
+print(f"output tokens/sec:   {final.usage.output_tokens / (end - first_token_at):.1f}")
+</textarea>
+    </div>
+    <p>In the browser the mock replays instantly, so real clocks would show zero. Instead, simulate a model with a
+      fake clock: a generator that pretends the first token takes 0.8 seconds (the model reading your prompt and
+      starting) and each later piece 0.05 seconds. This separates the <em>shape</em> of latency from any real
+      network.</p>
+    <div class="runnable" data-title="Simulated latency: blocking versus streaming">
+<textarea>
+import agentlab as al
+
+def timed(events, first_delay=0.8, per_event=0.05):
+    """Pair each event with a simulated arrival time in seconds."""
+    clock = 0.0
+    seen_delta = False
+    for event in events:
+        if event.type == "content_block_delta" and not seen_delta:
+            clock += first_delay
+            seen_delta = True
+        else:
+            clock += per_event
+        yield round(clock, 2), event
+
+answer = "Rivers carve valleys over millions of years, carrying sediment from mountains to the sea. " * 3
+client = al.MockClient([answer])
+events = client.messages.create(model=al.MODEL, max_tokens=512, stream=True,
+                                messages=[{"role": "user", "content": "Tell me about rivers."}])
+
+ttft = None
+total = 0.0
+for t, event in timed(events):
+    if ttft is None and event.type == "content_block_delta":
+        ttft = t
+    total = t
+
+print(f"streaming: first words visible after {ttft}s, complete after {total}s")
+print(f"blocking:  first words visible after {total}s, complete after {total}s")
+</textarea>
+    </div>
+    <p>Same total, very different experience. What drives the two numbers (from <a href="m01-llm-calls.html">M01</a>):
+      TTFT grows with the size of the input the model must read and with network distance; total time grows mainly
+      with the number of output tokens. A huge prompt with a one-word answer has slow TTFT and a short tail; a short
+      prompt asking for an essay has fast TTFT and a long tail. Higher <code>output_config.effort</code> can also add
+      time before the visible answer starts, because the model may think first.</p>
+    <aside class="callout warn"><p>Measure TTFT at the first <em>text</em> delta, not at <code>message_start</code>.
+      <code>message_start</code> arrives before any content and makes your numbers look better than what a person
+      experiences.</p></aside>
+    <aside class="callout tip"><p><strong>Remember:</strong> TTFT = first text delta minus request start; total =
+      last event minus request start. Use <code>time.perf_counter()</code> locally. Input size drives TTFT, output
+      length drives the tail.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="agents-stream">
+    <h2>Why agents stream</h2>
+    <p>From <a href="m09-agent-loop.html">M09</a> on you will build agents: a loop that calls the model, runs any
+      tools it asks for, and calls it again until it ends its turn. Each iteration is one request. A run of ten
+      iterations with no streaming is ten silent waits in a row; a user sees a frozen screen for a minute and then a
+      wall of text. Streaming every iteration lets the interface show the model's words and each tool call as they
+      happen.</p>
+    <p>The loop logic itself does not change. Streaming is a different way of receiving each response; the agent still
+      looks at <code>final.stop_reason</code> and <code>final.content</code>. Here is one iteration's worth, written
+      so that the display and the loop logic are cleanly separated:</p>
+    <div class="runnable" data-title="One streamed agent step">
+<textarea>
+import agentlab as al
+
+TOOLS = [{"name": "get_time", "description": "Current time in a city.",
+          "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+client = al.MockClient([al.tool_call("get_time", {"city": "Tokyo"}, text="I'll look that up.")])
+history = [{"role": "user", "content": "What time is it in Tokyo?"}]
+
+with client.messages.stream(model=al.MODEL, max_tokens=512, tools=TOOLS, messages=history) as stream:
+    for event in stream:
+        if event.type == "content_block_delta" and event.delta.type == "text_delta":
+            print(event.delta.text, end="", flush=True)
+        elif event.type == "content_block_start" and event.content_block.type == "tool_use":
+            print(f"\n[calling {event.content_block.name}...]")
+    final = stream.get_final_message()
+
+history.append({"role": "assistant", "content": final.content})
+print("stop_reason:", final.stop_reason)
+for block in final.content:
+    if block.type == "tool_use":
+        print("run tool:", block.name, block.input, "id:", block.id)
+</textarea>
+    </div>
+    <p>The display code reacts to events; the agent code reads the final message. Keep those two jobs apart and
+      adding streaming to an existing agent becomes a small, safe change.</p>
+    <aside class="callout tip"><p><strong>Remember:</strong> agents stream for visibility, not for different logic.
+      React to events for display; make decisions from <code>get_final_message()</code>.</p></aside>
+  </section>
+
+  <section class="lesson-section" id="practice">
+    <h2>Practice</h2>
+    <p>Exercises run in the browser against the mock and are graded instantly. Each test builds its own
+      <code>MockClient</code>, so your functions must take the client (or the events) as an argument.</p>
+
+    <div class="exercise" data-id="m04-e1" data-title="Stream and return the text">
+      <div class="exercise-prompt">
+        <p>Write <code>stream_text(client, prompt)</code>. It sends <code>prompt</code> as a single user message with
+          <code>model=al.MODEL</code> and <code>max_tokens=512</code> using <code>client.messages.stream</code>,
+          prints each text piece as it arrives (no extra newlines or spaces), and <em>returns</em> the complete
+          text.</p>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def stream_text(client, prompt):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_returns_full_text():
+    client = al.MockClient(["Streams deliver text in pieces."])
+    result, printed = capture_output(stream_text, client, "Tell me about streams.")
+    assert result == "Streams deliver text in pieces.", f"return the complete text, got {result!r}"
+
+def test_prints_pieces_exactly():
+    client = al.MockClient(["One two three four."])
+    result, printed = capture_output(stream_text, client, "Count.")
+    assert printed == "One two three four.", f"print each piece with end='' so the output equals the text, got {printed!r}"
+
+def test_request_shape():
+    client = al.MockClient(["ok"])
+    capture_output(stream_text, client, "Hi there")
+    req = client.requests[0]
+    assert req.max_tokens == 512, "use max_tokens=512"
+    assert req.messages == [{"role": "user", "content": "Hi there"}], "send the prompt as one user message"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Open the stream with <code>with client.messages.stream(...) as
+        stream:</code>, loop over <code>stream.text_stream</code>, print with <code>end=""</code>, and append each
+        piece to a list you join at the end.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def stream_text(client, prompt):
+    pieces = []
+    with client.messages.stream(
+        model=al.MODEL,
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            pieces.append(text)
+    return "".join(pieces)</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e2" data-title="Count events by type">
+      <div class="exercise-prompt">
+        <p>Write <code>count_events(events)</code> that takes any iterable of stream events and returns a dict
+          mapping each event <code>type</code> to how many times it occurred, plus a key <code>"text_deltas"</code>
+          counting only the deltas whose <code>delta.type</code> is <code>"text_delta"</code>.</p>
+        <p>For a single text block streamed in three pieces the result is
+          <code>{"message_start": 1, "content_block_start": 1, "content_block_delta": 3, "content_block_stop": 1,
+          "message_delta": 1, "message_stop": 1, "text_deltas": 3}</code>.</p>
+      </div>
+<textarea class="starter">
+def count_events(events):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def _events(script, **extra):
+    client = al.MockClient(script)
+    return client.messages.create(model=al.MODEL, max_tokens=256, stream=True,
+                                  messages=[{"role": "user", "content": "go"}], **extra)
+
+def test_single_text_block():
+    counts = count_events(_events(["one two three"]))
+    expected = {"message_start": 1, "content_block_start": 1, "content_block_delta": 3,
+                "content_block_stop": 1, "message_delta": 1, "message_stop": 1, "text_deltas": 3}
+    assert counts == expected, f"expected {expected}, got {counts}"
+
+def test_tool_deltas_are_not_text_deltas():
+    tools = [{"name": "lookup", "description": "Look something up.",
+              "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}]
+    counts = count_events(_events([al.tool_call("lookup", {"q": "a fairly long query string here"}, text="Hi there.")],
+                                  tools=tools))
+    assert counts.get("text_deltas") == 2, f"only text_delta events count as text_deltas, got {counts.get('text_deltas')}"
+    assert counts.get("content_block_start") == 2, "a text block and a tool_use block make two content_block_start events"
+    assert counts.get("content_block_delta", 0) > 2, "tool input arrives as extra content_block_delta events"
+
+def test_text_deltas_key_always_present():
+    tools = [{"name": "ping", "description": "Ping.", "input_schema": {"type": "object", "properties": {}}}]
+    counts = count_events(_events([al.tool_call("ping", {})], tools=tools))
+    assert counts.get("text_deltas") == 0, "include 'text_deltas': 0 when there is no text"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Start with <code>counts = {"text_deltas": 0}</code>. For each
+        event, increase <code>counts[event.type]</code> with <code>counts.get(event.type, 0) + 1</code>, and also
+        increase <code>"text_deltas"</code> when <code>event.type == "content_block_delta"</code> and
+        <code>event.delta.type == "text_delta"</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def count_events(events):
+    counts = {"text_deltas": 0}
+    for event in events:
+        counts[event.type] = counts.get(event.type, 0) + 1
+        if event.type == "content_block_delta" and event.delta.type == "text_delta":
+            counts["text_deltas"] += 1
+    return counts</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e3" data-title="Accumulate a stream by hand">
+      <div class="exercise-prompt">
+        <p>Write <code>accumulate(events)</code> that rebuilds a response from raw events (no
+          <code>get_final_message</code> available: the tests pass you the iterator from
+          <code>create(stream=True)</code>). Return a dict with:</p>
+        <ul>
+          <li><code>"text"</code>: all text from text blocks, joined in order</li>
+          <li><code>"stop_reason"</code>: from <code>message_delta</code></li>
+          <li><code>"output_tokens"</code>: from <code>message_delta</code>'s <code>usage</code></li>
+          <li><code>"blocks"</code>: the list of block types in order, such as <code>["text"]</code></li>
+        </ul>
+      </div>
+<textarea class="starter">
+def accumulate(events):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def _final_and_events(script, max_tokens=256, **extra):
+    msgs = [{"role": "user", "content": "go"}]
+    final = al.MockClient(list(script)).messages.create(model=al.MODEL, max_tokens=max_tokens, messages=msgs, **extra)
+    events = al.MockClient(list(script)).messages.create(model=al.MODEL, max_tokens=max_tokens, messages=msgs,
+                                                         stream=True, **extra)
+    return final, events
+
+def test_plain_text():
+    final, events = _final_and_events(["Accumulating is just appending deltas."])
+    result = accumulate(events)
+    assert result["text"] == final.text, f"text should be {final.text!r}, got {result['text']!r}"
+    assert result["stop_reason"] == "end_turn", "read stop_reason from message_delta"
+    assert result["output_tokens"] == final.usage.output_tokens, "read output_tokens from message_delta's usage"
+    assert result["blocks"] == ["text"], "one text block expected"
+
+def test_truncated():
+    final, events = _final_and_events(["This is a long answer that will be cut off early."], max_tokens=3)
+    result = accumulate(events)
+    assert result["stop_reason"] == "max_tokens", "a truncated stream reports max_tokens in message_delta"
+    assert result["text"] == final.text, f"keep the partial text {final.text!r}, got {result['text']!r}"
+
+def test_text_and_tool():
+    tools = [{"name": "search", "description": "Search.",
+              "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}]
+    final, events = _final_and_events([al.tool_call("search", {"q": "rivers"}, text="Searching now.")], tools=tools)
+    result = accumulate(events)
+    assert result["blocks"] == ["text", "tool_use"], f"block types in order, got {result['blocks']}"
+    assert result["text"] == "Searching now.", "only text deltas contribute to text"
+    assert result["stop_reason"] == "tool_use", "stop_reason should be tool_use"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Record <code>event.content_block.type</code> on each
+        <code>content_block_start</code>. Append <code>event.delta.text</code> only for
+        <code>text_delta</code> deltas. On <code>message_delta</code>, read <code>event.delta.stop_reason</code> and
+        <code>event.usage.output_tokens</code>.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def accumulate(events):
+    result = {"text": "", "stop_reason": None, "output_tokens": 0, "blocks": []}
+    for event in events:
+        if event.type == "content_block_start":
+            result["blocks"].append(event.content_block.type)
+        elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+            result["text"] += event.delta.text
+        elif event.type == "message_delta":
+            result["stop_reason"] = event.delta.stop_reason
+            result["output_tokens"] = event.usage.output_tokens
+    return result</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e4" data-title="Rebuild tool calls from input_json_delta">
+      <div class="exercise-prompt">
+        <p>Write <code>rebuild_tool_calls(events)</code> that returns a list of dicts
+          <code>{"id": ..., "name": ..., "input": {...}}</code>, one per <code>tool_use</code> block, in order. Take
+          the id and name from <code>content_block_start</code>, buffer each block's <code>partial_json</code>
+          fragments by <code>index</code>, and parse the buffer with <code>json.loads</code> at
+          <code>content_block_stop</code>. An empty buffer means the input is <code>{}</code>. Ignore text blocks.</p>
+      </div>
+<textarea class="starter">
+import json
+
+def rebuild_tool_calls(events):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+TOOLS = [
+    {"name": "get_weather", "description": "Weather.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_time", "description": "Time.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "ping", "description": "Ping.", "input_schema": {"type": "object", "properties": {}}},
+]
+
+def _events(step):
+    client = al.MockClient([step])
+    return client.messages.create(model=al.MODEL, max_tokens=1024, tools=TOOLS, stream=True,
+                                  messages=[{"role": "user", "content": "go"}])
+
+def test_single_call():
+    calls = rebuild_tool_calls(_events(al.tool_call("get_weather", {"city": "Lagos", "units": "celsius"}, id="toolu_1")))
+    assert calls == [{"id": "toolu_1", "name": "get_weather", "input": {"city": "Lagos", "units": "celsius"}}], \
+        f"got {calls}"
+
+def test_parallel_calls_with_text():
+    step = al.tool_calls([("get_weather", {"city": "Oslo", "note": "a long note so the JSON spans several fragments"}),
+                          ("get_time", {"city": "Oslo"})], text="Checking both.", ids=["toolu_a", "toolu_b"])
+    calls = rebuild_tool_calls(_events(step))
+    assert [c["id"] for c in calls] == ["toolu_a", "toolu_b"], f"one dict per tool_use block, in order; got {calls}"
+    assert calls[0]["input"]["note"].startswith("a long note"), "join every fragment of a block before parsing"
+    assert calls[1] == {"id": "toolu_b", "name": "get_time", "input": {"city": "Oslo"}}, f"got {calls[1]}"
+
+def test_empty_input():
+    calls = rebuild_tool_calls(_events(al.tool_call("ping", {}, id="toolu_p")))
+    assert calls == [{"id": "toolu_p", "name": "ping", "input": {}}], f"empty input should be {{}}, got {calls}"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Keep two dicts keyed by index: <code>starts</code> (the block
+        from <code>content_block_start</code>, only when its type is <code>"tool_use"</code>) and
+        <code>buffers</code> (a string). On <code>content_block_stop</code>, if the index is in
+        <code>starts</code>, parse <code>buffers[index] or "{}"</code> and append the dict.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import json
+
+def rebuild_tool_calls(events):
+    starts = {}
+    buffers = {}
+    calls = []
+    for event in events:
+        if event.type == "content_block_start" and event.content_block.type == "tool_use":
+            starts[event.index] = event.content_block
+            buffers[event.index] = ""
+        elif event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+            buffers[event.index] += event.delta.partial_json
+        elif event.type == "content_block_stop" and event.index in starts:
+            block = starts[event.index]
+            calls.append({"id": block.id, "name": block.name, "input": json.loads(buffers[event.index] or "{}")})
+    return calls</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e5" data-title="Time to first token">
+      <div class="exercise-prompt">
+        <p>Write <code>latency(timed_events)</code>. It receives a list of <code>(seconds, event)</code> pairs, where
+          <code>seconds</code> is the arrival time measured from when the request was sent. Return a tuple
+          <code>(ttft, total)</code>: <code>ttft</code> is the time of the first <code>text_delta</code> (or
+          <code>None</code> if there is no text at all), and <code>total</code> is the time of the last event
+          (<code>0.0</code> for an empty list).</p>
+      </div>
+<textarea class="starter">
+def latency(timed_events):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def _timed(step, times, tools=None):
+    client = al.MockClient([step])
+    extra = {"tools": tools} if tools else {}
+    events = list(client.messages.create(model=al.MODEL, max_tokens=256, stream=True,
+                                         messages=[{"role": "user", "content": "go"}], **extra))
+    return list(zip(times(len(events)), events))
+
+def test_text_response():
+    pairs = _timed("alpha beta gamma", lambda n: [0.1, 0.2, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0][:n])
+    assert latency(pairs) == (1.5, 2.0), f"first text_delta at 1.5s, last event at 2.0s; got {latency(pairs)}"
+
+def test_not_message_start():
+    pairs = _timed("hi", lambda n: [0.05 * (i + 1) for i in range(n)])
+    ttft, total = latency(pairs)
+    assert ttft == pairs[2][0], "measure at the first text_delta, not at message_start or content_block_start"
+
+def test_tool_only_has_no_ttft():
+    tools = [{"name": "ping", "description": "Ping.", "input_schema": {"type": "object", "properties": {}}}]
+    pairs = _timed(al.tool_call("ping", {"x": 1}), lambda n: [float(i) for i in range(1, n + 1)], tools)
+    ttft, total = latency(pairs)
+    assert ttft is None, "input_json_delta is not text: with no text_delta, ttft is None"
+    assert total == pairs[-1][0], "total is the time of the last event"
+
+def test_empty():
+    assert latency([]) == (None, 0.0), "an empty list gives (None, 0.0)"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Loop over the pairs. Set <code>ttft</code> the first time you
+        see a <code>content_block_delta</code> whose <code>delta.type</code> is <code>"text_delta"</code>; update
+        <code>total</code> on every pair.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">def latency(timed_events):
+    ttft = None
+    total = 0.0
+    for seconds, event in timed_events:
+        if ttft is None and event.type == "content_block_delta" and event.delta.type == "text_delta":
+            ttft = seconds
+        total = seconds
+    return ttft, total</code></pre>
+      </details>
+    </div>
+
+    <div class="exercise" data-id="m04-e6" data-title="A streamed chat turn that keeps history">
+      <div class="exercise-prompt">
+        <p>Write <code>stream_turn(client, history, user_text, on_text)</code> for a streaming chat program. It must:</p>
+        <ol>
+          <li>append <code>{"role": "user", "content": user_text}</code> to <code>history</code> (mutate the list you
+            are given);</li>
+          <li>stream a reply with <code>model=al.MODEL</code>, <code>max_tokens=1024</code> and the whole history,
+            calling <code>on_text(piece)</code> for every text piece;</li>
+          <li>append the assistant turn using the final message's <code>content</code> blocks;</li>
+          <li>return the final message.</li>
+        </ol>
+      </div>
+<textarea class="starter">
+import agentlab as al
+
+def stream_turn(client, history, user_text, on_text):
+    ...
+</textarea>
+      <script type="text/x-python" class="tests">
+import agentlab as al
+
+def test_two_turns():
+    client = al.MockClient(["Hello! How can I help?", "Rivers flow downhill."])
+    history = []
+    seen = []
+    first = stream_turn(client, history, "Hi", seen.append)
+    assert "".join(seen) == "Hello! How can I help?", "call on_text with every text piece, in order"
+    assert first.stop_reason == "end_turn", "return the final Message from get_final_message()"
+    second = stream_turn(client, history, "Tell me about rivers.", seen.append)
+    assert len(history) == 4, f"history should hold user, assistant, user, assistant; it has {len(history)} items"
+    assert [m["role"] for m in history] == ["user", "assistant", "user", "assistant"], "roles must alternate"
+    sent = client.requests[1].messages
+    assert len(sent) == 3, "the second request must send the whole history (3 messages)"
+    assert isinstance(history[1]["content"], list), "append final.content (the list of blocks), not the text"
+    assert second.content[0].text == "Rivers flow downhill.", "return the second final message"
+
+def test_request_settings():
+    client = al.MockClient(["ok"])
+    stream_turn(client, [], "x", lambda piece: None)
+    assert client.requests[0].max_tokens == 1024, "use max_tokens=1024"
+      </script>
+      <details class="hint"><summary>Hint</summary><p>Append the user message first, then open
+        <code>client.messages.stream(..., messages=history)</code>. Loop over <code>text_stream</code> calling
+        <code>on_text</code>, then call <code>stream.get_final_message()</code> before leaving the
+        <code>with</code> block.</p></details>
+      <details class="solution"><summary>Show solution</summary>
+<pre><code class="language-python">import agentlab as al
+
+def stream_turn(client, history, user_text, on_text):
+    history.append({"role": "user", "content": user_text})
+    with client.messages.stream(model=al.MODEL, max_tokens=1024, messages=history) as stream:
+        for piece in stream.text_stream:
+            on_text(piece)
+        final = stream.get_final_message()
+    history.append({"role": "assistant", "content": final.content})
+    return final</code></pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="mini-project">
+    <h2>Mini-project</h2>
+    <div class="project-box">
+      <div class="widget-head"><span class="w-kind">Mini-project</span><span class="w-title">stream_chat.py: a terminal chat with latency stats</span></div>
+      <div class="widget-body">
+        <p>Build a terminal chat that streams every answer and reports how fast it was. It uses the real API when the
+          <code>anthropic</code> package and a key are available, and falls back to a scripted
+          <code>MockClient</code> otherwise, so you can develop it offline.</p>
+        <pre data-label="Terminal"><code class="language-bash">mkdir stream-chat &amp;&amp; cd stream-chat
+pixi init
+pixi add python=3.14 anthropic structlog
+# install agentlab from this repository as an editable path dependency, or copy the mock fallback idea
+pixi run python stream_chat.py</code></pre>
+        <p><strong>Structure</strong></p>
+        <ul>
+          <li><code>make_client()</code>: try <code>al.get_client()</code>; on
+            <code>al.LiveModelUnavailableError</code> return a <code>MockClient</code> with a
+            <code>responder=</code> function that echoes the user's last message.</li>
+          <li><code>stream_turn(client, history, user_text, on_text, clock=time.perf_counter)</code>: your exercise
+            m04-e6 solution, extended to return a small stats dict (<code>ttft</code>, <code>total</code>,
+            <code>output_tokens</code>, <code>stop_reason</code>). Taking <code>clock</code> as a parameter lets tests
+            pass a fake clock.</li>
+          <li><code>main()</code>: a loop that reads a line, streams the answer to the terminal, then logs one structured
+            event per turn with structlog (for example <code>log.info("turn", ttft=..., total=..., output_tokens=...)</code>).
+            Structured logs give you machine-readable numbers you can aggregate later, which a <code>print</code> line
+            does not.</li>
+        </ul>
+        <ul class="checklist" data-id="m04-mini">
+          <li>Answers appear piece by piece, with <code>flush=True</code>, and no stray newlines between pieces</li>
+          <li>The history list holds every turn and the assistant turns store <code>final.content</code></li>
+          <li>TTFT is measured at the first text piece, total at the end of the stream</li>
+          <li>A <code>max_tokens</code> stop prints a visible "(answer truncated)" note</li>
+          <li>The program runs offline with the mock fallback and online with a real key, with no code changes</li>
+          <li>A test file checks <code>stream_turn</code> with a <code>MockClient</code> and a fake clock</li>
+          <li>No API key appears anywhere in the code; it comes from the environment</li>
+        </ul>
+        <p><strong>Stretch goals:</strong> add a <code>/effort low|medium|high</code> command that sets
+          <code>output_config</code> and compare TTFT across levels; print <code>[calling tool...]</code> markers by
+          watching <code>content_block_start</code>; keep a running cost estimate from <code>usage</code> using the
+          prices in <a href="m01-llm-calls.html">M01</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="quiz">
+    <h2>Quiz</h2>
+    <div class="quiz" data-id="m04-quiz">
+      <script type="application/json">
+      {"title": "Streaming quiz", "passScore": 0.7, "questions": [
+        {"type": "single", "prompt": "Compared with the same request without streaming, what does streaming mainly improve?", "options": ["Total time to the complete answer", "Time to first token: how soon the first output is visible", "The price per output token", "The quality of the answer"], "answer": 1,
+         "explanation": "<p>The model does the same work either way. Streaming delivers output as it is generated, so the first words arrive near the start instead of at the end. Total time, tokens, and cost are essentially unchanged.</p>"},
+        {"type": "multi", "prompt": "Which events appear in every successful streamed response that contains one text block?", "options": ["<code>message_start</code>", "<code>content_block_start</code>", "<code>input_json_delta</code> deltas", "<code>message_delta</code>", "<code>message_stop</code>"], "answer": [0, 1, 3, 4],
+         "explanation": "<p>Every stream starts with <code>message_start</code> and ends with <code>message_delta</code> then <code>message_stop</code>; each block has a <code>content_block_start</code>. <code>input_json_delta</code> only appears for <code>tool_use</code> blocks.</p>"},
+        {"type": "single", "prompt": "Where do you find the <code>stop_reason</code> in a raw event stream?", "options": ["In <code>message_start</code>", "In every <code>content_block_delta</code>", "In <code>message_delta</code>", "In <code>message_stop</code>"], "answer": 2,
+         "explanation": "<p>The model only knows why it stopped once it has stopped, so <code>stop_reason</code> (and the final <code>usage.output_tokens</code>) arrive in <code>message_delta</code>, after all the content.</p>"},
+        {"type": "output", "prompt": "The mock splits text at word boundaries. What does this print?", "code": "import agentlab as al\nclient = al.MockClient([\"red green blue\"])\nevents = client.messages.create(model=al.MODEL, max_tokens=64, stream=True,\n    messages=[{\"role\": \"user\", \"content\": \"colors\"}])\nprint(sum(1 for e in events if e.type == \"content_block_delta\"))", "answer": "3",
+         "explanation": "<p>The text arrives as three <code>text_delta</code> pieces: <code>'red '</code>, <code>'green '</code>, <code>'blue'</code>. The real API chunks differently, so never assume one piece per word.</p>"},
+        {"type": "single", "prompt": "You loop over <code>stream.text_stream</code> to the end, then loop over <code>stream</code> itself. What does the second loop see?", "options": ["Every event again, from the start", "Only the text events", "Nothing: the events were already consumed", "A <code>RuntimeError</code>"], "answer": 2,
+         "explanation": "<p>A stream is read once. <code>text_stream</code> consumed the events; the second loop finds none. <code>get_final_message()</code> still returns the complete message, so use it after reading the stream one way.</p>"},
+        {"type": "single", "prompt": "When should you call <code>json.loads</code> on a tool call's streamed input?", "options": ["On every <code>input_json_delta</code> fragment", "On <code>content_block_start</code>", "Once, on that block's <code>content_block_stop</code>, after joining all fragments", "On <code>message_start</code>"], "answer": 2,
+         "explanation": "<p>Fragments are arbitrary slices of a JSON string, such as <code>', \"units\": \"cels'</code>, which are not valid JSON on their own. Buffer them by index and parse once the block stops.</p>"},
+        {"type": "text", "prompt": "Which method on the stream object returns the complete <code>Message</code> after (or instead of) reading events?", "answer": ["get_final_message", "get_final_message()", "stream.get_final_message()"],
+         "explanation": "<p><code>stream.get_final_message()</code> consumes anything left and returns the accumulated <code>Message</code> with <code>content</code>, <code>stop_reason</code> and <code>usage</code>.</p>"},
+        {"type": "multi", "prompt": "Which are good reasons to stream?", "options": ["A person is watching the answer appear", "The output may be very long, with a large <code>max_tokens</code>", "Streaming makes requests cheaper", "An agent's interface should show progress and tool calls as they happen"], "answer": [0, 1, 3],
+         "explanation": "<p>Streaming helps perceived latency, keeps long responses from sitting silent on one connection, and lets interfaces show progress. It does not change token counts or price.</p>"},
+        {"type": "single", "prompt": "What does <code>client.messages.create(..., stream=True)</code> return?", "options": ["A <code>Message</code> whose content fills in over time", "An iterator of raw stream events", "A context manager with <code>text_stream</code>", "The text as a string"], "answer": 1,
+         "explanation": "<p>It returns the raw events. There is no <code>text_stream</code> or <code>get_final_message()</code>; you accumulate yourself. Reading <code>.content</code> on it raises <code>AttributeError</code>.</p>"},
+        {"type": "single", "prompt": "What does the <code>index</code> on a <code>content_block_delta</code> tell you?", "options": ["How many deltas came before it", "Which content block (position in <code>content</code>) the delta belongs to", "The token number in the response", "The request number"], "answer": 1,
+         "explanation": "<p>A response can hold several blocks, such as text then a tool call. The index ties each delta to its block so an accumulator appends to the right one.</p>"},
+        {"type": "text", "prompt": "What is the <code>delta.type</code> of the events that carry fragments of a tool call's input?", "answer": ["input_json_delta"],
+         "explanation": "<p><code>input_json_delta</code> events carry <code>partial_json</code> fragments; <code>text_delta</code> events carry <code>text</code>.</p>"},
+        {"type": "single", "prompt": "You measure TTFT from the request start to <code>message_start</code>. What is wrong?", "options": ["Nothing, that is the definition", "<code>message_start</code> arrives before any content, so the number understates what a reader experiences", "<code>message_start</code> arrives last", "TTFT can only be measured without streaming"], "answer": 1,
+         "explanation": "<p>Time to first token is about the first visible output: measure at the first <code>text_delta</code>.</p>"},
+        {"type": "single", "prompt": "A streamed response stops with <code>stop_reason == \"max_tokens\"</code>. The text looked fine on screen. What should your code do?", "options": ["Nothing; the user already saw it", "Handle it as in M03: the answer is incomplete, so continue, raise the limit, or tell the user", "Retry the identical request immediately", "Switch to <code>create(stream=True)</code>"], "answer": 1,
+         "explanation": "<p>Streaming changes delivery, not meaning. A <code>max_tokens</code> stop is a truncated answer, and the handler from M03 still applies.</p>"}
+      ]}
+      </script>
+    </div>
+  </section>
+
+  <section class="lesson-section" id="recap">
+    <h2>Recap</h2>
+    <ul>
+      <li>Streaming delivers a response as server-sent events while it is generated. It cuts time to first token; it does not change total time, tokens, cost, or the final answer.</li>
+      <li><code>with client.messages.stream(...) as stream:</code> takes the same arguments as <code>create</code>. <code>stream.text_stream</code> yields text pieces; print them with <code>end=""</code> and <code>flush=True</code>.</li>
+      <li>Events: <code>message_start</code>, then per block <code>content_block_start</code> / <code>content_block_delta</code> (<code>text_delta</code> or <code>input_json_delta</code>) / <code>content_block_stop</code>, then <code>message_delta</code> (stop reason, output tokens) and <code>message_stop</code>.</li>
+      <li>Accumulate by <code>index</code>. <code>get_final_message()</code> does it for you and returns the same <code>Message</code> <code>create</code> would.</li>
+      <li>A stream is read once. Append <code>final.content</code> to history, and still check <code>final.stop_reason</code>.</li>
+      <li><code>create(stream=True)</code> returns raw events with no helpers; prefer <code>messages.stream</code> unless you need the raw events.</li>
+      <li>Tool input streams as JSON fragments: buffer by index, <code>json.loads</code> once at <code>content_block_stop</code>.</li>
+      <li>Measure TTFT at the first text delta with <code>time.perf_counter()</code>; input size drives TTFT, output length drives the tail.</li>
+    </ul>
+    <div class="flashcards" data-title="Streaming">
+      <script type="application/json">
+      [{"front": "What does streaming improve, and what does it not?", "back": "It improves time to first token. It does not change total time, tokens, cost, or the answer."},
+       {"front": "The streaming helper call", "back": "<code>with client.messages.stream(model=..., max_tokens=..., messages=...) as stream:</code>"},
+       {"front": "Print streamed text correctly", "back": "<code>for text in stream.text_stream: print(text, end=\"\", flush=True)</code>"},
+       {"front": "The six event types, in order", "back": "<code>message_start</code>, <code>content_block_start</code>, <code>content_block_delta</code>, <code>content_block_stop</code>, <code>message_delta</code>, <code>message_stop</code>"},
+       {"front": "Where is <code>stop_reason</code> in a stream?", "back": "In <code>message_delta</code>, with the final <code>usage.output_tokens</code>."},
+       {"front": "What does <code>event.index</code> mean?", "back": "The position of the content block the event belongs to."},
+       {"front": "<code>get_final_message()</code>", "back": "Consumes the rest of the stream and returns the complete <code>Message</code>."},
+       {"front": "<code>create(stream=True)</code> returns...", "back": "An iterator of raw events. No <code>text_stream</code>, no <code>get_final_message()</code>."},
+       {"front": "How do you get a streamed tool call's input?", "back": "Join its <code>input_json_delta</code> <code>partial_json</code> fragments by index; <code>json.loads</code> at <code>content_block_stop</code>."},
+       {"front": "Where do you measure TTFT?", "back": "At the first <code>text_delta</code>, not at <code>message_start</code>."},
+       {"front": "Can you iterate a stream twice?", "back": "No. Read it one way, then call <code>get_final_message()</code>."}]
+      </script>
+    </div>
+    <h3>Going further</h3>
+    <ul>
+      <li><a href="https://platform.claude.com/docs/en/build-with-claude/streaming">Claude docs: Streaming messages</a> (every event type, with examples)</li>
+      <li><a href="https://github.com/anthropics/anthropic-sdk-python">Anthropic Python SDK</a>: the <code>messages.stream</code> helper and its events</li>
+      <li><a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">HTML standard: Server-sent events</a>, the wire format underneath</li>
+      <li><a href="https://docs.python.org/3.14/library/time.html#time.perf_counter">Python docs: <code>time.perf_counter</code></a></li>
+      <li><a href="../reference/agentlab.html">agentlab reference</a> and <a href="../reference/glossary.html">glossary</a></li>
+      <li>Next: <a href="m05-structured-output.html">M05 Structured Output</a></li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>
